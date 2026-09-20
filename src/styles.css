@@ -291,3 +291,78 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
 .codec-list li { font-size: .74rem; color: #9cc3ff; font-family: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace; }
 .result-notes li { font-size: .74rem; color: #8295ad; line-height: 1.45; }
 .result-notes { margin: 10px 0 14px; }
+
+
+/* --- AutoPilot agents --- */
+.agent-box {
+  margin-top: 18px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(94, 156, 255, .22);
+  background: linear-gradient(180deg, rgba(32, 77, 136, .13), rgba(255,255,255,.02));
+}
+
+.agent-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.agent-head > div {
+  display: grid;
+  gap: 4px;
+}
+
+.agent-head strong {
+  font-size: .88rem;
+}
+
+.agent-head span:not(.badge) {
+  color: #8295ad;
+  font-size: .72rem;
+  line-height: 1.4;
+}
+
+.agent-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.agent-row {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,.06);
+  background: rgba(255,255,255,.025);
+}
+
+.agent-row strong {
+  font-size: .75rem;
+}
+
+.agent-row span {
+  color: #8fa3be;
+  font-size: .69rem;
+  line-height: 1.4;
+}
+
+.agent-row.ok {
+  border-left: 3px solid rgba(88,231,165,.65);
+}
+
+.agent-row.adjusted {
+  border-left: 3px solid rgba(94,156,255,.8);
+}
+
+.agent-row.warning {
+  border-left: 3px solid rgba(255,174,56,.8);
+}
+
+@media (max-width: 640px) {
+  .agent-head {
+    align-items: center;
+  }
+}
