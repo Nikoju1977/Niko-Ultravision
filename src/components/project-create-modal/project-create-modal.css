@@ -1,0 +1,57 @@
+.project-create-modal {
+  --q-modal-width: 30.125rem;
+
+  gap: var(--hf-space-400);
+  padding: var(--hf-space-400);
+  border: var(--hf-border-width-thin) solid var(--hf-color-border-subtle);
+}
+
+.project-create-modal > .q-modal-header {
+  min-height: var(--hf-space-800);
+}
+
+.project-create-modal > .q-modal-header > .q-modal-title {
+  min-height: var(--hf-space-800);
+  padding: var(--hf-space-0);
+  font-family: var(--hf-type-family-secondary);
+  font-size: var(--hf-type-size-400);
+  font-weight: var(--hf-type-weight-semi-bold);
+  line-height: var(--hf-type-line-height-600);
+  letter-spacing: var(--hf-type-letter-spacing-none);
+}
+
+.project-create-modal > .q-modal-header > .q-close {
+  margin: var(--hf-space-0);
+}
+
+.project-create-modal-form {
+  display: contents;
+}
+
+.project-create-modal-name-field {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: center;
+  padding-block: var(--hf-space-1000);
+}
+
+.project-create-modal-name-field > input {
+  width: 100%;
+  padding: var(--hf-space-0);
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--hf-color-text-primary);
+  caret-color: var(--hf-color-text-primary);
+  font-family: var(--hf-type-family-primary);
+  font-size: var(--hf-type-size-800);
+  font-weight: var(--hf-type-weight-semi-bold);
+  line-height: var(--hf-type-line-height-900);
+  letter-spacing: var(--hf-type-letter-spacing-tight);
+  text-align: center;
+}
+
+.project-create-modal-name-field > input::placeholder {
+  color: var(--hf-color-text-tertiary);
+}
