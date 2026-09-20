@@ -62,12 +62,14 @@ jobs:
           const input = page.locator('input[type="file"]');
 
           await input.setInputFiles(path.resolve("test.png"));
+          await page.getByText("Source analysée localement").waitFor({timeout:10000});
           await page.getByRole("button", {name:/^Original/}).click();
           await page.getByRole("button", {name:"Créer le master local"}).click();
           await page.getByText("Master terminé").waitFor({timeout:20000});
           if (!(await page.getByRole("button", {name:"Télécharger"}).isVisible())) throw new Error("Image export missing");
 
           await input.setInputFiles(path.resolve("test.webm"));
+          await page.getByText("Source analysée localement").waitFor({timeout:10000});
           await page.getByRole("button", {name:/^Original/}).click();
           await page.getByRole("button", {name:"Créer le master local"}).click();
           await page.getByText("Master terminé").waitFor({timeout:30000});
