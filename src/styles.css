@@ -281,3 +281,13 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
 @media (max-width: 640px) {
   .engine-grid { grid-template-columns: 1fr; }
 }
+
+.codec-list, .result-notes {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+}
+.codec-list li { font-size: .74rem; color: #9cc3ff; font-family: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace; }
+.result-notes li { font-size: .74rem; color: #8295ad; line-height: 1.45; }
+.result-notes { margin: 10px 0 14px; }
