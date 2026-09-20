@@ -98,10 +98,13 @@ async function detectFrameRate(video: HTMLVideoElement): Promise<{ value: number
     let lastMediaTime = 0;
     let frames = 0;
     let settled = false;
+    let timer = 0;
 
     const finish = () => {
       if (settled) return;
       settled = true;
+      window.clearTimeout(timer);
+      video.removeEventListener("ended", wrappedFinish);
       video.pause();
       video.currentTime = 0;
       video.muted = originalMuted;
@@ -125,12 +128,11 @@ async function detectFrameRate(video: HTMLVideoElement): Promise<{ value: number
       framed.requestVideoFrameCallback?.(onFrame);
     };
 
-    const timer = window.setTimeout(finish, Math.max(1800, sampleSeconds * 2500));
-    const wrappedFinish = () => {
-      window.clearTimeout(timer);
+    function wrappedFinish() {
       finish();
-    };
+    }
 
+    timer = window.setTimeout(finish, Math.max(1800, sampleSeconds * 2500));
     video.addEventListener("ended", wrappedFinish, { once: true });
     framed.requestVideoFrameCallback(onFrame);
     void video.play().catch(wrappedFinish);
