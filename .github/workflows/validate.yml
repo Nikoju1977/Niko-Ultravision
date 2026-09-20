@@ -21,5 +21,7 @@ jobs:
           node-version: "22.12.0"
       - name: Install
         run: npm install --no-audit --no-fund
+      - name: Security audit
+        run: npm audit --audit-level=high
       - name: Build
         run: npm run build
