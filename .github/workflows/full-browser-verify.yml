@@ -1,0 +1,141 @@
+name: UltraVision Full Browser Verification
+
+on:
+  push:
+    paths:
+      - .github/workflows/full-browser-verify.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+      - name: Install app
+        run: npm ci --no-audit --no-fund
+      - name: Install browser runtime
+        run: |
+          npm install --no-save --package-lock=false --no-audit --no-fund playwright
+          npx playwright install chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+      - name: Build
+        run: npm run build
+      - name: Create deterministic media
+        run: |
+          ffmpeg -y -f lavfi -i color=c=red:s=64x48 -frames:v 1 test.png
+          ffmpeg -y -f lavfi -i testsrc=size=320x180:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -c:v libvpx-vp9 -pix_fmt yuv420p -c:a libopus test30.webm
+          ffmpeg -y -f lavfi -i testsrc=size=160x90:rate=60 -f lavfi -i sine=frequency=660:sample_rate=48000 -t 1 -c:v libvpx-vp9 -pix_fmt yuv420p -c:a libopus test60.webm
+      - name: Run browser verification
+        run: |
+          npm run preview -- --host 127.0.0.1 --port 4173 > /tmp/ultravision-preview.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID || true' EXIT
+          for i in {1..30}; do
+            curl -fsS http://127.0.0.1:4173 >/dev/null && break
+            sleep 1
+          done
+
+          cat > browser-verify.mjs <<'JS'
+          import { chromium } from "playwright";
+          import path from "node:path";
+
+          const browser = await chromium.launch({
+            headless: true,
+            args: ["--autoplay-policy=no-user-gesture-required"],
+          });
+
+          const external = [];
+
+          async function openPage() {
+            const page = await browser.newPage();
+            page.on("request", (request) => {
+              const url = new URL(request.url());
+              if ((url.protocol === "http:" || url.protocol === "https:") &&
+                  !["127.0.0.1", "localhost"].includes(url.hostname)) {
+                external.push(request.url());
+              }
+            });
+            await page.goto("http://127.0.0.1:4173", { waitUntil: "networkidle" });
+            if ((await page.title()) !== "Niko UltraVision Pro") {
+              throw new Error("Unexpected page title");
+            }
+            return page;
+          }
+
+          {
+            const page = await openPage();
+            const input = page.locator('input[type="file"]');
+            await input.setInputFiles(path.resolve("test.png"));
+            await page.getByText("Source analysée localement").waitFor({ timeout: 10000 });
+
+            const ultra32 = page.getByRole("button", { name: /^32K/ });
+            if (!(await ultra32.isDisabled())) {
+              throw new Error("32K should be disabled for this source/device budget");
+            }
+
+            await page.getByRole("button", { name: /^2K/ }).click();
+            await page.getByRole("button", { name: "Créer le master local" }).click();
+            await page.getByText("Master terminé").waitFor({ timeout: 30000 });
+
+            const text = await page.locator(".result-copy").innerText();
+            if (!/2\D*048\D+1\D*536/.test(text)) {
+              throw new Error("Image 2K output dimensions are incorrect: " + text);
+            }
+            if (!(await page.getByRole("button", { name: "Télécharger" }).isVisible())) {
+              throw new Error("Image download is missing");
+            }
+            await page.close();
+          }
+
+          {
+            const page = await openPage();
+            const input = page.locator('input[type="file"]');
+            await input.setInputFiles(path.resolve("test30.webm"));
+            await page.getByText("Source analysée localement").waitFor({ timeout: 10000 });
+
+            await page.getByRole("button", { name: /^1080p/ }).click();
+            await page.getByRole("button", { name: "Créer le master local" }).click();
+            await page.getByText("Master terminé").waitFor({ timeout: 45000 });
+
+            const text = await page.locator(".result-copy").innerText();
+            if (!/1\D*920\D+1\D*080/.test(text)) {
+              throw new Error("Video 1080p output dimensions are incorrect: " + text);
+            }
+            if (!/30 i\/s/.test(text)) {
+              throw new Error("30 fps output cadence missing: " + text);
+            }
+            await page.close();
+          }
+
+          {
+            const page = await openPage();
+            const input = page.locator('input[type="file"]');
+            await input.setInputFiles(path.resolve("test60.webm"));
+            await page.getByText("Source analysée localement").waitFor({ timeout: 10000 });
+
+            await page.getByRole("button", { name: /^Original/ }).click();
+            await page.getByRole("button", { name: "Créer le master local" }).click();
+            await page.getByText("Master terminé").waitFor({ timeout: 30000 });
+
+            const text = await page.locator(".result-copy").innerText();
+            if (!/60 i\/s/.test(text)) {
+              throw new Error("60 fps preservation path failed: " + text);
+            }
+            await page.close();
+          }
+
+          if (external.length) {
+            throw new Error("Unexpected external requests: " + external.join(", "));
+          }
+
+          console.log("ULTRAVISION_FULL_VERIFY_OK image-2K video-1080p video-60fps no-external-requests");
+          await browser.close();
+          JS
+
+          node browser-verify.mjs
