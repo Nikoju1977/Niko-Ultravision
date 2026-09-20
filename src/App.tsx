@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
-import { assessImageTarget, enhanceImage, type ImageFormat } from "./lib/imageEnhancer";
+import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
+import {
+  AI_MAX_SOURCE_PIXELS,
+  AI_WARN_SOURCE_PIXELS,
+  DEFAULT_MODEL_LABEL,
+  DEFAULT_MODEL_URL,
+  aiEngineAvailable,
+  loadAiModel,
+  loadedModel,
+  webGpuAvailable,
+  type AiModelInfo,
+} from "./lib/aiUpscaler";
 import { PROFILES, type ProfileId } from "./lib/profiles";
 import { enhanceVideo } from "./lib/videoEnhancer";
 
@@ -13,6 +24,7 @@ type OutputState = {
   note: string;
   frameRate?: number;
   frameRateDetected?: boolean;
+  engineUsed?: EngineId;
 } | null;
 
 const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -20,8 +32,7 @@ const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
   { id: "2k", label: "2K", hint: "2 048 px côté long" },
   { id: "4k", label: "4K", hint: "3 840 px côté long" },
   { id: "8k", label: "8K", hint: "7 680 px côté long" },
-  { id: "16k", label: "16K", hint: "15 360 px · appareil puissant" },
-  { id: "32k", label: "32K", hint: "30 720 px · limite matérielle probable" },
+  { id: "16k", label: "16K", hint: "15 360 px · desktop mémoire élevée" },
 ];
 
 const VIDEO_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -79,6 +90,11 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState("Prêt");
   const [error, setError] = useState<string | null>(null);
+  const [engine, setEngine] = useState<EngineId>("canvas");
+  const [modelUrl, setModelUrl] = useState(DEFAULT_MODEL_URL);
+  const [model, setModel] = useState<AiModelInfo | null>(loadedModel());
+  const [modelBusy, setModelBusy] = useState(false);
+  const [modelStatus, setModelStatus] = useState<string | null>(null);
 
   const targets = mode === "image" ? IMAGE_TARGETS : VIDEO_TARGETS;
   const predicted = useMemo(() => {
@@ -90,6 +106,14 @@ export default function App() {
     if (mode !== "image" || !sourceSize) return null;
     return assessImageTarget(sourceSize, target);
   }, [mode, sourceSize, target]);
+
+  const sourcePixels = sourceSize ? sourceSize.width * sourceSize.height : 0;
+  const aiTooLarge = sourcePixels > AI_MAX_SOURCE_PIXELS;
+  const aiSlow = sourcePixels > AI_WARN_SOURCE_PIXELS && !aiTooLarge;
+
+  useEffect(() => {
+    if (mode === "video" || aiTooLarge) setEngine("canvas");
+  }, [mode, aiTooLarge]);
 
   useEffect(() => {
     if (!file) {
@@ -131,6 +155,27 @@ export default function App() {
     }
   }
 
+  async function acquireModel(source: Parameters<typeof loadAiModel>[0]) {
+    setModelBusy(true);
+    setError(null);
+    setModelStatus("Préparation du moteur IA");
+    try {
+      const loaded = await loadAiModel(source, (_ratio, label) => setModelStatus(label));
+      setModel(loaded);
+      setEngine("ai");
+      setModelStatus(
+        `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo`,
+      );
+    } catch (reason) {
+      setModel(null);
+      setEngine("canvas");
+      setModelStatus(null);
+      setError(reason instanceof Error ? reason.message : "Chargement du modèle impossible.");
+    } finally {
+      setModelBusy(false);
+    }
+  }
+
   async function runEnhancement() {
     if (!file || !sourceSize) return;
     setBusy(true);
@@ -143,18 +188,25 @@ export default function App() {
 
     try {
       if (mode === "image") {
-        const result = await enhanceImage(file, target, profile, format, (value, label) => {
-          setProgress(value);
-          setStatus(label);
+        const result = await enhanceImage(file, target, profile, format, {
+          engine,
+          onProgress: (value, label) => {
+            setProgress(value);
+            setStatus(label);
+          },
         });
         const url = URL.createObjectURL(result.blob);
         setOutput({
           url,
           blob: result.blob,
           size: result.size,
-          note: result.sharpenApplied
-            ? "Agrandissement progressif + accentuation locale légère."
-            : "Agrandissement progressif haute qualité ; accentuation désactivée sur très grande image pour préserver la mémoire.",
+          engineUsed: result.engineUsed,
+          note:
+            result.engineUsed === "ai"
+              ? `Super-résolution IA x${result.aiScale} (${result.aiProvider?.toUpperCase()}) puis normalisation géométrique vers la cible.`
+              : result.sharpenApplied
+                ? "Agrandissement progressif + accentuation locale légère."
+                : "Agrandissement progressif haute qualité ; accentuation désactivée sur très grande image pour préserver la mémoire.",
         });
       } else {
         const result = await enhanceVideo(file, target, profile, (value, label) => {
