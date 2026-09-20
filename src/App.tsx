@@ -14,6 +14,12 @@ import {
 } from "./lib/aiUpscaler";
 import { PROFILES, type ProfileId } from "./lib/profiles";
 import { enhanceVideo } from "./lib/videoEnhancer";
+import {
+  CODEC_INTENTS,
+  codecInventory,
+  webCodecsAvailable,
+  type CodecIntent,
+} from "./lib/videoCodec";
 
 type MediaMode = "image" | "video";
 
@@ -25,6 +31,8 @@ type OutputState = {
   frameRate?: number;
   frameRateDetected?: boolean;
   engineUsed?: EngineId;
+  codecLabel?: string;
+  notes?: string[];
 } | null;
 
 const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -39,7 +47,8 @@ const VIDEO_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
   { id: "original", label: "Original", hint: "même définition" },
   { id: "1080p", label: "1080p", hint: "1 920 px côté long" },
   { id: "2k", label: "2K", hint: "2 048 px côté long" },
-  { id: "4k", label: "4K", hint: "limite locale fiable" },
+  { id: "4k", label: "4K", hint: "3 840 px côté long" },
+  { id: "8k", label: "8K", hint: "WebCodecs requis · encodeur négocié" },
 ];
 
 function extensionFor(type: string): string {
@@ -95,6 +104,8 @@ export default function App() {
   const [model, setModel] = useState<AiModelInfo | null>(loadedModel());
   const [modelBusy, setModelBusy] = useState(false);
   const [modelStatus, setModelStatus] = useState<string | null>(null);
+  const [intent, setIntent] = useState<CodecIntent>("master");
+  const [codecs, setCodecs] = useState<string[] | null>(null);
 
   const targets = mode === "image" ? IMAGE_TARGETS : VIDEO_TARGETS;
   const predicted = useMemo(() => {
@@ -114,6 +125,24 @@ export default function App() {
   useEffect(() => {
     if (mode === "video" || aiTooLarge) setEngine("canvas");
   }, [mode, aiTooLarge]);
+
+  useEffect(() => {
+    if (mode !== "video" || !sourceSize || !webCodecsAvailable()) {
+      setCodecs(null);
+      return;
+    }
+    let alive = true;
+    void codecInventory(sourceSize.width, sourceSize.height, 30)
+      .then((list) => {
+        if (alive) setCodecs(list.map((entry) => `${entry.label} → ${entry.container.toUpperCase()}`));
+      })
+      .catch(() => {
+        if (alive) setCodecs([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [mode, sourceSize]);
 
   useEffect(() => {
     if (!file) {
@@ -209,19 +238,32 @@ export default function App() {
                 : "Agrandissement progressif haute qualité ; accentuation désactivée sur très grande image pour préserver la mémoire.",
         });
       } else {
-        const result = await enhanceVideo(file, target, profile, (value, label) => {
-          setProgress(value);
-          setStatus(label);
+        const result = await enhanceVideo(file, target, profile, {
+          intent,
+          onProgress: (value, label) => {
+            setProgress(value);
+            setStatus(label);
+          },
         });
         const url = URL.createObjectURL(result.blob);
         setOutput({
           url,
           blob: result.blob,
           size: result.size,
-          note: (result.audioPreserved ? "Piste audio intégrée. " : "Piste audio non disponible avec ce navigateur. ") +
+          codecLabel: result.streamCopied
+            ? "Copie directe (aucun réencodage)"
+            : result.plan
+              ? `${result.plan.codec.toUpperCase()} · ${result.plan.container.toUpperCase()} · ${result.plan.keyFrameInterval === 0 ? "tout intra" : `clé/${result.plan.keyFrameInterval}s`}`
+              : "MediaRecorder",
+          notes: result.notes,
+          note:
+            (result.pipeline === "webcodecs"
+              ? "Pipeline WebCodecs : aucune image perdue, horodatage exact. "
+              : "Pipeline MediaRecorder temps réel. ") +
+            (result.audioPreserved ? "Piste audio conservée. " : "Sans piste audio. ") +
             (result.frameRateDetected
-              ? `Cadence source détectée et sortie à ${Math.round(result.frameRate)} i/s.`
-              : `Cadence de sortie de compatibilité : ${Math.round(result.frameRate)} i/s.`),
+              ? `Cadence source ${Math.round(result.frameRate)} i/s.`
+              : `Cadence de compatibilité ${Math.round(result.frameRate)} i/s.`),
           frameRate: result.frameRate,
           frameRateDetected: result.frameRateDetected,
         });
