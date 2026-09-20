@@ -94,6 +94,8 @@ export interface CodecPlan {
   keyFrameInterval: number;
   quality: "very-high" | "high" | "medium";
   intent: CodecIntent;
+  /** Pourquoi ce codec a été retenu par le superviseur. */
+  rationale: string;
   /** Codecs écartés, avec la raison — affiché tel quel dans l'interface. */
   rejected: string[];
 }
@@ -110,6 +112,66 @@ function mimeFor(container: ContainerId, codec: VideoCodec): string {
   return container === "mp4" ? `video/mp4; codecs=${codec}` : `video/webm; codecs=${codec}`;
 }
 
+function professionalPreference(
+  intent: CodecIntent,
+  width: number,
+  height: number,
+  frameRate: number,
+): VideoCodec[] {
+  const pixelsPerSecond = width * height * Math.max(1, frameRate);
+  const isHeavy = pixelsPerSecond >= 3840 * 2160 * 50;
+
+  if (intent === "mezzanine") {
+    // Pour un intermédiaire de montage, la priorité est la robustesse de décodage
+    // et le tout-intra plutôt que le meilleur ratio de compression.
+    return ["hevc", "avc", "av1", "vp9"];
+  }
+
+  if (intent === "master") {
+    // Sur une charge très élevée, HEVC est préféré à AV1 pour limiter le coût
+    // d'encodage quand les deux sont disponibles. Sinon AV1 maximise l'efficacité.
+    return isHeavy ? ["hevc", "av1", "vp9", "avc"] : ["av1", "hevc", "vp9", "avc"];
+  }
+
+  if (intent === "delivery") {
+    // Diffusion : efficacité de compression avant compatibilité historique.
+    return ["av1", "hevc", "vp9", "avc", "vp8"];
+  }
+
+  if (intent === "compat") {
+    return ["avc", "vp9", "vp8"];
+  }
+
+  return [];
+}
+
+function codecRationale(
+  codec: VideoCodec,
+  intent: CodecIntent,
+  width: number,
+  height: number,
+  frameRate: number,
+): string {
+  const target = `${width}×${height} à ${Math.round(frameRate)} i/s`;
+
+  switch (codec) {
+    case "av1":
+      return `AV1 retenu pour son excellente efficacité de compression en ${target}.`;
+    case "hevc":
+      return `HEVC retenu pour son bon équilibre qualité, débit et charge d'encodage en ${target}.`;
+    case "avc":
+      return intent === "mezzanine"
+        ? `H.264 intra retenu pour une lecture/montage très compatible en ${target}.`
+        : `H.264 retenu comme codec professionnel de compatibilité en ${target}.`;
+    case "vp9":
+      return `VP9 retenu comme repli haute efficacité en ${target}.`;
+    case "vp8":
+      return `VP8 retenu comme dernier repli WebM compatible en ${target}.`;
+    default:
+      return `${CODEC_LABELS[codec]} retenu en ${target}.`;
+  }
+}
+
 /**
  * Interroge réellement le navigateur pour la taille et la cadence visées.
  * Un codec listé ici est un codec que cette machine sait encoder maintenant.
@@ -123,24 +185,25 @@ export async function negotiateCodec(
   if (intent === "copy") return null;
 
   const spec = CODEC_INTENTS[intent];
+  const preference = professionalPreference(intent, width, height, frameRate);
   const { getEncodableVideoCodecs, QUALITY_HIGH, QUALITY_MEDIUM, QUALITY_VERY_HIGH } =
     await import("mediabunny");
 
   const quality =
     spec.quality === "very-high" ? QUALITY_VERY_HIGH : spec.quality === "high" ? QUALITY_HIGH : QUALITY_MEDIUM;
 
-  const encodable = await getEncodableVideoCodecs(spec.preference, {
+  const encodable = await getEncodableVideoCodecs(preference, {
     width,
     height,
     quality,
     frameRate,
   });
 
-  const rejected = spec.preference
+  const rejected = preference
     .filter((codec) => !encodable.includes(codec))
     .map((codec) => `${CODEC_LABELS[codec]} : non encodable en ${width}×${height} sur ce navigateur`);
 
-  const chosen = spec.preference.find((codec) => encodable.includes(codec));
+  const chosen = preference.find((codec) => encodable.includes(codec));
   if (!chosen) return null;
 
   const container = containerFor(chosen);
@@ -153,6 +216,7 @@ export async function negotiateCodec(
     keyFrameInterval: spec.keyFrameInterval,
     quality: spec.quality,
     intent,
+    rationale: codecRationale(chosen, intent, width, height, frameRate),
     rejected,
   };
 }
