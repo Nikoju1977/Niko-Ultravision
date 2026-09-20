@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
 import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
+import { decodeImageFile } from "./lib/imageDecode";
 import {
   AI_MAX_SOURCE_PIXELS,
   AI_WARN_SOURCE_PIXELS,
@@ -76,37 +77,11 @@ function looksLikeVideo(file: File): boolean {
 }
 
 async function inspectImage(file: File): Promise<Size> {
-  // Android file providers sometimes expose an empty MIME type, and some
-  // browser builds reject ImageBitmapOptions. Try the native fast path first,
-  // then fall back to the browser's <img> decoder.
-  if ("createImageBitmap" in window) {
-    try {
-      const bitmap = await createImageBitmap(file);
-      const size = { width: bitmap.width, height: bitmap.height };
-      bitmap.close();
-      if (size.width > 0 && size.height > 0) return size;
-    } catch {
-      // Fall through to HTMLImageElement decoding below.
-    }
-  }
-
-  const url = URL.createObjectURL(file);
+  const decoded = await decodeImageFile(file);
   try {
-    const image = new Image();
-    image.decoding = "async";
-    await new Promise<void>((resolve, reject) => {
-      image.onload = () => resolve();
-      image.onerror = () => reject(new Error("Image illisible par ce navigateur."));
-      image.src = url;
-    });
-
-    if (!image.naturalWidth || !image.naturalHeight) {
-      throw new Error("Dimensions de l'image introuvables.");
-    }
-
-    return { width: image.naturalWidth, height: image.naturalHeight };
+    return { width: decoded.width, height: decoded.height };
   } finally {
-    URL.revokeObjectURL(url);
+    decoded.close();
   }
 }
 
@@ -194,14 +169,68 @@ export default function App() {
   }, [mode, sourceSize]);
 
   useEffect(() => {
+    let alive = true;
+    let objectUrl: string | null = null;
+    setSourceUrl(null);
+
     if (!file) {
-      setSourceUrl(null);
-      return;
+      return () => {
+        alive = false;
+      };
     }
-    const next = URL.createObjectURL(file);
-    setSourceUrl(next);
-    return () => URL.revokeObjectURL(next);
-  }, [file]);
+
+    if (mode === "video") {
+      objectUrl = URL.createObjectURL(file);
+      setSourceUrl(objectUrl);
+      return () => {
+        alive = false;
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+      };
+    }
+
+    void (async () => {
+      try {
+        const decoded = await decodeImageFile(file);
+        try {
+          const maxSide = 1280;
+          const scale = Math.min(1, maxSide / Math.max(decoded.width, decoded.height));
+          const width = Math.max(1, Math.round(decoded.width * scale));
+          const height = Math.max(1, Math.round(decoded.height * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) throw new Error("Canvas 2D indisponible.");
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+          ctx.drawImage(decoded.source, 0, 0, width, height);
+
+          const preview = await new Promise<Blob>((resolve, reject) => {
+            canvas.toBlob(
+              (blob) => (blob ? resolve(blob) : reject(new Error("Aperçu impossible."))),
+              "image/jpeg",
+              0.9,
+            );
+          });
+
+          if (!alive) return;
+          objectUrl = URL.createObjectURL(preview);
+          setSourceUrl(objectUrl);
+        } finally {
+          decoded.close();
+        }
+      } catch {
+        if (!alive) return;
+        objectUrl = URL.createObjectURL(file);
+        setSourceUrl(objectUrl);
+      }
+    })();
+
+    return () => {
+      alive = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [file, mode]);
 
   useEffect(() => {
     return () => {
