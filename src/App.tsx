@@ -158,9 +158,12 @@ export default function App() {
           url,
           blob: result.blob,
           size: result.size,
-          note: result.audioPreserved
-            ? "Vidéo rééchantillonnée localement avec piste audio préservée."
-            : "Vidéo rééchantillonnée localement. Le navigateur n'a pas permis de préserver l'audio.",
+          note: (result.audioPreserved ? "Piste audio intégrée. " : "Piste audio non disponible avec ce navigateur. ") +
+            (result.frameRateDetected
+              ? `Cadence source détectée et sortie à ${Math.round(result.frameRate)} i/s.`
+              : `Cadence de sortie de compatibilité : ${Math.round(result.frameRate)} i/s.`),
+          frameRate: result.frameRate,
+          frameRateDetected: result.frameRateDetected,
         });
       }
       setProgress(1);
@@ -337,6 +340,9 @@ export default function App() {
                 <div><dt>Résolution</dt><dd>{formatDimensions(output.size)}</dd></div>
                 <div><dt>Taille</dt><dd>{(output.blob.size / 1024 / 1024).toFixed(1)} Mo</dd></div>
                 <div><dt>Traitement</dt><dd>Local navigateur</dd></div>
+                {output.frameRate && (
+                  <div><dt>Cadence</dt><dd>{Math.round(output.frameRate)} i/s{output.frameRateDetected ? " détectée" : " compatibilité"}</dd></div>
+                )}
               </dl>
             </div>
           </div>
