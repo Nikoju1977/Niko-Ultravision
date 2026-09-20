@@ -46,6 +46,7 @@ async function rewindVideo(video: HTMLVideoElement): Promise<void> {
     video.currentTime = 0;
     return;
   }
+
   await new Promise<void>((resolve) => {
     let settled = false;
     const finish = () => {
@@ -133,7 +134,9 @@ async function detectFrameRate(video: HTMLVideoElement): Promise<{ value: number
       framed.requestVideoFrameCallback?.(onFrame);
     };
 
-    function wrappedFinish() { finish(); }
+    function wrappedFinish() {
+      finish();
+    }
 
     timer = window.setTimeout(finish, Math.max(1800, sampleSeconds * 2500));
     video.addEventListener("ended", wrappedFinish, { once: true });
@@ -193,6 +196,7 @@ export async function enhanceVideoWithRecorder(
       const AudioContextCtor =
         window.AudioContext ??
         (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
       if (AudioContextCtor) {
         audioContext = new AudioContextCtor();
         const source = audioContext.createMediaElementSource(video);
@@ -232,19 +236,27 @@ export async function enhanceVideoWithRecorder(
       if (video.ended || video.paused) return;
       ctx.drawImage(video, 0, 0, output.width, output.height);
       const progress = video.duration ? Math.min(0.98, video.currentTime / video.duration) : 0;
-      onProgress?.(progress, "Traitement vidéo local · " + Math.round(frameRate) + " i/s");
+      onProgress?.(progress, `Traitement vidéo local · ${Math.round(frameRate)} i/s`);
+
       const framed = video as FrameVideo;
-      if (framed.requestVideoFrameCallback) framed.requestVideoFrameCallback(() => drawFrame());
-      else requestAnimationFrame(drawFrame);
+      if (framed.requestVideoFrameCallback) {
+        framed.requestVideoFrameCallback(() => drawFrame());
+      } else {
+        requestAnimationFrame(drawFrame);
+      }
     };
 
-    video.addEventListener("ended", () => {
-      if (recorder?.state !== "inactive") recorder?.stop();
-    }, { once: true });
+    video.addEventListener(
+      "ended",
+      () => {
+        if (recorder?.state !== "inactive") recorder?.stop();
+      },
+      { once: true },
+    );
 
     video.currentTime = 0;
     video.muted = false;
-    onProgress?.(0.03, "Préparation · " + Math.round(frameRate) + " i/s");
+    onProgress?.(0.03, `Préparation · ${Math.round(frameRate)} i/s`);
     recorder.start(1000);
     await video.play();
     drawFrame();
@@ -254,6 +266,7 @@ export async function enhanceVideoWithRecorder(
     if (blob.size === 0) throw new Error("L'encodeur vidéo a produit un fichier vide.");
 
     onProgress?.(1, "Terminé");
+
     return {
       blob,
       size: output,
@@ -265,11 +278,18 @@ export async function enhanceVideoWithRecorder(
   } finally {
     video.pause();
     if (recorder && recorder.state !== "inactive") {
-      try { recorder.stop(); } catch { /* cleanup only */ }
+      try {
+        recorder.stop();
+      } catch {
+        // no-op: cleanup only
+      }
     }
     stream?.getTracks().forEach((track) => track.stop());
     if (audioContext) await audioContext.close().catch(() => undefined);
-    if (canvas) { canvas.width = 1; canvas.height = 1; }
+    if (canvas) {
+      canvas.width = 1;
+      canvas.height = 1;
+    }
     video.removeAttribute("src");
     video.load();
     URL.revokeObjectURL(url);
