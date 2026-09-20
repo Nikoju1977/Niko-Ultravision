@@ -350,6 +350,110 @@ export default function App() {
             </div>
           )}
 
+          {mode === "image" && (
+            <div className="control-block">
+              <label>Moteur de traitement</label>
+              <div className="engine-grid">
+                <button
+                  type="button"
+                  className={engine === "canvas" ? "choice active" : "choice"}
+                  onClick={() => setEngine("canvas")}
+                  disabled={busy}
+                >
+                  <strong>Canvas</strong>
+                  <span>Rééchantillonnage haute qualité. Rapide, hors ligne, aucun détail inventé.</span>
+                </button>
+                <button
+                  type="button"
+                  className={engine === "ai" ? "choice active" : "choice"}
+                  onClick={() => setEngine("ai")}
+                  disabled={busy || !model || aiTooLarge}
+                  title={
+                    !model
+                      ? "Charge d'abord un modèle ONNX."
+                      : aiTooLarge
+                        ? "Source trop grande pour l'inférence locale."
+                        : undefined
+                  }
+                >
+                  <strong>IA locale{model ? ` · x${model.scale}` : ""}</strong>
+                  <span>
+                    {model
+                      ? `Réseau de neurones exécuté sur l'appareil (${model.provider.toUpperCase()}).`
+                      : "Super-résolution par réseau de neurones. Modèle requis."}
+                  </span>
+                </button>
+              </div>
+
+              {!aiEngineAvailable() && (
+                <div className="warning-card">WebAssembly indisponible : le moteur IA ne peut pas démarrer sur ce navigateur.</div>
+              )}
+
+              <div className="model-box">
+                <div className="model-head">
+                  <strong>Modèle open source</strong>
+                  <span className={webGpuAvailable() ? "badge ok" : "badge"}>
+                    {webGpuAvailable() ? "WebGPU disponible" : "WASM (CPU)"}
+                  </span>
+                </div>
+
+                <p className="model-note">
+                  Par défaut : {DEFAULT_MODEL_LABEL}. Les poids sont téléchargés une fois depuis l'URL ci-dessous, puis
+                  mis en cache par le navigateur. Tes images, elles, ne sortent jamais de l'appareil.
+                </p>
+
+                <input
+                  type="url"
+                  value={modelUrl}
+                  spellCheck={false}
+                  onChange={(event) => setModelUrl(event.target.value)}
+                  disabled={busy || modelBusy}
+                  aria-label="URL du modèle ONNX"
+                />
+
+                <div className="model-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={busy || modelBusy || !modelUrl.trim() || !aiEngineAvailable()}
+                    onClick={() => void acquireModel({ kind: "url", url: modelUrl.trim(), label: DEFAULT_MODEL_LABEL })}
+                  >
+                    {modelBusy ? "Chargement…" : "Charger depuis l'URL"}
+                  </button>
+
+                  <label className="file-button">
+                    Fichier .onnx local
+                    <input
+                      type="file"
+                      accept=".onnx,application/octet-stream"
+                      disabled={busy || modelBusy || !aiEngineAvailable()}
+                      onChange={(event) => {
+                        const picked = event.target.files?.[0];
+                        if (picked) void acquireModel({ kind: "file", file: picked });
+                        event.target.value = "";
+                      }}
+                    />
+                  </label>
+                </div>
+
+                {modelStatus && <div className="model-status">{modelStatus}</div>}
+                {aiTooLarge && (
+                  <div className="warning-card">
+                    Source de {(sourcePixels / 1_000_000).toFixed(1)} MP : au-delà de{" "}
+                    {(AI_MAX_SOURCE_PIXELS / 1_000_000).toFixed(0)} MP l'inférence par tuiles n'est plus tenable dans un
+                    navigateur. Moteur Canvas imposé.
+                  </div>
+                )}
+                {aiSlow && engine === "ai" && (
+                  <div className="warning-card">
+                    {(sourcePixels / 1_000_000).toFixed(1)} MP en entrée : l'inférence va durer plusieurs minutes,
+                    surtout sans WebGPU.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="fidelity-card">
             <strong>Géométrie verrouillée</strong>
             <span>Pas de crop automatique. Pas d’étirement. Le ratio source est recalculé mathématiquement à chaque cible.</span>
@@ -400,6 +504,9 @@ export default function App() {
                 <div><dt>Résolution</dt><dd>{formatDimensions(output.size)}</dd></div>
                 <div><dt>Taille</dt><dd>{(output.blob.size / 1024 / 1024).toFixed(1)} Mo</dd></div>
                 <div><dt>Traitement</dt><dd>Local navigateur</dd></div>
+                {output.engineUsed && (
+                  <div><dt>Moteur</dt><dd>{output.engineUsed === "ai" ? "IA locale (ONNX)" : "Canvas"}</dd></div>
+                )}
                 {output.frameRate && (
                   <div><dt>Cadence</dt><dd>{Math.round(output.frameRate)} i/s{output.frameRateDetected ? " détectée" : " compatibilité"}</dd></div>
                 )}
@@ -417,11 +524,17 @@ export default function App() {
       <section className="truth-panel">
         <h2>Ce que fait réellement cette version</h2>
         <p>
-          UltraVision utilise ici les API natives du navigateur : rééchantillonnage haute qualité par Canvas pour l’image et traitement vidéo via Canvas + MediaRecorder. Il n’invente pas de « nouveaux détails IA ». Les cibles extrêmes restent limitées par la mémoire et les capacités du navigateur. La vidéo locale est volontairement plafonnée à 4K.
+          Deux moteurs, deux comportements distincts. Le moteur <strong>Canvas</strong> rééchantillonne sans jamais fabriquer
+          de détail : c’est de l’agrandissement honnête. Le moteur <strong>IA locale</strong> exécute un vrai modèle de
+          super-résolution open source au format ONNX, par tuiles, sur cet appareil — il reconstruit bien de la texture,
+          avec le risque d’hallucination propre à ce type de réseau. Seuls les poids du modèle transitent par le réseau,
+          jamais tes médias. La vidéo reste en Canvas + MediaRecorder, plafonnée à 4K, avec cadence source détectée quand
+          <code> requestVideoFrameCallback</code> est disponible. Le 32K a été retiré : aucun navigateur actuel n’alloue un
+          canvas de cette surface. Le 16K n’est proposé que si la dimension maximale mesurée sur cet appareil le permet.
         </p>
       </section>
 
-      <footer>UltraVision Pro · moteur local indépendant · aucune dépendance Higgsfield</footer>
+      <footer>UltraVision Pro · moteurs locaux Canvas + ONNX Runtime Web · aucune dépendance Higgsfield</footer>
     </main>
   );
 }
