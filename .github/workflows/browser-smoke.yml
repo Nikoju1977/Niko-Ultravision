@@ -64,14 +64,14 @@ jobs:
           const imageError = page.locator(".error-card");
           if (await imageError.isVisible()) throw new Error("Image import error: " + await imageError.textContent());
           await page.getByText("Source analysée localement").waitFor({timeout:10000});
-          await page.getByRole("button", {name:/^Original/}).click();
+          await page.getByRole("button", {name:/^2K/}).click();
           await page.getByRole("button", {name:"Créer le master local"}).click();
           await page.getByText("Master terminé").waitFor({timeout:20000});
           if (!(await page.getByRole("button", {name:"Télécharger"}).isVisible())) throw new Error("Image export missing");
 
           await input.setInputFiles(path.resolve("test.webm"));
           await page.getByText("Source analysée localement").waitFor({timeout:10000});
-          await page.getByRole("button", {name:/^Original/}).click();
+          await page.getByRole("button", {name:/^1080p/}).click();
           await page.getByRole("button", {name:"Créer le master local"}).click();
           await page.getByText("Master terminé").waitFor({timeout:30000});
           if (!(await page.getByRole("button", {name:"Télécharger"}).isVisible())) throw new Error("Video export missing");
