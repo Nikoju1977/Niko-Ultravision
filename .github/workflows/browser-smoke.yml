@@ -62,6 +62,10 @@ jobs:
           const input = page.locator('input[type="file"]');
 
           await input.setInputFiles(path.resolve("test.png"));
+          await page.waitForTimeout(1200);
+          console.log("IMAGE_STATE", await page.locator("body").innerText());
+          const imageError = page.locator(".error-card");
+          if (await imageError.isVisible()) throw new Error("Image import error: " + await imageError.textContent());
           await page.getByText("Source analysée localement").waitFor({timeout:10000});
           await page.getByRole("button", {name:/^Original/}).click();
           await page.getByRole("button", {name:"Créer le master local"}).click();
