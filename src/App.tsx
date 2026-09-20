@@ -92,7 +92,10 @@ export default function App() {
   }, [mode, sourceSize, target]);
 
   useEffect(() => {
-    if (!file) return;
+    if (!file) {
+      setSourceUrl(null);
+      return;
+    }
     const next = URL.createObjectURL(file);
     setSourceUrl(next);
     return () => URL.revokeObjectURL(next);
@@ -107,6 +110,10 @@ export default function App() {
   async function handleFile(next: File | null) {
     if (!next) return;
     setError(null);
+    setStatus("Analyse de la source");
+    setProgress(0);
+    setFile(null);
+    setSourceSize(null);
     setOutput((previous) => {
       if (previous?.url) URL.revokeObjectURL(previous.url);
       return null;
@@ -119,6 +126,7 @@ export default function App() {
       setTarget(inspected.mode === "video" ? "1080p" : "4k");
       setStatus("Source analysée localement");
     } catch (reason) {
+      setStatus("Source invalide");
       setError(reason instanceof Error ? reason.message : "Impossible de lire ce fichier.");
     }
   }
