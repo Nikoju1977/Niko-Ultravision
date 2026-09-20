@@ -256,18 +256,23 @@ export default function App() {
           <div className="control-block">
             <label>Définition cible</label>
             <div className="target-grid">
-              {targets.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={target === item.id ? "target active" : "target"}
-                  onClick={() => setTarget(item.id)}
-                  disabled={busy}
-                >
-                  <strong>{item.label}</strong>
-                  <span>{item.hint}</span>
-                </button>
-              ))}
+              {targets.map((item) => {
+                const availability =
+                  mode === "image" && sourceSize ? assessImageTarget(sourceSize, item.id) : null;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={target === item.id ? "target active" : "target"}
+                    onClick={() => setTarget(item.id)}
+                    disabled={busy || availability?.supported === false}
+                    title={availability?.reason}
+                  >
+                    <strong>{item.label}</strong>
+                    <span>{availability?.supported === false ? "indisponible sur cet appareil" : item.hint}</span>
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -287,13 +292,17 @@ export default function App() {
             <span>Pas de crop automatique. Pas d’étirement. Le ratio source est recalculé mathématiquement à chaque cible.</span>
           </div>
 
-          {predicted && mode === "image" && megapixels(predicted) > 70 && (
+          {imageAssessment && !imageAssessment.supported && (
+            <div className="warning-card">{imageAssessment.reason}</div>
+          )}
+
+          {imageAssessment?.supported && predicted && megapixels(predicted) > 70 && (
             <div className="warning-card">
-              Cette cible représente {megapixels(predicted).toFixed(1)} MP. Elle peut dépasser la mémoire disponible sur mobile ; UltraVision refusera plutôt que de planter l’appareil.
+              Cette cible représente {megapixels(predicted).toFixed(1)} MP. Le traitement est autorisé, mais restera exigeant pour la mémoire locale.
             </div>
           )}
 
-          <button className="run-button" type="button" onClick={() => void runEnhancement()} disabled={!file || busy}>
+          <button className="run-button" type="button" onClick={() => void runEnhancement()} disabled={!file || busy || imageAssessment?.supported === false}>
             {busy ? "Traitement en cours…" : "Créer le master local"}
           </button>
 
