@@ -29,6 +29,7 @@ export interface EnhanceVideoOptions {
   onProgress?: (value: number, label: string) => void;
 }
 
+/** Lit les dimensions et la cadence directement dans le conteneur, sans lecture temps réel. */
 async function inspectWithMediabunny(file: File) {
   const { ALL_FORMATS, BlobSource, Input } = await import("mediabunny");
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
@@ -71,6 +72,7 @@ function normalizeFrameRate(value: number): number {
   const nearest = standards.reduce((best, candidate) =>
     Math.abs(candidate - value) < Math.abs(best - value) ? candidate : best,
   );
+  // Une cadence exotique assumée (timelapse, 144 i/s) est conservée telle quelle.
   return Math.abs(nearest - value) / value <= 0.02 ? nearest : Math.round(value * 1000) / 1000;
 }
 
@@ -107,6 +109,7 @@ export async function enhanceVideo(
   const filter = PROFILES[profile].filter;
   const filtering = filter !== "none";
 
+  // Copie directe : ni redimensionnement ni filtre, donc aucune raison de réencoder.
   const wantsCopy = intent === "copy";
   if (wantsCopy && (resizing || filtering)) {
     notes.push(
@@ -139,6 +142,7 @@ export async function enhanceVideo(
     WebMOutputFormat,
   } = await import("mediabunny");
 
+  // L'Input de sondage a servi; on en ouvre un neuf pour la conversion.
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
   const container = plan?.container ?? "mp4";
   const bufferTarget = new BufferTarget();
@@ -159,7 +163,7 @@ export async function enhanceVideo(
       : {
           width: output.width,
           height: output.height,
-          fit: "fill",
+          fit: "fill", // le ratio est déjà exact, aucun recadrage n'est introduit
           codec: plan!.codec,
           quality: plan!.quality === "very-high" ? QUALITY_VERY_HIGH : QUALITY_HIGH,
           keyFrameInterval: plan!.keyFrameInterval,
