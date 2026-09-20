@@ -30,10 +30,7 @@ jobs:
           sudo apt-get install -y -qq ffmpeg
       - name: Create test media
         run: |
-          python3 - <<'PY'
-          import base64, pathlib
-          pathlib.Path("test.png").write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR42mP8z8AARAwMjIwgBgAALQAB/2Yx0QAAAABJRU5ErkJggg=="))
-          PY
+          ffmpeg -y -f lavfi -i color=c=red:s=64x48 -frames:v 1 test.png
           ffmpeg -y -f lavfi -i testsrc=size=320x180:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 1 -c:v libvpx-vp9 -pix_fmt yuv420p -c:a libopus test.webm
       - name: Browser functional test
         run: |
