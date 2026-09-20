@@ -1,4 +1,4 @@
-export type TargetId = "original" | "1080p" | "2k" | "4k" | "8k" | "16k" | "32k";
+export type TargetId = "original" | "1080p" | "2k" | "4k" | "8k" | "16k";
 
 export const TARGET_LONG_SIDE: Record<TargetId, number | null> = {
   original: null,
@@ -7,7 +7,6 @@ export const TARGET_LONG_SIDE: Record<TargetId, number | null> = {
   "4k": 3840,
   "8k": 7680,
   "16k": 15360,
-  "32k": 30720,
 };
 
 export interface Size {
