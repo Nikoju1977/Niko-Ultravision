@@ -1,0 +1,36 @@
+name: Import Niko UltraVision source
+
+on:
+  push:
+    paths:
+      - IMPORT_SOURCE
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download source archive
+        run: |
+          curl -L --fail "https://d2ol7oe51mr4n9.cloudfront.net/user_2wbPs8El1wRPIOHlk5Cjrcs5oCu/7fdc5fd1-e4c7-49c6-91ae-62fd096ed3f1.gz" -o /tmp/niko-ultravision-src.tar.gz
+
+      - name: Extract source
+        run: |
+          tar -xzf /tmp/niko-ultravision-src.tar.gz -C .
+          rm -f IMPORT_SOURCE
+
+      - name: Commit imported source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Import Niko UltraVision source"
+          git push
