@@ -496,6 +496,54 @@ export default function App() {
             </div>
           )}
 
+          {mode === "video" && (
+            <div className="control-block">
+              <label>Intention d’encodage</label>
+              <div className="profile-grid">
+                {(Object.keys(CODEC_INTENTS) as CodecIntent[]).map((id) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className={intent === id ? "choice active" : "choice"}
+                    onClick={() => setIntent(id)}
+                    disabled={busy}
+                  >
+                    <strong>{CODEC_INTENTS[id].label}</strong>
+                    <span>{CODEC_INTENTS[id].description}</span>
+                  </button>
+                ))}
+              </div>
+
+              <div className="model-box">
+                <div className="model-head">
+                  <strong>Codecs disponibles ici</strong>
+                  <span className={webCodecsAvailable() ? "badge ok" : "badge"}>
+                    {webCodecsAvailable() ? "WebCodecs" : "MediaRecorder"}
+                  </span>
+                </div>
+                {webCodecsAvailable() ? (
+                  codecs === null ? (
+                    <p className="model-note">Sonde des encodeurs en cours…</p>
+                  ) : codecs.length > 0 ? (
+                    <ul className="codec-list">
+                      {codecs.map((entry) => (
+                        <li key={entry}>{entry}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="model-note">Aucun encodeur matériel ou logiciel exposé pour cette définition.</p>
+                  )
+                ) : (
+                  <p className="model-note">
+                    Ce navigateur n’expose pas WebCodecs. Repli MediaRecorder : encodage en temps réel, images
+                    potentiellement perdues, qualité non réglable. Chrome ou Edge donnent un résultat nettement
+                    supérieur.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="fidelity-card">
             <strong>Géométrie verrouillée</strong>
             <span>Pas de crop automatique. Pas d’étirement. Le ratio source est recalculé mathématiquement à chaque cible.</span>
@@ -542,12 +590,22 @@ export default function App() {
               <div className="success-mark">✓</div>
               <h3>Master terminé</h3>
               <p>{output.note}</p>
+              {output.notes && output.notes.length > 0 && (
+                <ul className="result-notes">
+                  {output.notes.map((entry) => (
+                    <li key={entry}>{entry}</li>
+                  ))}
+                </ul>
+              )}
               <dl>
                 <div><dt>Résolution</dt><dd>{formatDimensions(output.size)}</dd></div>
                 <div><dt>Taille</dt><dd>{(output.blob.size / 1024 / 1024).toFixed(1)} Mo</dd></div>
                 <div><dt>Traitement</dt><dd>Local navigateur</dd></div>
                 {output.engineUsed && (
                   <div><dt>Moteur</dt><dd>{output.engineUsed === "ai" ? "IA locale (ONNX)" : "Canvas"}</dd></div>
+                )}
+                {output.codecLabel && (
+                  <div><dt>Codec</dt><dd>{output.codecLabel}</dd></div>
                 )}
                 {output.frameRate && (
                   <div><dt>Cadence</dt><dd>{Math.round(output.frameRate)} i/s{output.frameRateDetected ? " détectée" : " compatibilité"}</dd></div>
@@ -570,8 +628,12 @@ export default function App() {
           de détail : c’est de l’agrandissement honnête. Le moteur <strong>IA locale</strong> exécute un vrai modèle de
           super-résolution open source au format ONNX, par tuiles, sur cet appareil — il reconstruit bien de la texture,
           avec le risque d’hallucination propre à ce type de réseau. Seuls les poids du modèle transitent par le réseau,
-          jamais tes médias. La vidéo reste en Canvas + MediaRecorder, plafonnée à 4K, avec cadence source détectée quand
-          <code> requestVideoFrameCallback</code> est disponible. Le 32K a été retiré : aucun navigateur actuel n’alloue un
+          jamais tes médias. La vidéo passe par <strong>WebCodecs</strong> quand le navigateur l’expose : démultiplexage du fichier source,
+          réencodage AV1/HEVC/VP9/H.264 selon ce que la machine sait réellement faire, horodatage exact et aucune image
+          perdue. Le mode <em>Mezzanine intra</em> force toutes les images en clé, ce qui donne le comportement de
+          montage d’un ProRes avec les codecs réellement encodables dans un navigateur. La copie directe remultiplexe
+          sans réencoder, donc sans perte de génération. Sans WebCodecs, repli MediaRecorder temps réel, signalé comme
+          tel. Le 32K a été retiré : aucun navigateur actuel n’alloue un
           canvas de cette surface. Le 16K n’est proposé que si la dimension maximale mesurée sur cet appareil le permet.
         </p>
       </section>
