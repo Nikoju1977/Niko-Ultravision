@@ -126,6 +126,7 @@ export async function enhanceVideo(
         `Aucun codec encodable par ce navigateur en ${output.width}×${output.height}. Réduis la définition cible.`,
       );
     }
+    notes.push(plan.rationale);
     notes.push(...plan.rejected);
   }
 
