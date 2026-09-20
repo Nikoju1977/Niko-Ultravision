@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
-import { enhanceImage, type ImageFormat } from "./lib/imageEnhancer";
+import { assessImageTarget, enhanceImage, type ImageFormat } from "./lib/imageEnhancer";
 import { PROFILES, type ProfileId } from "./lib/profiles";
 import { enhanceVideo } from "./lib/videoEnhancer";
 
@@ -11,6 +11,8 @@ type OutputState = {
   blob: Blob;
   size: Size;
   note: string;
+  frameRate?: number;
+  frameRateDetected?: boolean;
 } | null;
 
 const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -83,6 +85,11 @@ export default function App() {
     if (!sourceSize) return null;
     return calculateOutputSize(sourceSize.width, sourceSize.height, target);
   }, [sourceSize, target]);
+
+  const imageAssessment = useMemo(() => {
+    if (mode !== "image" || !sourceSize) return null;
+    return assessImageTarget(sourceSize, target);
+  }, [mode, sourceSize, target]);
 
   useEffect(() => {
     if (!file) return;
