@@ -209,3 +209,75 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
   h1 { font-size: 2.3rem; }
   .privacy-badge { font-size: .75rem; }
 }
+
+/* --- Moteur IA --- */
+.engine-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+.model-box {
+  margin-top: 12px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255,255,255,.07);
+  background: rgba(255,255,255,.028);
+  display: grid;
+  gap: 10px;
+}
+
+.model-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.model-head strong { font-size: .86rem; }
+
+.badge {
+  font-size: .66rem;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,.12);
+  color: #8295ad;
+  white-space: nowrap;
+}
+.badge.ok { border-color: rgba(94,156,255,.45); color: #9cc3ff; background: rgba(53,114,209,.14); }
+
+.model-note { margin: 0; color: #8295ad; font-size: .72rem; line-height: 1.45; }
+
+.model-box input[type="url"] {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,.09);
+  background: rgba(3,8,16,.7);
+  color: #dce8fb;
+  font-size: 16px;
+  font-family: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+}
+.model-box input[type="url"]:focus { outline: none; border-color: #5e9cff; }
+
+.model-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.file-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 9px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,.12);
+  background: rgba(255,255,255,.04);
+  color: #dce8fb;
+  font-size: .78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.file-button:hover { border-color: rgba(120,168,255,.4); }
+.file-button input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.file-button:has(input:disabled) { opacity: .55; cursor: not-allowed; }
+
+.model-status {
+  font-size: .72rem;
+  color: #9cc3ff;
+  font-family: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+  word-break: break-word;
+}
+
+@media (max-width: 640px) {
+  .engine-grid { grid-template-columns: 1fr; }
+}
