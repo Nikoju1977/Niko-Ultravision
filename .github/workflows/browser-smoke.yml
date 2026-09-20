@@ -44,7 +44,7 @@ jobs:
             curl -fsS http://127.0.0.1:4173 >/dev/null && break
             sleep 1
           done
-          cat > /tmp/smoke.mjs <<'JS'
+          cat > smoke.mjs <<'JS'
           import { chromium } from "playwright";
           import path from "node:path";
 
@@ -77,4 +77,4 @@ jobs:
           console.log("BROWSER_SMOKE_OK image+video local processing; no external HTTP requests");
           await browser.close();
           JS
-          node /tmp/smoke.mjs
+          node smoke.mjs
