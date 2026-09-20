@@ -1,5 +1,14 @@
-import { calculateOutputSize, megapixels, type Size, type TargetId } from "./geometry";
+import { calculateOutputSize, type Size, type TargetId } from "./geometry";
 import { PROFILES, type ProfileId } from "./profiles";
+import { enhanceVideoWithRecorder } from "./videoRecorderFallback";
+import {
+  negotiateCodec,
+  webCodecsAvailable,
+  type CodecIntent,
+  type CodecPlan,
+} from "./videoCodec";
+
+export type VideoPipeline = "webcodecs" | "recorder";
 
 export interface VideoEnhanceResult {
   blob: Blob;
@@ -8,284 +17,227 @@ export interface VideoEnhanceResult {
   audioPreserved: boolean;
   frameRate: number;
   frameRateDetected: boolean;
+  pipeline: VideoPipeline;
+  plan: CodecPlan | null;
+  /** true quand les paquets ont été recopiés sans réencodage. */
+  streamCopied: boolean;
+  notes: string[];
 }
 
-type FrameVideo = HTMLVideoElement & {
-  requestVideoFrameCallback?: (
-    callback: (now: number, metadata: { mediaTime: number }) => void,
-  ) => number;
-};
-
-function waitForMetadata(video: HTMLVideoElement): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      video.removeEventListener("loadedmetadata", onLoaded);
-      video.removeEventListener("error", onError);
-    };
-    const onLoaded = () => {
-      cleanup();
-      resolve();
-    };
-    const onError = () => {
-      cleanup();
-      reject(new Error("Impossible de lire les métadonnées vidéo."));
-    };
-    video.addEventListener("loadedmetadata", onLoaded, { once: true });
-    video.addEventListener("error", onError, { once: true });
-  });
+export interface EnhanceVideoOptions {
+  intent?: CodecIntent;
+  onProgress?: (value: number, label: string) => void;
 }
 
-async function rewindVideo(video: HTMLVideoElement): Promise<void> {
-  if (video.currentTime <= 0.001) {
-    video.currentTime = 0;
-    return;
+async function inspectWithMediabunny(file: File) {
+  const { ALL_FORMATS, BlobSource, Input } = await import("mediabunny");
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+
+  if (!(await input.canRead())) {
+    throw new Error("Format de conteneur non reconnu par le démultiplexeur local.");
   }
 
-  await new Promise<void>((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      video.removeEventListener("seeked", finish);
-      resolve();
-    };
-    video.addEventListener("seeked", finish, { once: true });
-    video.currentTime = 0;
-    window.setTimeout(finish, 1200);
-  });
-}
+  const track = await input.getPrimaryVideoTrack();
+  if (!track) throw new Error("Aucune piste vidéo dans ce fichier.");
 
-function chooseMimeType(): string {
-  const choices = [
-    "video/webm;codecs=vp9,opus",
-    "video/webm;codecs=vp8,opus",
-    "video/webm;codecs=vp9",
-    "video/webm;codecs=vp8",
-    "video/webm",
-    "video/mp4",
-  ];
-  return choices.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
-}
+  const audioTrack = await input.getPrimaryAudioTrack();
 
-function videoBitrate(size: Size, frameRate: number): number {
-  const mp = megapixels(size);
-  const base = mp >= 8 ? 28_000_000 : mp >= 3.5 ? 16_000_000 : 9_000_000;
-  return frameRate > 30 ? Math.round(base * 1.5) : base;
+  let frameRate = 0;
+  let frameRateDetected = false;
+  try {
+    const stats = await track.computePacketStats(120);
+    if (stats && Number.isFinite(stats.averagePacketRate) && stats.averagePacketRate > 0) {
+      frameRate = stats.averagePacketRate;
+      frameRateDetected = true;
+    }
+  } catch {
+    frameRate = 0;
+  }
+
+  return {
+    input,
+    track,
+    hasAudio: Boolean(audioTrack),
+    width: track.displayWidth,
+    height: track.displayHeight,
+    frameRate: frameRateDetected ? frameRate : 30,
+    frameRateDetected,
+  };
 }
 
 function normalizeFrameRate(value: number): number {
-  if (!Number.isFinite(value) || value < 12) return 30;
-  const capped = Math.min(60, value);
-  const standards = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60];
-  return standards.reduce((best, candidate) =>
-    Math.abs(candidate - capped) < Math.abs(best - capped) ? candidate : best,
+  if (!Number.isFinite(value) || value < 8) return 30;
+  const standards = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 100, 120];
+  const nearest = standards.reduce((best, candidate) =>
+    Math.abs(candidate - value) < Math.abs(best - value) ? candidate : best,
   );
-}
-
-async function detectFrameRate(video: HTMLVideoElement): Promise<{ value: number; detected: boolean }> {
-  const framed = video as FrameVideo;
-  if (!framed.requestVideoFrameCallback || !Number.isFinite(video.duration) || video.duration <= 0) {
-    return { value: 30, detected: false };
-  }
-
-  const sampleSeconds = Math.min(0.8, Math.max(0.35, video.duration * 0.5));
-  const originalMuted = video.muted;
-  video.muted = true;
-  video.currentTime = 0;
-
-  return new Promise((resolve) => {
-    let firstMediaTime: number | null = null;
-    let lastMediaTime = 0;
-    let frames = 0;
-    let settled = false;
-    let timer = 0;
-
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      window.clearTimeout(timer);
-      video.removeEventListener("ended", wrappedFinish);
-      video.pause();
-      video.currentTime = 0;
-      video.muted = originalMuted;
-      const elapsed = firstMediaTime == null ? 0 : lastMediaTime - firstMediaTime;
-      if (frames < 3 || elapsed <= 0) {
-        resolve({ value: 30, detected: false });
-        return;
-      }
-      const measured = (frames - 1) / elapsed;
-      resolve({ value: normalizeFrameRate(measured), detected: true });
-    };
-
-    const onFrame = (_now: number, metadata: { mediaTime: number }) => {
-      if (firstMediaTime == null) firstMediaTime = metadata.mediaTime;
-      lastMediaTime = metadata.mediaTime;
-      frames += 1;
-      if (metadata.mediaTime - (firstMediaTime ?? 0) >= sampleSeconds || video.ended) {
-        finish();
-        return;
-      }
-      framed.requestVideoFrameCallback?.(onFrame);
-    };
-
-    function wrappedFinish() {
-      finish();
-    }
-
-    timer = window.setTimeout(finish, Math.max(1800, sampleSeconds * 2500));
-    video.addEventListener("ended", wrappedFinish, { once: true });
-    framed.requestVideoFrameCallback(onFrame);
-    void video.play().catch(wrappedFinish);
-  });
+  return Math.abs(nearest - value) / value <= 0.02 ? nearest : Math.round(value * 1000) / 1000;
 }
 
 export async function enhanceVideo(
   file: File,
   target: TargetId,
   profile: ProfileId,
-  onProgress?: (value: number, label: string) => void,
+  options: EnhanceVideoOptions = {},
 ): Promise<VideoEnhanceResult> {
-  if (typeof MediaRecorder === "undefined") {
-    throw new Error("MediaRecorder n'est pas disponible sur ce navigateur.");
-  }
+  const { intent = "master", onProgress } = options;
 
-  const url = URL.createObjectURL(file);
-  const video = document.createElement("video");
-  video.src = url;
-  video.preload = "auto";
-  video.playsInline = true;
-
-  let stream: MediaStream | null = null;
-  let audioContext: AudioContext | null = null;
-  let recorder: MediaRecorder | null = null;
-  let canvas: HTMLCanvasElement | null = null;
-
-  try {
-    await waitForMetadata(video);
-
-    const output = calculateOutputSize(video.videoWidth, video.videoHeight, target);
-    if (Math.max(output.width, output.height) > 3840 || output.width * output.height > 9_000_000) {
-      throw new Error("Le traitement vidéo local est limité à 4K pour rester fiable dans le navigateur.");
-    }
-
-    onProgress?.(0.01, "Analyse du framerate");
-    const detectedRate = await detectFrameRate(video);
-    const frameRate = detectedRate.value;
-    await rewindVideo(video);
-
-    canvas = document.createElement("canvas");
-    canvas.width = output.width;
-    canvas.height = output.height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Canvas 2D indisponible.");
-
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    ctx.filter = PROFILES[profile].filter;
-
-    stream = canvas.captureStream(frameRate);
-    let audioPreserved = false;
-
-    try {
-      const AudioContextCtor =
-        window.AudioContext ??
-        (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-
-      if (AudioContextCtor) {
-        audioContext = new AudioContextCtor();
-        const source = audioContext.createMediaElementSource(video);
-        const destination = audioContext.createMediaStreamDestination();
-        source.connect(destination);
-        destination.stream.getAudioTracks().forEach((track) => stream?.addTrack(track));
-        audioPreserved = destination.stream.getAudioTracks().length > 0;
-        await audioContext.resume();
-      }
-    } catch {
-      audioPreserved = false;
-      if (audioContext) {
-        await audioContext.close().catch(() => undefined);
-        audioContext = null;
-      }
-    }
-
-    const mimeType = chooseMimeType();
-    recorder = new MediaRecorder(stream, {
-      ...(mimeType ? { mimeType } : {}),
-      videoBitsPerSecond: videoBitrate(output, frameRate),
-      audioBitsPerSecond: 192_000,
-    });
-
-    const chunks: BlobPart[] = [];
-    recorder.addEventListener("dataavailable", (event) => {
-      if (event.data.size > 0) chunks.push(event.data);
-    });
-
-    const finished = new Promise<void>((resolve, reject) => {
-      recorder?.addEventListener("stop", () => resolve(), { once: true });
-      recorder?.addEventListener("error", () => reject(new Error("Erreur d'encodage vidéo.")), { once: true });
-      video.addEventListener("error", () => reject(new Error("Erreur de lecture vidéo pendant le traitement.")), { once: true });
-    });
-
-    const drawFrame = () => {
-      if (video.ended || video.paused) return;
-      ctx.drawImage(video, 0, 0, output.width, output.height);
-      const progress = video.duration ? Math.min(0.98, video.currentTime / video.duration) : 0;
-      onProgress?.(progress, `Traitement vidéo local · ${Math.round(frameRate)} i/s`);
-
-      const framed = video as FrameVideo;
-      if (framed.requestVideoFrameCallback) {
-        framed.requestVideoFrameCallback(() => drawFrame());
-      } else {
-        requestAnimationFrame(drawFrame);
-      }
-    };
-
-    video.addEventListener(
-      "ended",
-      () => {
-        if (recorder?.state !== "inactive") recorder?.stop();
-      },
-      { once: true },
-    );
-
-    video.currentTime = 0;
-    video.muted = false;
-    onProgress?.(0.03, `Préparation · ${Math.round(frameRate)} i/s`);
-    recorder.start(1000);
-    await video.play();
-    drawFrame();
-    await finished;
-
-    const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "video/webm" });
-    if (blob.size === 0) throw new Error("L'encodeur vidéo a produit un fichier vide.");
-
-    onProgress?.(1, "Terminé");
-
+  if (!webCodecsAvailable()) {
+    onProgress?.(0.01, "WebCodecs indisponible · repli MediaRecorder");
+    const legacy = await enhanceVideoWithRecorder(file, target, profile, onProgress);
     return {
-      blob,
-      size: output,
-      mimeType: blob.type,
-      audioPreserved,
-      frameRate,
-      frameRateDetected: detectedRate.detected,
+      ...legacy,
+      pipeline: "recorder",
+      plan: null,
+      streamCopied: false,
+      notes: [
+        "WebCodecs absent de ce navigateur : encodage en temps réel via MediaRecorder.",
+        "Des images peuvent être perdues si le rendu prend du retard, et la qualité n'est pas réglable finement.",
+      ],
     };
-  } finally {
-    video.pause();
-    if (recorder && recorder.state !== "inactive") {
-      try {
-        recorder.stop();
-      } catch {
-        // no-op: cleanup only
-      }
-    }
-    stream?.getTracks().forEach((track) => track.stop());
-    if (audioContext) await audioContext.close().catch(() => undefined);
-    if (canvas) {
-      canvas.width = 1;
-      canvas.height = 1;
-    }
-    video.removeAttribute("src");
-    video.load();
-    URL.revokeObjectURL(url);
   }
+
+  onProgress?.(0.02, "Analyse du conteneur");
+  const probe = await inspectWithMediabunny(file);
+  const notes: string[] = [];
+
+  const output = calculateOutputSize(probe.width, probe.height, target);
+  const frameRate = normalizeFrameRate(probe.frameRate);
+  const resizing = output.width !== probe.width || output.height !== probe.height;
+  const filter = PROFILES[profile].filter;
+  const filtering = filter !== "none";
+
+  const wantsCopy = intent === "copy";
+  if (wantsCopy && (resizing || filtering)) {
+    notes.push(
+      "Copie directe demandée mais un redimensionnement ou un filtre est actif : réencodage nécessaire.",
+    );
+  }
+  const pureCopy = wantsCopy && !resizing && !filtering;
+
+  let plan: CodecPlan | null = null;
+  if (!pureCopy) {
+    plan = await negotiateCodec(wantsCopy ? "master" : intent, output.width, output.height, frameRate);
+    if (!plan) {
+      throw new Error(
+        `Aucun codec encodable par ce navigateur en ${output.width}×${output.height}. Réduis la définition cible.`,
+      );
+    }
+    notes.push(...plan.rejected);
+  }
+
+  const {
+    ALL_FORMATS,
+    BlobSource,
+    BufferTarget,
+    Conversion,
+    Input,
+    Mp4OutputFormat,
+    Output,
+    QUALITY_HIGH,
+    QUALITY_VERY_HIGH,
+    WebMOutputFormat,
+  } = await import("mediabunny");
+
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+  const container = plan?.container ?? "mp4";
+  const bufferTarget = new BufferTarget();
+  const out = new Output({
+    format: container === "mp4" ? new Mp4OutputFormat() : new WebMOutputFormat(),
+    target: bufferTarget,
+  });
+
+  let workCanvas: HTMLCanvasElement | null = null;
+  let workCtx: CanvasRenderingContext2D | null = null;
+
+  const conversion = await Conversion.init({
+    input,
+    output: out,
+    showWarnings: false,
+    video: pureCopy
+      ? {}
+      : {
+          width: output.width,
+          height: output.height,
+          fit: "fill",
+          codec: plan!.codec,
+          quality: plan!.quality === "very-high" ? QUALITY_VERY_HIGH : QUALITY_HIGH,
+          keyFrameInterval: plan!.keyFrameInterval,
+          ...(filtering
+            ? {
+                processedWidth: output.width,
+                processedHeight: output.height,
+                process: (sample) => {
+                  if (!workCanvas || !workCtx) {
+                    workCanvas = document.createElement("canvas");
+                    workCanvas.width = output.width;
+                    workCanvas.height = output.height;
+                    workCtx = workCanvas.getContext("2d");
+                    if (!workCtx) throw new Error("Canvas 2D indisponible pour le filtrage.");
+                  }
+                  workCtx.filter = filter;
+                  workCtx.clearRect(0, 0, output.width, output.height);
+                  sample.draw(workCtx, 0, 0, output.width, output.height);
+                  return workCanvas;
+                },
+              }
+            : {}),
+        },
+    audio: {},
+  });
+
+  if (!conversion.isValid) {
+    const reasons = conversion.discardedTracks
+      .map((entry) => `${entry.track.type} : ${entry.reason}`)
+      .join(" ; ");
+    throw new Error(`Conversion impossible (${reasons || "aucune piste exploitable"}).`);
+  }
+
+  for (const discarded of conversion.discardedTracks) {
+    notes.push(`Piste ${discarded.track.type} écartée : ${discarded.reason}`);
+  }
+
+  const label = pureCopy
+    ? "Remultiplexage sans réencodage"
+    : `Encodage ${plan!.codec.toUpperCase()} · ${output.width}×${output.height} · ${Math.round(frameRate)} i/s`;
+
+  conversion.onProgress = (value) => {
+    onProgress?.(0.05 + Math.min(0.94, value) * 0.92, label);
+  };
+
+  onProgress?.(0.05, label);
+  await conversion.execute();
+
+  const buffer = bufferTarget.buffer;
+  if (!buffer || buffer.byteLength === 0) throw new Error("L'encodeur n'a produit aucune donnée.");
+
+  const audioPreserved = conversion.utilizedTracks.some((track) => track.type === "audio");
+  const blob = new Blob([buffer], {
+    type: container === "mp4" ? "video/mp4" : "video/webm",
+  });
+
+  if (!probe.frameRateDetected) {
+    notes.push("Cadence source non lisible dans le conteneur : 30 i/s retenus par compatibilité.");
+  }
+  if (probe.hasAudio && !audioPreserved) {
+    notes.push("La piste audio n'a pas pu être conservée dans ce conteneur.");
+  }
+  if (plan && plan.keyFrameInterval === 0) {
+    notes.push("Toutes les images sont des images clés : fichier lourd, mais montage image par image exact.");
+  }
+
+  onProgress?.(1, "Terminé");
+
+  return {
+    blob,
+    size: pureCopy ? { width: probe.width, height: probe.height } : output,
+    mimeType: blob.type,
+    audioPreserved,
+    frameRate,
+    frameRateDetected: probe.frameRateDetected,
+    pipeline: "webcodecs",
+    plan,
+    streamCopied: pureCopy,
+    notes,
+  };
 }
