@@ -35,6 +35,26 @@ function waitForMetadata(video: HTMLVideoElement): Promise<void> {
   });
 }
 
+async function rewindVideo(video: HTMLVideoElement): Promise<void> {
+  if (video.currentTime <= 0.001) {
+    video.currentTime = 0;
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      video.removeEventListener("seeked", finish);
+      resolve();
+    };
+    video.addEventListener("seeked", finish, { once: true });
+    video.currentTime = 0;
+    window.setTimeout(finish, 1200);
+  });
+}
+
 function chooseMimeType(): string {
   const choices = [
     "video/webm;codecs=vp9,opus",
@@ -149,6 +169,7 @@ export async function enhanceVideo(
     onProgress?.(0.01, "Analyse du framerate");
     const detectedRate = await detectFrameRate(video);
     const frameRate = detectedRate.value;
+    await rewindVideo(video);
 
     canvas = document.createElement("canvas");
     canvas.width = output.width;
