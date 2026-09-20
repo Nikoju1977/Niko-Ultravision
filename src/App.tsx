@@ -59,15 +59,63 @@ function extensionFor(type: string): string {
   return "webm";
 }
 
-async function inspectMedia(file: File): Promise<{ mode: MediaMode; size: Size }> {
-  if (file.type.startsWith("image/")) {
-    const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
-    const size = { width: bitmap.width, height: bitmap.height };
-    bitmap.close();
-    return { mode: "image", size };
+const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "avif", "gif", "bmp"]);
+const VIDEO_EXTENSIONS = new Set(["mp4", "webm", "mov", "m4v", "ogv"]);
+
+function fileExtension(file: File): string {
+  const match = file.name.toLowerCase().match(/\.([a-z0-9]+)$/);
+  return match?.[1] ?? "";
+}
+
+function looksLikeImage(file: File): boolean {
+  return file.type.startsWith("image/") || IMAGE_EXTENSIONS.has(fileExtension(file));
+}
+
+function looksLikeVideo(file: File): boolean {
+  return file.type.startsWith("video/") || VIDEO_EXTENSIONS.has(fileExtension(file));
+}
+
+async function inspectImage(file: File): Promise<Size> {
+  // Android file providers sometimes expose an empty MIME type, and some
+  // browser builds reject ImageBitmapOptions. Try the native fast path first,
+  // then fall back to the browser's <img> decoder.
+  if ("createImageBitmap" in window) {
+    try {
+      const bitmap = await createImageBitmap(file);
+      const size = { width: bitmap.width, height: bitmap.height };
+      bitmap.close();
+      if (size.width > 0 && size.height > 0) return size;
+    } catch {
+      // Fall through to HTMLImageElement decoding below.
+    }
   }
 
-  if (file.type.startsWith("video/")) {
+  const url = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    image.decoding = "async";
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("Image illisible par ce navigateur."));
+      image.src = url;
+    });
+
+    if (!image.naturalWidth || !image.naturalHeight) {
+      throw new Error("Dimensions de l'image introuvables.");
+    }
+
+    return { width: image.naturalWidth, height: image.naturalHeight };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function inspectMedia(file: File): Promise<{ mode: MediaMode; size: Size }> {
+  if (looksLikeImage(file)) {
+    return { mode: "image", size: await inspectImage(file) };
+  }
+
+  if (looksLikeVideo(file)) {
     const url = URL.createObjectURL(file);
     try {
       const video = document.createElement("video");
@@ -83,7 +131,8 @@ async function inspectMedia(file: File): Promise<{ mode: MediaMode; size: Size }
     }
   }
 
-  throw new Error("Format non pris en charge. Utilise une image ou une vidéo.");
+  const detail = file.type ? `Type détecté : ${file.type}` : "Type MIME non fourni par Android";
+  throw new Error(`Format non pris en charge. ${detail}. Utilise JPG, PNG, WebP, AVIF, MP4 ou WebM.`);
 }
 
 export default function App() {
@@ -314,7 +363,11 @@ export default function App() {
             <input
               type="file"
               accept="image/*,video/*"
-              onChange={(event) => void handleFile(event.target.files?.[0] ?? null)}
+              onChange={(event) => {
+                const picked = event.currentTarget.files?.[0] ?? null;
+                event.currentTarget.value = "";
+                void handleFile(picked);
+              }}
               disabled={busy}
             />
             {sourceUrl ? (
