@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
 import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
 import { decodeImageFile } from "./lib/imageDecode";
+import { orchestrateMediaAgents, type AgentDecision } from "./lib/mediaAgents";
 import {
   AI_MAX_SOURCE_PIXELS,
   AI_WARN_SOURCE_PIXELS,
@@ -130,6 +131,7 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState<string | null>(null);
   const [intent, setIntent] = useState<CodecIntent>("master");
   const [codecs, setCodecs] = useState<string[] | null>(null);
+  const [agentDecisions, setAgentDecisions] = useState<AgentDecision[]>([]);
 
   const targets = mode === "image" ? IMAGE_TARGETS : VIDEO_TARGETS;
   const predicted = useMemo(() => {
@@ -243,6 +245,7 @@ export default function App() {
     setError(null);
     setStatus("Analyse de la source");
     setProgress(0);
+    setAgentDecisions([]);
     setFile(null);
     setSourceSize(null);
     setOutput((previous) => {
@@ -294,9 +297,31 @@ export default function App() {
     });
 
     try {
+      setStatus("Agents AutoPilot · analyse");
+      const plan = await orchestrateMediaAgents({
+        file,
+        mode,
+        sourceSize,
+        target,
+        profile,
+        engine,
+        format,
+        intent,
+        aiModelLoaded: Boolean(model),
+        webGpu: webGpuAvailable(),
+      });
+
+      setAgentDecisions(plan.decisions);
+      if (plan.target !== target) setTarget(plan.target);
+      if (plan.profile !== profile) setProfile(plan.profile);
+      if (plan.engine !== engine) setEngine(plan.engine);
+      if (plan.intent !== intent) setIntent(plan.intent);
+
+      const agentNotes = plan.decisions.map((entry) => `${entry.label} : ${entry.message}`);
+
       if (mode === "image") {
-        const result = await enhanceImage(file, target, profile, format, {
-          engine,
+        const result = await enhanceImage(file, plan.target, plan.profile, plan.format, {
+          engine: plan.engine,
           onProgress: (value, label) => {
             setProgress(value);
             setStatus(label);
@@ -314,10 +339,11 @@ export default function App() {
               : result.sharpenApplied
                 ? "Agrandissement progressif + accentuation locale légère."
                 : "Agrandissement progressif haute qualité ; accentuation désactivée sur très grande image pour préserver la mémoire.",
+          notes: agentNotes,
         });
       } else {
-        const result = await enhanceVideo(file, target, profile, {
-          intent,
+        const result = await enhanceVideo(file, plan.target, plan.profile, {
+          intent: plan.intent,
           onProgress: (value, label) => {
             setProgress(value);
             setStatus(label);
@@ -333,7 +359,7 @@ export default function App() {
             : result.plan
               ? `${result.plan.codec.toUpperCase()} · ${result.plan.container.toUpperCase()} · ${result.plan.keyFrameInterval === 0 ? "tout intra" : `clé/${result.plan.keyFrameInterval}s`}`
               : "MediaRecorder",
-          notes: result.notes,
+          notes: [...agentNotes, ...result.notes],
           note:
             (result.pipeline === "webcodecs"
               ? "Pipeline WebCodecs : aucune image perdue, horodatage exact. "
@@ -626,6 +652,29 @@ export default function App() {
             </div>
           )}
 
+          <div className="agent-box">
+            <div className="agent-head">
+              <div>
+                <strong>AutoPilot agents Image + Vidéo</strong>
+                <span>7 agents locaux supervisent qualité, upscale, mémoire, format et codecs.</span>
+              </div>
+              <span className="badge ok">ACTIF</span>
+            </div>
+
+            {agentDecisions.length > 0 ? (
+              <div className="agent-list">
+                {agentDecisions.map((entry, index) => (
+                  <div className={`agent-row ${entry.status}`} key={`${entry.agent}-${index}`}>
+                    <strong>{entry.label}</strong>
+                    <span>{entry.message}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="model-note">Les agents analyseront automatiquement le média au lancement du master.</p>
+            )}
+          </div>
+
           <div className="fidelity-card">
             <strong>Géométrie verrouillée</strong>
             <span>Pas de crop automatique. Pas d’étirement. Le ratio source est recalculé mathématiquement à chaque cible.</span>
@@ -641,7 +690,7 @@ export default function App() {
             </div>
           )}
 
-          <button className="run-button" type="button" onClick={() => void runEnhancement()} disabled={!file || busy || imageAssessment?.supported === false}>
+          <button className="run-button" type="button" onClick={() => void runEnhancement()} disabled={!file || busy}>
             {busy ? "Traitement en cours…" : "Créer le master local"}
           </button>
 
