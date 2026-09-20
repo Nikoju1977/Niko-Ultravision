@@ -2,6 +2,7 @@ import { calculateOutputSize, megapixels, type Size, type TargetId } from "./geo
 import { PROFILES, type ProfileId } from "./profiles";
 import { canAllocateCanvas, canvasLimits } from "./capability";
 import { AI_MAX_SOURCE_PIXELS, loadedModel, upscaleWithAi } from "./aiUpscaler";
+import { decodeImageFile } from "./imageDecode";
 
 export type ImageFormat = "image/png" | "image/jpeg" | "image/webp";
 export type EngineId = "canvas" | "ai";
@@ -165,12 +166,12 @@ export async function enhanceImage(
   const { engine = "canvas", onProgress } = options;
 
   onProgress?.(0.03, "Décodage de l'image");
-  const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const decoded = await decodeImageFile(file);
 
   let current: HTMLCanvasElement | null = null;
 
   try {
-    const source = { width: bitmap.width, height: bitmap.height };
+    const source = { width: decoded.width, height: decoded.height };
     const assessment = assessImageTarget(source, target);
     if (!assessment.supported) {
       throw new Error(assessment.reason ?? "Cette définition dépasse les capacités locales sûres de cet appareil.");
@@ -184,10 +185,10 @@ export async function enhanceImage(
       );
     }
 
-    current = canvasFor(bitmap.width, bitmap.height);
+    current = canvasFor(decoded.width, decoded.height);
     const ctx = current.getContext("2d");
     if (!ctx) throw new Error("Canvas 2D indisponible.");
-    ctx.drawImage(bitmap, 0, 0);
+    ctx.drawImage(decoded.source, 0, 0);
 
     let engineUsed: EngineId = "canvas";
     let aiScale: number | null = null;
@@ -230,7 +231,7 @@ export async function enhanceImage(
     onProgress?.(1, "Terminé");
     return { blob, size: output, mimeType: format, sharpenApplied, engineUsed, aiScale, aiProvider };
   } finally {
-    bitmap.close();
+    decoded.close();
     release(current);
   }
 }
