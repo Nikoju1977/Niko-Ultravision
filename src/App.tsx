@@ -208,17 +208,13 @@ export default function App() {
           ctx.imageSmoothingQuality = "high";
           ctx.drawImage(decoded.source, 0, 0, width, height);
 
-          const preview = await new Promise<Blob>((resolve, reject) => {
-            canvas.toBlob(
-              (blob) => (blob ? resolve(blob) : reject(new Error("Aperçu impossible."))),
-              "image/jpeg",
-              0.9,
-            );
-          });
+          const preview = canvas.toDataURL("image/jpeg", 0.9);
+          if (!preview.startsWith("data:image/")) {
+            throw new Error("Aperçu impossible.");
+          }
 
           if (!alive) return;
-          objectUrl = URL.createObjectURL(preview);
-          setSourceUrl(objectUrl);
+          setSourceUrl(preview);
         } finally {
           decoded.close();
         }
