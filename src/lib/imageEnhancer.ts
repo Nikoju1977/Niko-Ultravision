@@ -3,6 +3,11 @@ import { PROFILES, type ProfileId } from "./profiles";
 import { canAllocateCanvas, canvasLimits } from "./capability";
 import { AI_MAX_SOURCE_PIXELS, loadedModel, upscaleWithAi } from "./aiUpscaler";
 import { decodeImageFile } from "./imageDecode";
+import {
+  applyDeepFocus,
+  DEFAULT_DEEP_FOCUS,
+  type DeepFocusSettings,
+} from "./deepFocus";
 
 export type ImageFormat = "image/png" | "image/jpeg" | "image/webp";
 export type EngineId = "canvas" | "ai";
@@ -16,6 +21,10 @@ export interface ImageEnhanceResult {
   engineUsed: EngineId;
   aiScale: number | null;
   aiProvider: string | null;
+  deepFocusApplied: boolean;
+  deepFocusLayers: number;
+  deepFocusConfidence: number;
+  deepFocusReason?: string;
 }
 
 export interface ImageTargetAssessment {
@@ -153,6 +162,7 @@ function resampleTo(
 
 export interface EnhanceImageOptions {
   engine?: EngineId;
+  deepFocus?: DeepFocusSettings;
   onProgress?: (value: number, label: string) => void;
 }
 
@@ -163,7 +173,11 @@ export async function enhanceImage(
   format: ImageFormat,
   options: EnhanceImageOptions = {},
 ): Promise<ImageEnhanceResult> {
-  const { engine = "canvas", onProgress } = options;
+  const {
+    engine = "canvas",
+    deepFocus = DEFAULT_DEEP_FOCUS,
+    onProgress,
+  } = options;
 
   onProgress?.(0.03, "Décodage de l'image");
   const decoded = await decodeImageFile(file);
@@ -190,6 +204,21 @@ export async function enhanceImage(
     if (!ctx) throw new Error("Canvas 2D indisponible.");
     ctx.drawImage(decoded.source, 0, 0);
 
+    let deepFocusApplied = false;
+    let deepFocusLayers = deepFocus.layers;
+    let deepFocusConfidence = 0;
+    let deepFocusReason: string | undefined;
+
+    if (deepFocus.enabled) {
+      const report = await applyDeepFocus(current, deepFocus, (ratio, label) => {
+        onProgress?.(0.06 + ratio * 0.22, label);
+      });
+      deepFocusApplied = report.applied;
+      deepFocusLayers = report.layers;
+      deepFocusConfidence = report.confidence;
+      deepFocusReason = report.skippedReason;
+    }
+
     let engineUsed: EngineId = "canvas";
     let aiScale: number | null = null;
     let aiProvider: string | null = null;
@@ -203,9 +232,9 @@ export async function enhanceImage(
         );
       }
 
-      onProgress?.(0.08, "Inférence IA · préparation");
+      onProgress?.(0.3, "Inférence IA · préparation");
       const inferred = await upscaleWithAi(current, (ratio, label) => {
-        onProgress?.(0.08 + ratio * 0.62, label);
+        onProgress?.(0.3 + ratio * 0.48, label);
       });
       release(current);
       current = inferred;
@@ -214,22 +243,38 @@ export async function enhanceImage(
       aiProvider = model.provider;
     }
 
-    onProgress?.(engineUsed === "ai" ? 0.72 : 0.18, "Normalisation géométrique");
+    onProgress?.(engineUsed === "ai" ? 0.8 : 0.34, "Normalisation géométrique");
     current = resampleTo(current, output, PROFILES[profile].filter, (pass) => {
-      const base = engineUsed === "ai" ? 0.74 : 0.2;
-      onProgress?.(Math.min(0.88, base + pass * 0.05), `Rééchantillonnage haute qualité · passe ${pass}`);
+      const base = engineUsed === "ai" ? 0.82 : 0.38;
+      onProgress?.(Math.min(0.9, base + pass * 0.05), `Rééchantillonnage haute qualité · passe ${pass}`);
     });
 
-    onProgress?.(0.9, "Finition locale");
-    // Après une passe IA, l'accentuation Canvas ferait double emploi.
-    const sharpenApplied = engineUsed === "ai" ? false : sharpen(current, PROFILES[profile].sharpen);
+    onProgress?.(0.91, "Finition locale");
+    // Deep Focus réalise déjà une accentuation adaptative avant l'upscale.
+    // Après IA ou Deep Focus, un sharpen global ferait double emploi et créerait des halos.
+    const sharpenApplied =
+      engineUsed === "ai" || deepFocusApplied
+        ? false
+        : sharpen(current, PROFILES[profile].sharpen);
 
-    onProgress?.(0.95, "Encodage du master");
+    onProgress?.(0.96, "Encodage du master");
     const blob = await toBlob(current, format, format === "image/png" ? 1 : 0.96);
     if (blob.size === 0) throw new Error("L'encodeur image a produit un fichier vide.");
 
     onProgress?.(1, "Terminé");
-    return { blob, size: output, mimeType: format, sharpenApplied, engineUsed, aiScale, aiProvider };
+    return {
+      blob,
+      size: output,
+      mimeType: format,
+      sharpenApplied,
+      engineUsed,
+      aiScale,
+      aiProvider,
+      deepFocusApplied,
+      deepFocusLayers,
+      deepFocusConfidence,
+      deepFocusReason,
+    };
   } finally {
     decoded.close();
     release(current);
