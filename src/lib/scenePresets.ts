@@ -1,5 +1,6 @@
 import type { DeepFocusSettings } from "./deepFocus";
 import type { PrecisionRestoreSettings } from "./precisionRestore";
+import type { DepthFocusSettings } from "./depth/depthTypes";
 
 export type ScenePresetId =
   | "balanced"
@@ -16,6 +17,7 @@ export interface ScenePreset {
   description: string;
   deepFocus: DeepFocusSettings;
   precisionRestore: PrecisionRestoreSettings;
+  depthFocusPrecision: DepthFocusSettings;
 }
 
 export const SCENE_PRESETS: Record<ScenePresetId, ScenePreset> = {
@@ -33,6 +35,15 @@ export const SCENE_PRESETS: Record<ScenePresetId, ScenePreset> = {
       centralBias: 0.30,
       noiseGate: 0.24,
     },
+    depthFocusPrecision: {
+      enabled: true,
+      mode: "heuristic",
+      planes: 12,
+      globalStrength: 0.56,
+      confidenceGate: 0.30,
+      fusionFeather: 0.42,
+      centerBias: 0.34,
+    },
   },
   "text-signs": {
     id: "text-signs",
@@ -47,6 +58,15 @@ export const SCENE_PRESETS: Record<ScenePresetId, ScenePreset> = {
       flatProtection: 0.74,
       centralBias: 0.22,
       noiseGate: 0.25,
+    },
+    depthFocusPrecision: {
+      enabled: true,
+      mode: "heuristic",
+      planes: 12,
+      globalStrength: 0.54,
+      confidenceGate: 0.28,
+      fusionFeather: 0.40,
+      centerBias: 0.24,
     },
   },
   "main-object": {
@@ -63,6 +83,15 @@ export const SCENE_PRESETS: Record<ScenePresetId, ScenePreset> = {
       centralBias: 0.78,
       noiseGate: 0.23,
     },
+    depthFocusPrecision: {
+      enabled: true,
+      mode: "heuristic",
+      planes: 14,
+      globalStrength: 0.62,
+      confidenceGate: 0.30,
+      fusionFeather: 0.48,
+      centerBias: 0.58,
+    },
   },
   aggressive: {
     id: "aggressive",
@@ -78,6 +107,15 @@ export const SCENE_PRESETS: Record<ScenePresetId, ScenePreset> = {
       centralBias: 0.48,
       noiseGate: 0.26,
     },
+    depthFocusPrecision: {
+      enabled: true,
+      mode: "heuristic",
+      planes: 16,
+      globalStrength: 0.68,
+      confidenceGate: 0.24,
+      fusionFeather: 0.52,
+      centerBias: 0.48,
+    },
   },
   "mobile-safe": {
     id: "mobile-safe",
@@ -92,6 +130,15 @@ export const SCENE_PRESETS: Record<ScenePresetId, ScenePreset> = {
       flatProtection: 0.82,
       centralBias: 0.18,
       noiseGate: 0.24,
+    },
+    depthFocusPrecision: {
+      enabled: true,
+      mode: "heuristic",
+      planes: 10,
+      globalStrength: 0.48,
+      confidenceGate: 0.34,
+      fusionFeather: 0.38,
+      centerBias: 0.20,
     },
   },
 };
