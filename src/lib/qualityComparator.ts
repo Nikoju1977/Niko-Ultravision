@@ -380,6 +380,6 @@ export async function compareImageQuality(source: Blob, output: Blob): Promise<Q
     textZone: zoneComparison(sourceText, outputText, masks.textCoverage),
     edgeZone: zoneComparison(sourceEdge, outputEdge, masks.edgeCoverage),
     flatZone: zoneComparison(sourceFlat, outputFlat, masks.flatCoverage),
-    centralZone: zoneComparison(sourceCentral, outputCentral, masks.centralStructure),
+    centralZone: zoneComparison(sourceCentral, outputCentral, masks.centralCoverage),
   };
 }
