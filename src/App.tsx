@@ -3,6 +3,8 @@ import DeepFocusControl, { type DeepFocusSettings } from "./DeepFocusControl";
 import ComparisonPanel from "./ComparisonPanel";
 import PrecisionRestoreControl, { type PrecisionRestoreSettings } from "./PrecisionRestoreControl";
 import ScenePrecisionControl from "./ScenePrecisionControl";
+import DepthFocusControl, { type DepthFocusSettings } from "./DepthFocusControl";
+import { DEFAULT_DEPTH_FOCUS } from "./lib/depth/depthTypes";
 import { analyzeScene, type SceneAnalysis } from "./lib/sceneAnalyzer";
 import {
   DEFAULT_SCENE_MODE,
@@ -52,6 +54,14 @@ type OutputState = {
   precisionTextCoverage?: number;
   precisionEdgeCoverage?: number;
   precisionFlatCoverage?: number;
+  depthFocusApplied?: boolean;
+  depthFocusPlanes?: number;
+  depthFocusConfidence?: number;
+  depthFocusCoverage?: number;
+  depthFocusNearCoverage?: number;
+  depthFocusMidCoverage?: number;
+  depthFocusFarCoverage?: number;
+  depthFocusMeanCorrection?: number;
   scenePreset?: ScenePresetId;
   codecLabel?: string;
   notes?: string[];
@@ -213,6 +223,7 @@ export default function App() {
     centralBias: 0.30,
     noiseGate: 0.22,
   });
+  const [depthFocusPrecision, setDepthFocusPrecision] = useState<DepthFocusSettings>({ ...DEFAULT_DEPTH_FOCUS });
   const [sceneMode, setSceneMode] = useState<SceneModeId>(DEFAULT_SCENE_MODE);
   const [sceneAnalysis, setSceneAnalysis] = useState<SceneAnalysis | null>(null);
   const [sceneAnalyzing, setSceneAnalyzing] = useState(false);
@@ -345,6 +356,8 @@ export default function App() {
     const preset = getScenePreset(sceneAnalysis.recommendedPreset);
     setDeepFocus({ ...preset.deepFocus });
     setPrecisionRestore({ ...preset.precisionRestore });
+    setDepthFocusPrecision({ ...preset.depthFocusPrecision });
+    setDepthFocusPrecision({ ...preset.depthFocusPrecision });
   }, [mode, sceneMode, sceneAnalysis]);
 
   useEffect(() => {
@@ -409,6 +422,7 @@ export default function App() {
       const preset = getScenePreset(sceneAnalysis.recommendedPreset);
       setDeepFocus({ ...preset.deepFocus });
       setPrecisionRestore({ ...preset.precisionRestore });
+      setDepthFocusPrecision({ ...preset.depthFocusPrecision });
       return;
     }
 
@@ -459,6 +473,7 @@ export default function App() {
           engine: plan.engine,
           deepFocus,
           precisionRestore,
+          depthFocusPrecision,
           onProgress: (value, label) => {
             setProgress(value);
             setStatus(label);
@@ -477,6 +492,14 @@ export default function App() {
           precisionTextCoverage: result.precisionTextCoverage,
           precisionEdgeCoverage: result.precisionEdgeCoverage,
           precisionFlatCoverage: result.precisionFlatCoverage,
+          depthFocusApplied: result.depthFocusApplied,
+          depthFocusPlanes: result.depthFocusPlanes,
+          depthFocusConfidence: result.depthFocusConfidence,
+          depthFocusCoverage: result.depthFocusCoverage,
+          depthFocusNearCoverage: result.depthFocusNearCoverage,
+          depthFocusMidCoverage: result.depthFocusMidCoverage,
+          depthFocusFarCoverage: result.depthFocusFarCoverage,
+          depthFocusMeanCorrection: result.depthFocusMeanCorrection,
           scenePreset: resolvedScenePreset,
           note:
             `Scene Precision ${SCENE_PRESETS[resolvedScenePreset].label}${sceneMode === "auto" ? " (Auto)" : ""}. ` +
@@ -485,6 +508,9 @@ export default function App() {
               : "") +
             (result.precisionRestoreApplied
               ? "Precision Restore a renforcé sélectivement texte et contours en protégeant les aplats. "
+              : "") +
+            (result.depthFocusApplied
+              ? `Depth Focus Precision a réparti la restauration sur ${result.depthFocusPlanes} plans Z avec ${Math.round(result.depthFocusConfidence * 100)} % de confiance moyenne. `
               : "") +
             (result.engineUsed === "ai"
               ? `Super-résolution IA x${result.aiScale} (${result.aiProvider?.toUpperCase()}) puis normalisation géométrique vers la cible.`
@@ -495,6 +521,7 @@ export default function App() {
             ...agentNotes,
             ...(result.deepFocusReason ? [`Deep Focus : ${result.deepFocusReason}`] : []),
             ...(result.precisionRestoreReason ? [`Precision Restore : ${result.precisionRestoreReason}`] : []),
+            ...(result.depthFocusReason ? [`Depth Focus Precision : ${result.depthFocusReason}`] : []),
           ],
         });
       } else {
@@ -796,6 +823,18 @@ export default function App() {
             </div>
           )}
 
+          {mode === "image" && (
+            <div className="control-block">
+              <label>Profondeur adaptative Z</label>
+              <DepthFocusControl
+                file={file}
+                disabled={busy}
+                value={depthFocusPrecision}
+                onChange={setDepthFocusPrecision}
+              />
+            </div>
+          )}
+
           {mode === "video" && (
             <div className="control-block">
               <label>Intention d’encodage</label>
@@ -953,6 +992,22 @@ export default function App() {
                     <dd>{Math.round((output.precisionFlatCoverage ?? 0) * 100)} % détectés</dd>
                   </div>
                 )}
+                {output.depthFocusApplied && (
+                  <div>
+                    <dt>Depth Focus Precision</dt>
+                    <dd>
+                      {output.depthFocusPlanes} plans Z · confiance {Math.round((output.depthFocusConfidence ?? 0) * 100)} % · couverture {Math.round((output.depthFocusCoverage ?? 0) * 100)} %
+                    </dd>
+                  </div>
+                )}
+                {output.depthFocusApplied && (
+                  <div>
+                    <dt>Répartition Z</dt>
+                    <dd>
+                      proche {Math.round((output.depthFocusNearCoverage ?? 0) * 100)} % · moyen {Math.round((output.depthFocusMidCoverage ?? 0) * 100)} % · lointain {Math.round((output.depthFocusFarCoverage ?? 0) * 100)} %
+                    </dd>
+                  </div>
+                )}
                 {output.codecLabel && (
                   <div><dt>Codec</dt><dd>{output.codecLabel}</dd></div>
                 )}
@@ -984,9 +1039,12 @@ export default function App() {
           dix bandes de focalisation adaptatives et une restauration locale contrast-limited : cela peut étendre la
           netteté perceptuelle sur plusieurs zones, sans prétendre recréer une profondeur physique disparue.
           <strong> Precision Restore</strong> détecte ensuite les structures fines probables, privilégie le texte et les
-          contours d’objets et protège les aplats pour limiter bruit et halos. <strong>Scene Precision Auto</strong>
-          choisit un preset à partir d'heuristiques locales (texte probable, contours, aplats et concentration centrale)
-          sans prétendre reconnaître sémantiquement les objets. Le <strong>Quality Lab</strong> compare
+          contours d’objets et protège les aplats pour limiter bruit et halos. <strong>Depth Focus Precision</strong>
+          estime ensuite une profondeur relative à faible résolution, calcule une carte de confiance et distribue la
+          restauration sur 10 à 16 plans Z avec fusion douce. Cette carte n’est pas une distance physique ni une vraie
+          reconstruction 3D. <strong>Scene Precision Auto</strong> choisit un preset à partir d'heuristiques locales
+          (texte probable, contours, aplats et concentration centrale) sans prétendre reconnaître sémantiquement les
+          objets. Le <strong>Quality Lab</strong> compare
           ensuite source et master à résolution commune : micro-détail, contours,
           contraste, SSIM par blocs, PSNR et carte de différence permettent de vérifier si le traitement a réellement
           modifié le signal. Seuls les poids du modèle transitent par le réseau,
