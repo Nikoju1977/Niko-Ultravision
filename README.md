@@ -61,12 +61,40 @@ Les réglages disponibles sont :
 - priorité texte ;
 - priorité contours ;
 - protection des aplats ;
+- priorité centrale ;
 - seuil anti-bruit.
 
 Le moteur reste volontairement conservateur : il accentue des structures mesurées dans
 l'image et ne présente pas une reconstruction hypothétique comme un détail original.
 Comme Deep Focus, l'étape est limitée à 10 MP en entrée pour protéger la mémoire des
 navigateurs mobiles.
+
+## Depth Focus Precision v0.1
+
+Depth Focus Precision ajoute une seconde couche de restauration orientée profondeur. Le
+moteur construit une **carte de profondeur relative** à définition réduite, calcule une
+**carte de confiance**, puis répartit la correction sur **10 à 16 plans Z**. Les paramètres
+de correction sont interpolés entre les plans pour éviter les coutures visibles.
+
+Le traitement combine :
+
+- intensité différente selon le plan Z ;
+- confiance locale pour éviter de forcer les zones ambiguës ;
+- renforcement plus prudent des plans lointains ;
+- protection accrue des zones peu structurées ;
+- fusion inter-plans réglable ;
+- pondération optionnelle du centre de l'image ;
+- carte de profondeur et carte de confiance visibles dans l'interface.
+
+La profondeur de v0.1 est **heuristique et relative** : elle utilise micro-structure,
+contraste local et position dans l'image. Elle ne correspond ni à une distance en mètres,
+ni à une reconstruction 3D, ni à une segmentation sémantique. Cette API est volontairement
+préparée pour accueillir ultérieurement un modèle monoculaire ONNX sans changer le reste
+du pipeline.
+
+Pour préserver la mémoire et le temps de calcul sur mobile, la restauration Depth Focus
+Precision est limitée à **8 MP en entrée**. Au-delà, l'étape est ignorée proprement et le
+reste du pipeline continue.
 
 ## Scene Precision v0.2
 
@@ -195,6 +223,8 @@ gênante pour un usage étalonnage, et elle est structurelle, pas un oubli.
 - Le repli MediaRecorder reste plafonné à 4K ; la cible 8K exige WebCodecs.
 - L'inférence IA est plafonnée à **8 MP en entrée**, avec avertissement au-delà de 2 MP.
   Sans WebGPU, compter plusieurs minutes.
+- Depth Focus Precision v0.1 utilise une profondeur **relative heuristique**, pas une profondeur métrique.
+  Son traitement pleine résolution est limité à **8 MP** pour protéger la mémoire locale.
 - Le mode multi-thread WASM exige l'isolation cross-origin (COOP/COEP). Sans elle,
   l'inférence tourne en mono-thread. C'est un choix : activer COOP/COEP casserait d'autres
   appels cross-origin.
@@ -226,5 +256,5 @@ normalisation des cadences sont vérifiés par calcul. Le code compile contre le
 de mediabunny et d'ONNX Runtime Web, et le build de production passe.
 
 En revanche, **l'inférence IA et l'encodage WebCodecs doivent être testés dans un vrai
-navigateur** : disponibilité de l'URL du modèle : disponibilité de l'URL du modèle, compatibilité de son
-graphe, et temps de calcul effectif sur ta machine.
+navigateur** : disponibilité de l'URL du modèle, compatibilité de son graphe et temps de calcul effectif
+sur ta machine.
