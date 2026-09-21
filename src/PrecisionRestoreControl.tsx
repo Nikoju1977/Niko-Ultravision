@@ -94,6 +94,20 @@ export default function PrecisionRestoreControl({ disabled = false, value, onCha
         </label>
 
         <label>
+          <span>Priorité centre</span>
+          <strong>{percent(value.centralBias)} %</strong>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            value={percent(value.centralBias)}
+            disabled={disabled || !value.enabled}
+            onChange={(event) => onChange({ ...value, centralBias: Number(event.target.value) / 100 })}
+          />
+        </label>
+
+        <label>
           <span>Seuil anti-bruit</span>
           <strong>{percent(value.noiseGate)} %</strong>
           <input

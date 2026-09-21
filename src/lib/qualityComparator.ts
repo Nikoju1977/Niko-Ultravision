@@ -1,4 +1,5 @@
 import { decodeImageFile } from "./imageDecode";
+import { buildZoneMasks, maskHeatmap } from "./qualityZones";
 
 export interface QualityMetrics {
   /** Variance du Laplacien : énergie de micro-détail, pas une mesure optique absolue. */
@@ -9,6 +10,13 @@ export interface QualityMetrics {
   edgeEnergy: number;
   /** Luminance moyenne 0..1. */
   meanLuma: number;
+}
+
+export interface ZoneComparison {
+  sharpnessGainPercent: number;
+  edgeGainPercent: number;
+  contrastChangePercent: number;
+  coveragePercent: number;
 }
 
 export interface QualityComparison {
@@ -26,6 +34,14 @@ export interface QualityComparison {
   sourcePreview: string;
   outputPreview: string;
   differencePreview: string;
+  textHeatmap: string;
+  edgeHeatmap: string;
+  flatHeatmap: string;
+  centralHeatmap: string;
+  textZone: ZoneComparison;
+  edgeZone: ZoneComparison;
+  flatZone: ZoneComparison;
+  centralZone: ZoneComparison;
 }
 
 const PREVIEW_MAX_SIDE = 720;
@@ -43,11 +59,7 @@ function luma(r: number, g: number, b: number): number {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-async function drawBlob(
-  blob: Blob,
-  width: number,
-  height: number,
-): Promise<HTMLCanvasElement> {
+async function drawBlob(blob: Blob, width: number, height: number): Promise<HTMLCanvasElement> {
   const decoded = await decodeImageFile(blob);
   try {
     const canvas = document.createElement("canvas");
@@ -139,6 +151,60 @@ function qualityMetrics(image: ImageData): QualityMetrics {
   };
 }
 
+function zoneMetrics(image: ImageData, mask: Float32Array): QualityMetrics {
+  const width = image.width;
+  const height = image.height;
+  const y = extractLuma(image);
+
+  let weightSum = 0;
+  let meanAcc = 0;
+  for (let i = 0; i < y.length; i += 1) {
+    const w = mask[i];
+    if (w <= 0.001) continue;
+    meanAcc += y[i] * w;
+    weightSum += w;
+  }
+
+  const mean = weightSum ? meanAcc / weightSum : 0;
+  let variance = 0;
+  let edgeSum = 0;
+  let edgeWeight = 0;
+  let lapSum = 0;
+  let lapSq = 0;
+  let lapWeight = 0;
+
+  for (let yy = 1; yy < height - 1; yy += 1) {
+    for (let xx = 1; xx < width - 1; xx += 1) {
+      const i = yy * width + xx;
+      const w = mask[i];
+      if (w <= 0.001) continue;
+
+      const d = y[i] - mean;
+      variance += d * d * w;
+
+      const gx = Math.abs(y[i + 1] - y[i - 1]);
+      const gy = Math.abs(y[i + width] - y[i - width]);
+      edgeSum += (gx + gy) * 0.5 * w;
+      edgeWeight += w;
+
+      const lap = y[i] * 4 - y[i - 1] - y[i + 1] - y[i - width] - y[i + width];
+      lapSum += lap * w;
+      lapSq += lap * lap * w;
+      lapWeight += w;
+    }
+  }
+
+  const lapMean = lapWeight ? lapSum / lapWeight : 0;
+  const lapVariance = lapWeight ? Math.max(0, lapSq / lapWeight - lapMean * lapMean) : 0;
+
+  return {
+    sharpness: lapVariance,
+    contrast: weightSum ? Math.sqrt(variance / weightSum) / 255 : 0,
+    edgeEnergy: edgeWeight ? edgeSum / edgeWeight / 255 : 0,
+    meanLuma: mean / 255,
+  };
+}
+
 function blockSsim(a: Float32Array, b: Float32Array, width: number, height: number): number {
   const block = 8;
   const c1 = (0.01 * 255) ** 2;
@@ -154,9 +220,9 @@ function blockSsim(a: Float32Array, b: Float32Array, width: number, height: numb
 
       let meanA = 0;
       let meanB = 0;
-      for (let y = by; y < yEnd; y += 1) {
+      for (let yy = by; yy < yEnd; yy += 1) {
         for (let x = bx; x < xEnd; x += 1) {
-          const i = y * width + x;
+          const i = yy * width + x;
           meanA += a[i];
           meanB += b[i];
         }
@@ -167,9 +233,9 @@ function blockSsim(a: Float32Array, b: Float32Array, width: number, height: numb
       let varA = 0;
       let varB = 0;
       let covariance = 0;
-      for (let y = by; y < yEnd; y += 1) {
+      for (let yy = by; yy < yEnd; yy += 1) {
         for (let x = bx; x < xEnd; x += 1) {
-          const i = y * width + x;
+          const i = yy * width + x;
           const da = a[i] - meanA;
           const db = b[i] - meanB;
           varA += da * da;
@@ -244,8 +310,6 @@ function differenceCanvas(sourceImage: ImageData, outputImage: ImageData): HTMLC
     const diff = clamp((dr + dg + db) / 3, 0, 255);
     const gain = clamp(diff * 4.5, 0, 255);
 
-    // Fond sombre + chaleur croissante : la carte indique où le master diffère,
-    // elle ne prétend pas dire que chaque différence est une amélioration.
     dst[i] = Math.round(gain);
     dst[i + 1] = Math.round(gain * 0.38);
     dst[i + 2] = Math.round(25 + gain * 0.12);
@@ -256,10 +320,20 @@ function differenceCanvas(sourceImage: ImageData, outputImage: ImageData): HTMLC
   return canvas;
 }
 
-export async function compareImageQuality(
-  source: Blob,
-  output: Blob,
-): Promise<QualityComparison> {
+function zoneComparison(
+  source: QualityMetrics,
+  output: QualityMetrics,
+  coverage: number,
+): ZoneComparison {
+  return {
+    sharpnessGainPercent: relativeChange(source.sharpness, output.sharpness),
+    edgeGainPercent: relativeChange(source.edgeEnergy, output.edgeEnergy),
+    contrastChangePercent: relativeChange(source.contrast, output.contrast),
+    coveragePercent: coverage * 100,
+  };
+}
+
+export async function compareImageQuality(source: Blob, output: Blob): Promise<QualityComparison> {
   const geometry = await comparisonGeometry(source);
   const [sourceCanvas, outputCanvas] = await Promise.all([
     drawBlob(source, geometry.width, geometry.height),
@@ -276,6 +350,16 @@ export async function compareImageQuality(
   const outputMetrics = qualityMetrics(outputImage);
   const stats = comparisonStats(sourceImage, outputImage);
   const diff = differenceCanvas(sourceImage, outputImage);
+  const masks = buildZoneMasks(sourceImage);
+
+  const sourceText = zoneMetrics(sourceImage, masks.text);
+  const outputText = zoneMetrics(outputImage, masks.text);
+  const sourceEdge = zoneMetrics(sourceImage, masks.edge);
+  const outputEdge = zoneMetrics(outputImage, masks.edge);
+  const sourceFlat = zoneMetrics(sourceImage, masks.flat);
+  const outputFlat = zoneMetrics(outputImage, masks.flat);
+  const sourceCentral = zoneMetrics(sourceImage, masks.central);
+  const outputCentral = zoneMetrics(outputImage, masks.central);
 
   return {
     source: sourceMetrics,
@@ -289,5 +373,13 @@ export async function compareImageQuality(
     sourcePreview: sourceCanvas.toDataURL("image/jpeg", 0.9),
     outputPreview: outputCanvas.toDataURL("image/jpeg", 0.9),
     differencePreview: diff.toDataURL("image/png"),
+    textHeatmap: maskHeatmap(masks.text, geometry.width, geometry.height, "text").toDataURL("image/png"),
+    edgeHeatmap: maskHeatmap(masks.edge, geometry.width, geometry.height, "edge").toDataURL("image/png"),
+    flatHeatmap: maskHeatmap(masks.flat, geometry.width, geometry.height, "flat").toDataURL("image/png"),
+    centralHeatmap: maskHeatmap(masks.central, geometry.width, geometry.height, "central").toDataURL("image/png"),
+    textZone: zoneComparison(sourceText, outputText, masks.textCoverage),
+    edgeZone: zoneComparison(sourceEdge, outputEdge, masks.edgeCoverage),
+    flatZone: zoneComparison(sourceFlat, outputFlat, masks.flatCoverage),
+    centralZone: zoneComparison(sourceCentral, outputCentral, masks.centralCoverage),
   };
 }

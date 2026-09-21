@@ -8,6 +8,8 @@ export interface PrecisionRestoreSettings {
   edgeBias: number;
   /** Protection des aplats et zones peu structurées 0..1. */
   flatProtection: number;
+  /** Pondération supplémentaire des contours structurés vers le centre 0..1. */
+  centralBias: number;
   /** Seuil anti-bruit 0..1. */
   noiseGate: number;
 }
@@ -26,6 +28,7 @@ export const DEFAULT_PRECISION_RESTORE: PrecisionRestoreSettings = {
   textBias: 0.72,
   edgeBias: 0.65,
   flatProtection: 0.78,
+  centralBias: 0.30,
   noiseGate: 0.22,
 };
 
@@ -46,6 +49,7 @@ function sanitize(settings: PrecisionRestoreSettings): PrecisionRestoreSettings 
     textBias: clamp(settings.textBias, 0, 1),
     edgeBias: clamp(settings.edgeBias, 0, 1),
     flatProtection: clamp(settings.flatProtection, 0, 1),
+    centralBias: clamp(settings.centralBias, 0, 1),
     noiseGate: clamp(settings.noiseGate, 0, 1),
   };
 }
@@ -106,6 +110,13 @@ function flatLikelihood(gradient: number, variance: number): number {
     clamp(variance / 180, 0, 1),
   );
   return 1 - structured;
+}
+
+function centralWeight(x: number, y: number, width: number, height: number): number {
+  const nx = (x + 0.5) / width - 0.5;
+  const ny = (y + 0.5) / height - 0.5;
+  const radius = Math.sqrt((nx / 0.52) ** 2 + (ny / 0.52) ** 2);
+  return clamp(1 - radius, 0, 1);
 }
 
 /**
@@ -191,7 +202,9 @@ export async function applyPrecisionRestore(
       const gateThreshold = safe.noiseGate * 0.55;
       const structureGate = clamp((structured - gateThreshold) / Math.max(0.08, 1 - gateThreshold), 0, 1);
       const protection = 1 - flatMask * safe.flatProtection;
-      const amount = safe.strength * structureGate * protection * (0.18 + structured * 0.42);
+      const center = centralWeight(x, yy, width, height);
+      const centralBoost = 1 + center * edgeMask * safe.centralBias * 0.55;
+      const amount = safe.strength * structureGate * protection * (0.18 + structured * 0.42) * centralBoost;
 
       if (amount <= 0.001) continue;
 

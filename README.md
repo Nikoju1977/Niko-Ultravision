@@ -68,6 +68,21 @@ l'image et ne présente pas une reconstruction hypothétique comme un détail or
 Comme Deep Focus, l'étape est limitée à 10 MP en entrée pour protéger la mémoire des
 navigateurs mobiles.
 
+## Scene Precision v0.2
+
+Scene Precision ajoute un mode **Auto** et cinq presets manuels : Équilibré,
+Texte & Enseignes, Objet principal, Agressif et Mobile Safe.
+
+Le mode Auto analyse l'image localement à définition réduite et choisit un preset à partir
+de quatre signaux : structures fines compatibles avec du texte, densité de contours,
+proportion d'aplats et concentration de contours vers le centre. Cette analyse est
+**heuristique** : elle ne fait ni OCR ni segmentation sémantique et ne prétend pas savoir
+quel objet est réellement le sujet de la photo.
+
+Le preset Objet principal active aussi une pondération centrale dans Precision Restore :
+les contours structurés proches du centre peuvent recevoir une correction légèrement plus
+forte, toujours limitée par les garde-fous anti-bruit et anti-halo.
+
 ## Quality Lab : vérifier le gain réel
 
 Après chaque master image, UltraVision affiche désormais un comparateur **avant / après**
@@ -79,7 +94,9 @@ interactif et mesure le signal à résolution commune :
 - **SSIM par blocs** pour la similarité structurelle ;
 - **PSNR** pour l'écart source/master ;
 - pourcentage de pixels réellement modifiés ;
-- carte de différence visualisant les zones où le master diverge de la source.
+- carte de différence visualisant les zones où le master diverge de la source ;
+- scores séparés texte probable / contours / aplats / structure centrale ;
+- heatmaps dédiées pour visualiser les zones détectées par Scene Precision.
 
 Ces métriques évitent de confondre un simple changement de conteneur ou de compression
 avec une amélioration réelle. Elles ne certifient toutefois pas qu'un détail généré par
