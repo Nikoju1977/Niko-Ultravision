@@ -13,6 +13,14 @@ import {
   DEFAULT_PRECISION_RESTORE,
   type PrecisionRestoreSettings,
 } from "./precisionRestore";
+import { buildDepthBuckets } from "./depth/depthBuckets";
+import { buildDepthConfidenceMap } from "./depth/depthConfidence";
+import { estimateRelativeDepth } from "./depth/depthEstimator";
+import { applyDepthFocusRestore } from "./depth/depthFocusRestore";
+import {
+  DEFAULT_DEPTH_FOCUS,
+  type DepthFocusSettings,
+} from "./depth/depthTypes";
 
 export type ImageFormat = "image/png" | "image/jpeg" | "image/webp";
 export type EngineId = "canvas" | "ai";
@@ -35,6 +43,15 @@ export interface ImageEnhanceResult {
   precisionEdgeCoverage: number;
   precisionFlatCoverage: number;
   precisionRestoreReason?: string;
+  depthFocusApplied: boolean;
+  depthFocusPlanes: number;
+  depthFocusConfidence: number;
+  depthFocusCoverage: number;
+  depthFocusNearCoverage: number;
+  depthFocusMidCoverage: number;
+  depthFocusFarCoverage: number;
+  depthFocusMeanCorrection: number;
+  depthFocusReason?: string;
 }
 
 export interface ImageTargetAssessment {
@@ -174,6 +191,7 @@ export interface EnhanceImageOptions {
   engine?: EngineId;
   deepFocus?: DeepFocusSettings;
   precisionRestore?: PrecisionRestoreSettings;
+  depthFocusPrecision?: DepthFocusSettings;
   onProgress?: (value: number, label: string) => void;
 }
 
@@ -188,6 +206,7 @@ export async function enhanceImage(
     engine = "canvas",
     deepFocus = DEFAULT_DEEP_FOCUS,
     precisionRestore = DEFAULT_PRECISION_RESTORE,
+    depthFocusPrecision = DEFAULT_DEPTH_FOCUS,
     onProgress,
   } = options;
 
@@ -223,7 +242,7 @@ export async function enhanceImage(
 
     if (deepFocus.enabled) {
       const report = await applyDeepFocus(current, deepFocus, (ratio, label) => {
-        onProgress?.(0.06 + ratio * 0.20, label);
+        onProgress?.(0.06 + ratio * 0.16, label);
       });
       deepFocusApplied = report.applied;
       deepFocusLayers = report.layers;
@@ -239,13 +258,48 @@ export async function enhanceImage(
 
     if (precisionRestore.enabled) {
       const report = await applyPrecisionRestore(current, precisionRestore, (ratio, label) => {
-        onProgress?.(0.27 + ratio * 0.15, label);
+        onProgress?.(0.23 + ratio * 0.13, label);
       });
       precisionRestoreApplied = report.applied;
       precisionTextCoverage = report.textCoverage;
       precisionEdgeCoverage = report.edgeCoverage;
       precisionFlatCoverage = report.flatCoverage;
       precisionRestoreReason = report.skippedReason;
+    }
+
+    let depthFocusApplied = false;
+    let depthFocusPlanes = depthFocusPrecision.planes;
+    let depthFocusConfidence = 0;
+    let depthFocusCoverage = 0;
+    let depthFocusNearCoverage = 0;
+    let depthFocusMidCoverage = 0;
+    let depthFocusFarCoverage = 0;
+    let depthFocusMeanCorrection = 0;
+    let depthFocusReason: string | undefined;
+
+    if (depthFocusPrecision.enabled) {
+      onProgress?.(0.37, "Depth Focus Precision · estimation relative");
+      const estimate = await estimateRelativeDepth(current, depthFocusPrecision.centerBias);
+      const confidence = buildDepthConfidenceMap(estimate.depth, estimate.structure);
+      const buckets = buildDepthBuckets(depthFocusPrecision);
+      const report = await applyDepthFocusRestore(
+        current,
+        estimate.depth,
+        confidence,
+        buckets,
+        depthFocusPrecision,
+        (ratio, label) => onProgress?.(0.38 + ratio * 0.18, label),
+      );
+
+      depthFocusApplied = report.applied;
+      depthFocusPlanes = report.planes;
+      depthFocusConfidence = report.meanConfidence;
+      depthFocusCoverage = report.processedCoverage;
+      depthFocusNearCoverage = report.nearCoverage;
+      depthFocusMidCoverage = report.midCoverage;
+      depthFocusFarCoverage = report.farCoverage;
+      depthFocusMeanCorrection = report.meanCorrection;
+      depthFocusReason = report.skippedReason;
     }
 
     let engineUsed: EngineId = "canvas";
@@ -261,9 +315,9 @@ export async function enhanceImage(
         );
       }
 
-      onProgress?.(0.43, "Inférence IA · préparation");
+      onProgress?.(0.58, "Inférence IA · préparation");
       const inferred = await upscaleWithAi(current, (ratio, label) => {
-        onProgress?.(0.43 + ratio * 0.36, label);
+        onProgress?.(0.58 + ratio * 0.22, label);
       });
       release(current);
       current = inferred;
@@ -272,9 +326,9 @@ export async function enhanceImage(
       aiProvider = model.provider;
     }
 
-    onProgress?.(engineUsed === "ai" ? 0.8 : 0.44, "Normalisation géométrique");
+    onProgress?.(engineUsed === "ai" ? 0.81 : 0.58, "Normalisation géométrique");
     current = resampleTo(current, output, PROFILES[profile].filter, (pass) => {
-      const base = engineUsed === "ai" ? 0.82 : 0.48;
+      const base = engineUsed === "ai" ? 0.83 : 0.62;
       onProgress?.(Math.min(0.9, base + pass * 0.05), `Rééchantillonnage haute qualité · passe ${pass}`);
     });
 
@@ -282,7 +336,7 @@ export async function enhanceImage(
     // Deep Focus et Precision Restore réalisent déjà une accentuation sélective.
     // Un sharpen global supplémentaire ferait double emploi et créerait des halos.
     const sharpenApplied =
-      engineUsed === "ai" || deepFocusApplied || precisionRestoreApplied
+      engineUsed === "ai" || deepFocusApplied || precisionRestoreApplied || depthFocusApplied
         ? false
         : sharpen(current, PROFILES[profile].sharpen);
 
@@ -308,6 +362,15 @@ export async function enhanceImage(
       precisionEdgeCoverage,
       precisionFlatCoverage,
       precisionRestoreReason,
+      depthFocusApplied,
+      depthFocusPlanes,
+      depthFocusConfidence,
+      depthFocusCoverage,
+      depthFocusNearCoverage,
+      depthFocusMidCoverage,
+      depthFocusFarCoverage,
+      depthFocusMeanCorrection,
+      depthFocusReason,
     };
   } finally {
     decoded.close();
