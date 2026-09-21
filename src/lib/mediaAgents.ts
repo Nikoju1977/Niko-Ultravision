@@ -113,6 +113,28 @@ function measureCanvas(canvas: HTMLCanvasElement): VisualMetrics {
   };
 }
 
+function averageMetrics(values: VisualMetrics[]): VisualMetrics | null {
+  if (!values.length) return null;
+  const sum = values.reduce(
+    (acc, value) => ({
+      meanLuma: acc.meanLuma + value.meanLuma,
+      contrast: acc.contrast + value.contrast,
+      edgeEnergy: acc.edgeEnergy + value.edgeEnergy,
+      clippedBlack: acc.clippedBlack + value.clippedBlack,
+      clippedWhite: acc.clippedWhite + value.clippedWhite,
+    }),
+    { meanLuma: 0, contrast: 0, edgeEnergy: 0, clippedBlack: 0, clippedWhite: 0 },
+  );
+  const divisor = values.length;
+  return {
+    meanLuma: sum.meanLuma / divisor,
+    contrast: sum.contrast / divisor,
+    edgeEnergy: sum.edgeEnergy / divisor,
+    clippedBlack: sum.clippedBlack / divisor,
+    clippedWhite: sum.clippedWhite / divisor,
+  };
+}
+
 async function imageMetrics(file: Blob): Promise<VisualMetrics | null> {
   let decoded: Awaited<ReturnType<typeof decodeImageFile>> | null = null;
   try {
@@ -128,45 +150,95 @@ async function imageMetrics(file: Blob): Promise<VisualMetrics | null> {
     ctx.drawImage(decoded.source, 0, 0, canvas.width, canvas.height);
     return measureCanvas(canvas);
   } catch {
-    // L'analyse visuelle est facultative : elle ne doit jamais bloquer
-    // le mastering si Android refuse une lecture secondaire du fichier.
     return null;
   } finally {
     decoded?.close();
   }
 }
 
-async function videoMetrics(file: File): Promise<VisualMetrics | null> {
+/**
+ * Analyse vidéo sans dépendre d'un élément <video>.
+ *
+ * Sur Android, un <video> caché peut rester bloqué sur loadeddata/seeked selon le
+ * conteneur et le codec. Mediabunny + VideoSampleSink lit directement des images
+ * décodées via WebCodecs, ce qui rend Agent Vision beaucoup plus fiable.
+ */
+async function videoMetricsWithSamples(file: File): Promise<VisualMetrics | null> {
+  if (!webCodecsAvailable()) return null;
+
+  const { ALL_FORMATS, BlobSource, Input, VideoSampleSink } = await import("mediabunny");
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+  if (!(await input.canRead())) return null;
+
+  const track = await input.getPrimaryVideoTrack();
+  if (!track || !(await track.canDecode())) return null;
+
+  const first = await track.getFirstTimestamp();
+  const metadataEnd = await track.getDurationFromMetadata({ skipLiveWait: true });
+  const end =
+    metadataEnd && Number.isFinite(metadataEnd) && metadataEnd > first
+      ? metadataEnd
+      : await track.computeDuration({ skipLiveWait: true });
+
+  const safeEnd = Number.isFinite(end) && end > first ? end : first + 0.001;
+  const span = Math.max(0.001, safeEnd - first);
+  const timestamps = [0.08, 0.5, 0.9].map((ratio) => first + span * ratio);
+  const sink = new VideoSampleSink(track, { hardwareAcceleration: "no-preference" });
+  const metrics: VisualMetrics[] = [];
+
+  for (const timestamp of timestamps) {
+    const sample = await sink.getSample(timestamp);
+    if (!sample) continue;
+
+    try {
+      const maxSide = 384;
+      const scale = Math.min(1, maxSide / Math.max(sample.displayWidth, sample.displayHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(8, Math.round(sample.displayWidth * scale));
+      canvas.height = Math.max(8, Math.round(sample.displayHeight * scale));
+      const ctx = canvas.getContext("2d");
+      if (!ctx) continue;
+      sample.draw(ctx, 0, 0, canvas.width, canvas.height);
+      metrics.push(measureCanvas(canvas));
+    } finally {
+      sample.close();
+    }
+  }
+
+  return averageMetrics(metrics);
+}
+
+async function videoMetricsWithElement(file: File): Promise<VisualMetrics | null> {
   const url = URL.createObjectURL(file);
   const video = document.createElement("video");
-  video.preload = "auto";
+  video.preload = "metadata";
   video.muted = true;
   video.playsInline = true;
 
   try {
     video.src = url;
     await new Promise<void>((resolve, reject) => {
-      video.addEventListener("loadeddata", () => resolve(), { once: true });
-      video.addEventListener("error", () => reject(new Error("Échantillon vidéo illisible.")), { once: true });
+      const timer = window.setTimeout(() => reject(new Error("Timeout analyse vidéo.")), 2500);
+      const finish = () => {
+        window.clearTimeout(timer);
+        resolve();
+      };
+      video.addEventListener("loadeddata", finish, { once: true });
+      video.addEventListener(
+        "error",
+        () => {
+          window.clearTimeout(timer);
+          reject(new Error("Échantillon vidéo illisible."));
+        },
+        { once: true },
+      );
     });
-
-    if (Number.isFinite(video.duration) && video.duration > 0.5) {
-      const seek = Math.min(video.duration * 0.2, Math.max(0.1, video.duration - 0.1));
-      await Promise.race([
-        new Promise<void>((resolve) => {
-          video.addEventListener("seeked", () => resolve(), { once: true });
-          video.currentTime = seek;
-        }),
-        new Promise<void>((resolve) => setTimeout(resolve, 800)),
-      ]);
-    }
 
     const maxSide = 384;
     const scale = Math.min(1, maxSide / Math.max(video.videoWidth, video.videoHeight));
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(8, Math.round(video.videoWidth * scale));
     canvas.height = Math.max(8, Math.round(video.videoHeight * scale));
-
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -178,6 +250,16 @@ async function videoMetrics(file: File): Promise<VisualMetrics | null> {
     video.load();
     URL.revokeObjectURL(url);
   }
+}
+
+async function videoMetrics(file: File): Promise<VisualMetrics | null> {
+  try {
+    const direct = await videoMetricsWithSamples(file);
+    if (direct) return direct;
+  } catch {
+    // Le chemin direct est prioritaire mais l'analyse ne doit jamais bloquer.
+  }
+  return videoMetricsWithElement(file);
 }
 
 function qualityProfile(metrics: VisualMetrics | null, current: ProfileId): ProfileId {
@@ -203,8 +285,6 @@ function safestImageTarget(source: Size, requested: TargetId): TargetId {
 
 async function safestVideoTarget(source: Size, requested: TargetId): Promise<TargetId> {
   if (!webCodecsAvailable()) {
-    // Le fallback MediaRecorder reste volontairement limité : ne pas pousser
-    // automatiquement un téléphone vers une cible très lourde.
     if (requested === "8k") return "4k";
     return requested;
   }
@@ -338,7 +418,7 @@ export async function orchestrateMediaAgents(context: AgentContext): Promise<Age
           "Agent Codec Pro",
           codecs.length ? "ok" : "warning",
           codecs.length
-            ? `Encodeurs professionnels disponibles : ${labels}. Le meilleur est choisi selon l'usage et la charge.`
+            ? `Encodeurs disponibles : ${labels}. UltraVision essaiera automatiquement le codec suivant si l'encodage réel échoue.`
             : "Aucun encodeur WebCodecs disponible à cette définition.",
         ),
       );
@@ -353,7 +433,7 @@ export async function orchestrateMediaAgents(context: AgentContext): Promise<Age
         "upscale",
         "Agent Upscale Vidéo",
         "ok",
-        "Redimensionnement géométrique haute qualité, sans recadrage et avec conservation de la cadence détectée.",
+        "Redimensionnement image par image, traitement stable dans le temps, conservation des timestamps et repli automatique si l'encodeur refuse la cible.",
       ),
     );
   }
