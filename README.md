@@ -48,6 +48,26 @@ le reste du pipeline continue normalement et l'interface indique que l'étape a 
 ignorée.
 
 
+## Precision Restore : détail utile, bruit protégé
+
+Precision Restore s'exécute après Deep Focus et avant la super-résolution. Il détecte
+localement les structures fines déjà présentes, renforce prioritairement les zones
+probables de texte et les contours d'objets, tout en protégeant les aplats et en
+plafonnant les corrections pour limiter les halos.
+
+Les réglages disponibles sont :
+
+- force générale ;
+- priorité texte ;
+- priorité contours ;
+- protection des aplats ;
+- seuil anti-bruit.
+
+Le moteur reste volontairement conservateur : il accentue des structures mesurées dans
+l'image et ne présente pas une reconstruction hypothétique comme un détail original.
+Comme Deep Focus, l'étape est limitée à 10 MP en entrée pour protéger la mémoire des
+navigateurs mobiles.
+
 ## Quality Lab : vérifier le gain réel
 
 Après chaque master image, UltraVision affiche désormais un comparateur **avant / après**
