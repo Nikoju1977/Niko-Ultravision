@@ -2,6 +2,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import DeepFocusControl, { type DeepFocusSettings } from "./DeepFocusControl";
 import ComparisonPanel from "./ComparisonPanel";
 import PrecisionRestoreControl, { type PrecisionRestoreSettings } from "./PrecisionRestoreControl";
+import ScenePrecisionControl from "./ScenePrecisionControl";
+import { analyzeScene, type SceneAnalysis } from "./lib/sceneAnalyzer";
+import {
+  DEFAULT_SCENE_MODE,
+  SCENE_PRESETS,
+  getScenePreset,
+  type SceneModeId,
+  type ScenePresetId,
+} from "./lib/scenePresets";
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
 import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
 import { decodeImageFile } from "./lib/imageDecode";
@@ -43,6 +52,7 @@ type OutputState = {
   precisionTextCoverage?: number;
   precisionEdgeCoverage?: number;
   precisionFlatCoverage?: number;
+  scenePreset?: ScenePresetId;
   codecLabel?: string;
   notes?: string[];
 } | null;
@@ -202,6 +212,9 @@ export default function App() {
     flatProtection: 0.78,
     noiseGate: 0.22,
   });
+  const [sceneMode, setSceneMode] = useState<SceneModeId>(DEFAULT_SCENE_MODE);
+  const [sceneAnalysis, setSceneAnalysis] = useState<SceneAnalysis | null>(null);
+  const [sceneAnalyzing, setSceneAnalyzing] = useState(false);
   const inspectionId = useRef(0);
 
   const targets = mode === "image" ? IMAGE_TARGETS : VIDEO_TARGETS;
@@ -302,6 +315,38 @@ export default function App() {
   }, [file, mode]);
 
   useEffect(() => {
+    if (mode !== "image" || !file) {
+      setSceneAnalysis(null);
+      setSceneAnalyzing(false);
+      return;
+    }
+
+    let alive = true;
+    setSceneAnalyzing(true);
+    void analyzeScene(file)
+      .then((analysis) => {
+        if (alive) setSceneAnalysis(analysis);
+      })
+      .catch(() => {
+        if (alive) setSceneAnalysis(null);
+      })
+      .finally(() => {
+        if (alive) setSceneAnalyzing(false);
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [file, mode]);
+
+  useEffect(() => {
+    if (mode !== "image" || sceneMode !== "auto" || !sceneAnalysis) return;
+    const preset = getScenePreset(sceneAnalysis.recommendedPreset);
+    setDeepFocus({ ...preset.deepFocus });
+    setPrecisionRestore({ ...preset.precisionRestore });
+  }, [mode, sceneMode, sceneAnalysis]);
+
+  useEffect(() => {
     return () => {
       if (output?.url) URL.revokeObjectURL(output.url);
     };
@@ -356,6 +401,21 @@ export default function App() {
     }
   }
 
+  function applySceneMode(next: SceneModeId) {
+    setSceneMode(next);
+    if (next === "auto") {
+      if (!sceneAnalysis) return;
+      const preset = getScenePreset(sceneAnalysis.recommendedPreset);
+      setDeepFocus({ ...preset.deepFocus });
+      setPrecisionRestore({ ...preset.precisionRestore });
+      return;
+    }
+
+    const preset = getScenePreset(next);
+    setDeepFocus({ ...preset.deepFocus });
+    setPrecisionRestore({ ...preset.precisionRestore });
+  }
+
   async function runEnhancement() {
     if (!file || !sourceSize) return;
     setBusy(true);
@@ -390,6 +450,10 @@ export default function App() {
       const agentNotes = plan.decisions.map((entry) => `${entry.label} : ${entry.message}`);
 
       if (mode === "image") {
+        const resolvedScenePreset: ScenePresetId =
+          sceneMode === "auto"
+            ? sceneAnalysis?.recommendedPreset ?? "balanced"
+            : sceneMode;
         const result = await enhanceImage(file, plan.target, plan.profile, plan.format, {
           engine: plan.engine,
           deepFocus,
@@ -412,7 +476,9 @@ export default function App() {
           precisionTextCoverage: result.precisionTextCoverage,
           precisionEdgeCoverage: result.precisionEdgeCoverage,
           precisionFlatCoverage: result.precisionFlatCoverage,
+          scenePreset: resolvedScenePreset,
           note:
+            `Scene Precision ${SCENE_PRESETS[resolvedScenePreset].label}${sceneMode === "auto" ? " (Auto)" : ""}. ` +
             (result.deepFocusApplied
               ? `Deep Focus ${result.deepFocusLayers}+ appliqué sur ${result.deepFocusLayers} plans de focalisation. `
               : "") +
@@ -695,6 +761,19 @@ export default function App() {
 
           {mode === "image" && (
             <div className="control-block">
+              <label>Scene Precision</label>
+              <ScenePrecisionControl
+                value={sceneMode}
+                disabled={busy}
+                analysis={sceneAnalysis}
+                analyzing={sceneAnalyzing}
+                onChange={applySceneMode}
+              />
+            </div>
+          )}
+
+          {mode === "image" && (
+            <div className="control-block">
               <label>Profondeur de netteté</label>
               <DeepFocusControl
                 file={file}
@@ -847,6 +926,12 @@ export default function App() {
                 {output.engineUsed && (
                   <div><dt>Moteur</dt><dd>{output.engineUsed === "ai" ? "IA locale (ONNX)" : "Canvas"}</dd></div>
                 )}
+                {output.scenePreset && (
+                  <div>
+                    <dt>Scene Precision</dt>
+                    <dd>{SCENE_PRESETS[output.scenePreset].label}</dd>
+                  </div>
+                )}
                 {output.deepFocusApplied && (
                   <div>
                     <dt>Deep Focus</dt>
@@ -898,7 +983,9 @@ export default function App() {
           dix bandes de focalisation adaptatives et une restauration locale contrast-limited : cela peut étendre la
           netteté perceptuelle sur plusieurs zones, sans prétendre recréer une profondeur physique disparue.
           <strong> Precision Restore</strong> détecte ensuite les structures fines probables, privilégie le texte et les
-          contours d’objets et protège les aplats pour limiter bruit et halos. Le <strong>Quality Lab</strong> compare
+          contours d’objets et protège les aplats pour limiter bruit et halos. <strong>Scene Precision Auto</strong>
+          choisit un preset à partir d'heuristiques locales (texte probable, contours, aplats et concentration centrale)
+          sans prétendre reconnaître sémantiquement les objets. Le <strong>Quality Lab</strong> compare
           ensuite source et master à résolution commune : micro-détail, contours,
           contraste, SSIM par blocs, PSNR et carte de différence permettent de vérifier si le traitement a réellement
           modifié le signal. Seuls les poids du modèle transitent par le réseau,
