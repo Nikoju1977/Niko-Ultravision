@@ -25,6 +25,28 @@ super-résolution à une entrée et une sortie NCHW fonctionne (Swin2SR, SwinIR,
 EDSR). Les tuiles sont complétées au multiple de 8 par réplication de bord, pour les
 architectures à fenêtre glissante.
 
+
+## UltraVision Deep Focus 10+
+
+Deep Focus est activé par défaut sur les images avec **10 plans de focalisation** et peut
+être réglé de 10 à 24 plans. Le moteur mesure le déficit local de micro-contraste,
+quantifie l'image en bandes de focalisation, puis applique une restauration
+contrast-limited différente selon chaque bande. Une carte colorée permet de visualiser
+les zones déjà nettes et celles qui demandent davantage de restauration.
+
+Ce mode est conçu pour augmenter la **profondeur de netteté perceptuelle** sans appliquer
+un sharpen global uniforme. Il fonctionne avant la super-résolution afin que le réseau
+ONNX reçoive une source déjà restaurée.
+
+Point important : sur une image 2D unique, Deep Focus ne mesure pas une profondeur
+physique en mètres et ne peut pas retrouver fidèlement des détails optiques totalement
+absents d'une zone très hors focus. Il améliore les informations réellement présentes,
+sans présenter une reconstruction hypothétique comme une donnée originale.
+
+Pour préserver la mémoire sur mobile, Deep Focus est limité à 10 MP en entrée. Au-delà,
+le reste du pipeline continue normalement et l'interface indique que l'étape a été
+ignorée.
+
 ## Vie privée
 
 - Aucune dépendance `@higgsfield/*`.
