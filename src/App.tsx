@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
 import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
 import { decodeImageFile } from "./lib/imageDecode";
@@ -132,6 +132,7 @@ export default function App() {
   const [intent, setIntent] = useState<CodecIntent>("master");
   const [codecs, setCodecs] = useState<string[] | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecision[]>([]);
+  const inspectionId = useRef(0);
 
   const targets = mode === "image" ? IMAGE_TARGETS : VIDEO_TARGETS;
   const predicted = useMemo(() => {
@@ -153,12 +154,12 @@ export default function App() {
   }, [mode, aiTooLarge]);
 
   useEffect(() => {
-    if (mode !== "video" || !sourceSize || !webCodecsAvailable()) {
+    if (mode !== "video" || !predicted || !webCodecsAvailable()) {
       setCodecs(null);
       return;
     }
     let alive = true;
-    void codecInventory(sourceSize.width, sourceSize.height, 30)
+    void codecInventory(predicted.width, predicted.height, 30)
       .then((list) => {
         if (alive) setCodecs(list.map((entry) => `${entry.label} → ${entry.container.toUpperCase()}`));
       })
@@ -168,7 +169,7 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, [mode, sourceSize]);
+  }, [mode, predicted]);
 
   useEffect(() => {
     let alive = true;
@@ -242,6 +243,7 @@ export default function App() {
 
   async function handleFile(next: File | null) {
     if (!next) return;
+    const requestId = ++inspectionId.current;
     setError(null);
     setStatus("Analyse de la source");
     setProgress(0);
@@ -254,12 +256,14 @@ export default function App() {
     });
     try {
       const inspected = await inspectMedia(next);
+      if (requestId !== inspectionId.current) return;
       setFile(next);
       setMode(inspected.mode);
       setSourceSize(inspected.size);
       setTarget(inspected.mode === "video" ? "1080p" : "4k");
       setStatus("Source analysée localement");
     } catch (reason) {
+      if (requestId !== inspectionId.current) return;
       setStatus("Source invalide");
       setError(reason instanceof Error ? reason.message : "Impossible de lire ce fichier.");
     }
