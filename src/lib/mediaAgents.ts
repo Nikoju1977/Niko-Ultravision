@@ -113,9 +113,10 @@ function measureCanvas(canvas: HTMLCanvasElement): VisualMetrics {
   };
 }
 
-async function imageMetrics(file: Blob): Promise<VisualMetrics> {
-  const decoded = await decodeImageFile(file);
+async function imageMetrics(file: Blob): Promise<VisualMetrics | null> {
+  let decoded: Awaited<ReturnType<typeof decodeImageFile>> | null = null;
   try {
+    decoded = await decodeImageFile(file);
     const maxSide = 384;
     const scale = Math.min(1, maxSide / Math.max(decoded.width, decoded.height));
     const canvas = document.createElement("canvas");
@@ -123,11 +124,15 @@ async function imageMetrics(file: Blob): Promise<VisualMetrics> {
     canvas.height = Math.max(8, Math.round(decoded.height * scale));
 
     const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Canvas 2D indisponible.");
+    if (!ctx) return null;
     ctx.drawImage(decoded.source, 0, 0, canvas.width, canvas.height);
     return measureCanvas(canvas);
+  } catch {
+    // L'analyse visuelle est facultative : elle ne doit jamais bloquer
+    // le mastering si Android refuse une lecture secondaire du fichier.
+    return null;
   } finally {
-    decoded.close();
+    decoded?.close();
   }
 }
 
