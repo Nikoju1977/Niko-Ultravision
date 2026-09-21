@@ -3,10 +3,12 @@ import type { VideoCodec } from "mediabunny";
 /**
  * Négociation de codec à l'exécution.
  *
- * Rien n'est codé en dur : la liste des codecs réellement encodables est
- * demandée au navigateur pour la résolution et la cadence visées, puis filtrée
- * par l'intention de sortie. Si un codec disparaît d'une version de navigateur
- * à l'autre, la chaîne se replie toute seule.
+ * La détection combine deux contraintes :
+ * 1) le codec doit être réellement encodable par le navigateur à la définition/cadence visée ;
+ * 2) le conteneur choisi doit effectivement accepter ce codec.
+ *
+ * Le pipeline vidéo peut ensuite essayer plusieurs plans, dans l'ordre, si un
+ * encodeur annoncé comme disponible échoue au moment de l'encodage réel.
  */
 
 export type CodecIntent = "copy" | "mezzanine" | "master" | "delivery" | "compat";
@@ -61,13 +63,13 @@ export const CODEC_INTENTS: Record<CodecIntent, CodecIntentSpec> = {
     id: "compat",
     label: "Compatibilité",
     description: "H.264 en MP4. Lisible à peu près partout, y compris sur du matériel ancien.",
-    preference: ["avc", "vp8", "vp9"],
+    preference: ["avc", "vp9", "vp8"],
     keyFrameInterval: 5,
     quality: "high",
   },
 };
 
-/** Conteneurs acceptant chaque codec, par ordre de préférence. */
+/** Conteneurs souhaités pour chaque codec, par ordre de préférence. */
 const CONTAINERS: Record<VideoCodec, ContainerId[]> = {
   avc: ["mp4"],
   hevc: ["mp4"],
@@ -104,12 +106,8 @@ export function webCodecsAvailable(): boolean {
   return typeof VideoEncoder !== "undefined" && typeof VideoFrame !== "undefined";
 }
 
-function containerFor(codec: VideoCodec): ContainerId {
-  return CONTAINERS[codec][0];
-}
-
-function mimeFor(container: ContainerId, codec: VideoCodec): string {
-  return container === "mp4" ? `video/mp4; codecs=${codec}` : `video/webm; codecs=${codec}`;
+function mimeFor(container: ContainerId): string {
+  return container === "mp4" ? "video/mp4" : "video/webm";
 }
 
 function professionalPreference(
@@ -122,19 +120,14 @@ function professionalPreference(
   const isHeavy = pixelsPerSecond >= 3840 * 2160 * 50;
 
   if (intent === "mezzanine") {
-    // Pour un intermédiaire de montage, la priorité est la robustesse de décodage
-    // et le tout-intra plutôt que le meilleur ratio de compression.
     return ["hevc", "avc", "av1", "vp9"];
   }
 
   if (intent === "master") {
-    // Sur une charge très élevée, HEVC est préféré à AV1 pour limiter le coût
-    // d'encodage quand les deux sont disponibles. Sinon AV1 maximise l'efficacité.
     return isHeavy ? ["hevc", "av1", "vp9", "avc"] : ["av1", "hevc", "vp9", "avc"];
   }
 
   if (intent === "delivery") {
-    // Diffusion : efficacité de compression avant compatibilité historique.
     return ["av1", "hevc", "vp9", "avc", "vp8"];
   }
 
@@ -172,25 +165,49 @@ function codecRationale(
   }
 }
 
+async function supportedContainerMap(): Promise<Record<ContainerId, Set<VideoCodec>>> {
+  const { Mp4OutputFormat, WebMOutputFormat } = await import("mediabunny");
+  return {
+    mp4: new Set(new Mp4OutputFormat().getSupportedVideoCodecs()),
+    webm: new Set(new WebMOutputFormat().getSupportedVideoCodecs()),
+  };
+}
+
+function chooseContainer(
+  codec: VideoCodec,
+  supported: Record<ContainerId, Set<VideoCodec>>,
+): ContainerId | null {
+  const candidates = CONTAINERS[codec] ?? [];
+  return candidates.find((container) => supported[container].has(codec)) ?? null;
+}
+
 /**
- * Interroge réellement le navigateur pour la taille et la cadence visées.
- * Un codec listé ici est un codec que cette machine sait encoder maintenant.
+ * Retourne tous les plans réellement encodables et muxables, dans l'ordre de
+ * préférence. Le premier est le plan nominal ; les suivants sont les replis.
  */
-export async function negotiateCodec(
+export async function negotiateCodecCandidates(
   intent: CodecIntent,
   width: number,
   height: number,
   frameRate: number,
-): Promise<CodecPlan | null> {
-  if (intent === "copy") return null;
+): Promise<CodecPlan[]> {
+  if (intent === "copy") return [];
 
   const spec = CODEC_INTENTS[intent];
   const preference = professionalPreference(intent, width, height, frameRate);
-  const { getEncodableVideoCodecs, QUALITY_HIGH, QUALITY_MEDIUM, QUALITY_VERY_HIGH } =
-    await import("mediabunny");
+  const {
+    getEncodableVideoCodecs,
+    QUALITY_HIGH,
+    QUALITY_MEDIUM,
+    QUALITY_VERY_HIGH,
+  } = await import("mediabunny");
 
   const quality =
-    spec.quality === "very-high" ? QUALITY_VERY_HIGH : spec.quality === "high" ? QUALITY_HIGH : QUALITY_MEDIUM;
+    spec.quality === "very-high"
+      ? QUALITY_VERY_HIGH
+      : spec.quality === "high"
+        ? QUALITY_HIGH
+        : QUALITY_MEDIUM;
 
   const encodable = await getEncodableVideoCodecs(preference, {
     width,
@@ -198,30 +215,50 @@ export async function negotiateCodec(
     quality,
     frameRate,
   });
+  const supportedContainers = await supportedContainerMap();
 
-  const rejected = preference
-    .filter((codec) => !encodable.includes(codec))
-    .map((codec) => `${CODEC_LABELS[codec]} : non encodable en ${width}×${height} sur ce navigateur`);
+  const rejected: string[] = [];
+  for (const codec of preference) {
+    if (!encodable.includes(codec)) {
+      rejected.push(`${CODEC_LABELS[codec]} : non encodable en ${width}×${height} sur ce navigateur`);
+      continue;
+    }
+    if (!chooseContainer(codec, supportedContainers)) {
+      rejected.push(`${CODEC_LABELS[codec]} : aucun conteneur MP4/WebM compatible dans Mediabunny`);
+    }
+  }
 
-  const chosen = preference.find((codec) => encodable.includes(codec));
-  if (!chosen) return null;
+  return preference.flatMap((codec) => {
+    if (!encodable.includes(codec)) return [];
+    const container = chooseContainer(codec, supportedContainers);
+    if (!container) return [];
 
-  const container = containerFor(chosen);
-
-  return {
-    codec: chosen,
-    container,
-    mimeType: mimeFor(container, chosen),
-    extension: container === "mp4" ? "mp4" : "webm",
-    keyFrameInterval: spec.keyFrameInterval,
-    quality: spec.quality,
-    intent,
-    rationale: codecRationale(chosen, intent, width, height, frameRate),
-    rejected,
-  };
+    return [{
+      codec,
+      container,
+      mimeType: mimeFor(container),
+      extension: container === "mp4" ? "mp4" : "webm",
+      keyFrameInterval: spec.keyFrameInterval,
+      quality: spec.quality,
+      intent,
+      rationale: codecRationale(codec, intent, width, height, frameRate),
+      rejected,
+    } satisfies CodecPlan];
+  });
 }
 
-/** Inventaire complet, pour afficher honnêtement ce que la machine sait faire. */
+/** Retourne le premier plan nominal pour les écrans qui n'ont besoin que d'un choix. */
+export async function negotiateCodec(
+  intent: CodecIntent,
+  width: number,
+  height: number,
+  frameRate: number,
+): Promise<CodecPlan | null> {
+  const plans = await negotiateCodecCandidates(intent, width, height, frameRate);
+  return plans[0] ?? null;
+}
+
+/** Inventaire complet, filtré par encodabilité ET compatibilité conteneur. */
 export async function codecInventory(
   width: number,
   height: number,
@@ -235,10 +272,11 @@ export async function codecInventory(
     quality: QUALITY_HIGH,
     frameRate,
   });
+  const supportedContainers = await supportedContainerMap();
 
-  return encodable.map((codec) => ({
-    codec,
-    label: CODEC_LABELS[codec],
-    container: containerFor(codec),
-  }));
+  return encodable.flatMap((codec) => {
+    const container = chooseContainer(codec, supportedContainers);
+    if (!container) return [];
+    return [{ codec, label: CODEC_LABELS[codec], container }];
+  });
 }
