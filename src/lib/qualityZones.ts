@@ -9,6 +9,7 @@ export interface ZoneMasks {
   edgeCoverage: number;
   flatCoverage: number;
   centralStructure: number;
+  centralCoverage: number;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -85,6 +86,7 @@ export function buildZoneMasks(image: ImageData): ZoneMasks {
   let flatHits = 0;
   let centralStructureSum = 0;
   let centralWeightSum = 0;
+  let centralHits = 0;
   let total = 0;
 
   for (let y = 1; y < height - 1; y += 1) {
@@ -103,6 +105,7 @@ export function buildZoneMasks(image: ImageData): ZoneMasks {
       flat[p] = f;
       central[p] = c;
 
+      if (c >= 0.35) centralHits += 1;
       if (t >= 0.45) textHits += 1;
       if (e >= 0.45) edgeHits += 1;
       if (f >= 0.55) flatHits += 1;
@@ -123,6 +126,7 @@ export function buildZoneMasks(image: ImageData): ZoneMasks {
     edgeCoverage: total ? edgeHits / total : 0,
     flatCoverage: total ? flatHits / total : 0,
     centralStructure: centralWeightSum ? centralStructureSum / centralWeightSum : 0,
+    centralCoverage: total ? centralHits / total : 0,
   };
 }
 
