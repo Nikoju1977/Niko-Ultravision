@@ -77,18 +77,65 @@ function looksLikeVideo(file: File): boolean {
   return file.type.startsWith("video/") || VIDEO_EXTENSIONS.has(fileExtension(file));
 }
 
-async function inspectImage(file: File): Promise<Size> {
+async function stabilizeAndroidImage(
+  file: File,
+  source: CanvasImageSource,
+  width: number,
+  height: number,
+): Promise<File> {
+  if (!/android/i.test(navigator.userAgent)) return file;
+
+  // Les très grands capteurs peuvent dépasser la mémoire disponible pendant
+  // une normalisation PNG. Dans ce cas, le décodeur multi-stratégies garde
+  // le fichier original et prendra le relais.
+  if (width * height > 40_000_000) return file;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  try {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return file;
+    ctx.drawImage(source, 0, 0, width, height);
+
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob(resolve, "image/png");
+    });
+    if (!blob || blob.size === 0) return file;
+
+    // Le nom d'origine est conservé pour que le nom du master exporté reste
+    // celui choisi par l'utilisateur ; seul le contenu interne devient un PNG
+    // local stable, décodable autant de fois que nécessaire.
+    return new File([blob], file.name, {
+      type: "image/png",
+      lastModified: file.lastModified,
+    });
+  } catch {
+    return file;
+  } finally {
+    canvas.width = 1;
+    canvas.height = 1;
+  }
+}
+
+async function inspectImage(file: File): Promise<{ size: Size; file: File }> {
   const decoded = await decodeImageFile(file);
   try {
-    return { width: decoded.width, height: decoded.height };
+    const stableFile = await stabilizeAndroidImage(file, decoded.source, decoded.width, decoded.height);
+    return {
+      size: { width: decoded.width, height: decoded.height },
+      file: stableFile,
+    };
   } finally {
     decoded.close();
   }
 }
 
-async function inspectMedia(file: File): Promise<{ mode: MediaMode; size: Size }> {
+async function inspectMedia(file: File): Promise<{ mode: MediaMode; size: Size; file: File }> {
   if (looksLikeImage(file)) {
-    return { mode: "image", size: await inspectImage(file) };
+    const inspected = await inspectImage(file);
+    return { mode: "image", size: inspected.size, file: inspected.file };
   }
 
   if (looksLikeVideo(file)) {
@@ -101,7 +148,11 @@ async function inspectMedia(file: File): Promise<{ mode: MediaMode; size: Size }
         video.addEventListener("loadedmetadata", () => resolve(), { once: true });
         video.addEventListener("error", () => reject(new Error("Vidéo illisible.")), { once: true });
       });
-      return { mode: "video", size: { width: video.videoWidth, height: video.videoHeight } };
+      return {
+        mode: "video",
+        size: { width: video.videoWidth, height: video.videoHeight },
+        file,
+      };
     } finally {
       URL.revokeObjectURL(url);
     }
@@ -253,7 +304,7 @@ export default function App() {
     try {
       const inspected = await inspectMedia(next);
       if (requestId !== inspectionId.current) return;
-      setFile(next);
+      setFile(inspected.file);
       setMode(inspected.mode);
       setSourceSize(inspected.size);
       setTarget(inspected.mode === "video" ? "1080p" : "4k");
