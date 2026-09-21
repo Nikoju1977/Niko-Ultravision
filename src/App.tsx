@@ -210,6 +210,7 @@ export default function App() {
     textBias: 0.72,
     edgeBias: 0.65,
     flatProtection: 0.78,
+    centralBias: 0.30,
     noiseGate: 0.22,
   });
   const [sceneMode, setSceneMode] = useState<SceneModeId>(DEFAULT_SCENE_MODE);
