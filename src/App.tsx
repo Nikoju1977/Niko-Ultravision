@@ -357,7 +357,6 @@ export default function App() {
     setDeepFocus({ ...preset.deepFocus });
     setPrecisionRestore({ ...preset.precisionRestore });
     setDepthFocusPrecision({ ...preset.depthFocusPrecision });
-    setDepthFocusPrecision({ ...preset.depthFocusPrecision });
   }, [mode, sceneMode, sceneAnalysis]);
 
   useEffect(() => {
@@ -429,6 +428,7 @@ export default function App() {
     const preset = getScenePreset(next);
     setDeepFocus({ ...preset.deepFocus });
     setPrecisionRestore({ ...preset.precisionRestore });
+    setDepthFocusPrecision({ ...preset.depthFocusPrecision });
   }
 
   async function runEnhancement() {
@@ -1006,6 +1006,12 @@ export default function App() {
                     <dd>
                       proche {Math.round((output.depthFocusNearCoverage ?? 0) * 100)} % · moyen {Math.round((output.depthFocusMidCoverage ?? 0) * 100)} % · lointain {Math.round((output.depthFocusFarCoverage ?? 0) * 100)} %
                     </dd>
+                  </div>
+                )}
+                {output.depthFocusApplied && (
+                  <div>
+                    <dt>Correction moyenne Z</dt>
+                    <dd>{(output.depthFocusMeanCorrection ?? 0).toFixed(2)} niveaux / 255</dd>
                   </div>
                 )}
                 {output.codecLabel && (
