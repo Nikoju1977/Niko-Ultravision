@@ -652,3 +652,61 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
     grid-template-columns: 1fr;
   }
 }
+
+
+/* --- UltraVision Precision Restore --- */
+.precision-box {
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(88, 231, 165, .20);
+  background: linear-gradient(180deg, rgba(32, 92, 70, .12), rgba(255,255,255,.02));
+  display: grid;
+  gap: 12px;
+}
+
+.precision-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.precision-controls label {
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(255,255,255,.025);
+  border: 1px solid rgba(255,255,255,.06);
+}
+
+.precision-controls label:last-child {
+  grid-column: 1 / -1;
+}
+
+.precision-controls label > span,
+.precision-controls label > strong {
+  display: block;
+}
+
+.precision-controls label > span {
+  color: #8295ad;
+  font-size: .68rem;
+}
+
+.precision-controls label > strong {
+  margin: 4px 0 7px;
+  font-size: .88rem;
+}
+
+.precision-controls input[type="range"] {
+  width: 100%;
+  accent-color: #58e7a5;
+}
+
+@media (max-width: 640px) {
+  .precision-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .precision-controls label:last-child {
+    grid-column: auto;
+  }
+}

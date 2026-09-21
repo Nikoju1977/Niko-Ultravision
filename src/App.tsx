@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import DeepFocusControl, { type DeepFocusSettings } from "./DeepFocusControl";
 import ComparisonPanel from "./ComparisonPanel";
+import PrecisionRestoreControl, { type PrecisionRestoreSettings } from "./PrecisionRestoreControl";
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
 import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
 import { decodeImageFile } from "./lib/imageDecode";
@@ -38,6 +39,10 @@ type OutputState = {
   deepFocusApplied?: boolean;
   deepFocusLayers?: number;
   deepFocusConfidence?: number;
+  precisionRestoreApplied?: boolean;
+  precisionTextCoverage?: number;
+  precisionEdgeCoverage?: number;
+  precisionFlatCoverage?: number;
   codecLabel?: string;
   notes?: string[];
 } | null;
@@ -189,6 +194,14 @@ export default function App() {
   const [codecs, setCodecs] = useState<string[] | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecision[]>([]);
   const [deepFocus, setDeepFocus] = useState<DeepFocusSettings>({ enabled: true, layers: 10, strength: 0.58 });
+  const [precisionRestore, setPrecisionRestore] = useState<PrecisionRestoreSettings>({
+    enabled: true,
+    strength: 0.52,
+    textBias: 0.72,
+    edgeBias: 0.65,
+    flatProtection: 0.78,
+    noiseGate: 0.22,
+  });
   const inspectionId = useRef(0);
 
   const targets = mode === "image" ? IMAGE_TARGETS : VIDEO_TARGETS;
@@ -380,6 +393,7 @@ export default function App() {
         const result = await enhanceImage(file, plan.target, plan.profile, plan.format, {
           engine: plan.engine,
           deepFocus,
+          precisionRestore,
           onProgress: (value, label) => {
             setProgress(value);
             setStatus(label);
@@ -394,16 +408,27 @@ export default function App() {
           deepFocusApplied: result.deepFocusApplied,
           deepFocusLayers: result.deepFocusLayers,
           deepFocusConfidence: result.deepFocusConfidence,
+          precisionRestoreApplied: result.precisionRestoreApplied,
+          precisionTextCoverage: result.precisionTextCoverage,
+          precisionEdgeCoverage: result.precisionEdgeCoverage,
+          precisionFlatCoverage: result.precisionFlatCoverage,
           note:
             (result.deepFocusApplied
               ? `Deep Focus ${result.deepFocusLayers}+ appliqué sur ${result.deepFocusLayers} plans de focalisation. `
+              : "") +
+            (result.precisionRestoreApplied
+              ? "Precision Restore a renforcé sélectivement texte et contours en protégeant les aplats. "
               : "") +
             (result.engineUsed === "ai"
               ? `Super-résolution IA x${result.aiScale} (${result.aiProvider?.toUpperCase()}) puis normalisation géométrique vers la cible.`
               : result.sharpenApplied
                 ? "Agrandissement progressif + accentuation locale légère."
                 : "Agrandissement progressif haute qualité ; accentuation globale désactivée pour éviter les halos."),
-          notes: result.deepFocusReason ? [...agentNotes, `Deep Focus : ${result.deepFocusReason}`] : agentNotes,
+          notes: [
+            ...agentNotes,
+            ...(result.deepFocusReason ? [`Deep Focus : ${result.deepFocusReason}`] : []),
+            ...(result.precisionRestoreReason ? [`Precision Restore : ${result.precisionRestoreReason}`] : []),
+          ],
         });
       } else {
         const result = await enhanceVideo(file, plan.target, plan.profile, {
@@ -680,6 +705,17 @@ export default function App() {
             </div>
           )}
 
+          {mode === "image" && (
+            <div className="control-block">
+              <label>Restauration de précision</label>
+              <PrecisionRestoreControl
+                disabled={busy}
+                value={precisionRestore}
+                onChange={setPrecisionRestore}
+              />
+            </div>
+          )}
+
           {mode === "video" && (
             <div className="control-block">
               <label>Intention d’encodage</label>
@@ -817,6 +853,20 @@ export default function App() {
                     <dd>{output.deepFocusLayers} plans · confiance {Math.round((output.deepFocusConfidence ?? 0) * 100)} %</dd>
                   </div>
                 )}
+                {output.precisionRestoreApplied && (
+                  <div>
+                    <dt>Precision Restore</dt>
+                    <dd>
+                      texte {Math.round((output.precisionTextCoverage ?? 0) * 100)} % · contours {Math.round((output.precisionEdgeCoverage ?? 0) * 100)} %
+                    </dd>
+                  </div>
+                )}
+                {output.precisionRestoreApplied && (
+                  <div>
+                    <dt>Aplats protégés</dt>
+                    <dd>{Math.round((output.precisionFlatCoverage ?? 0) * 100)} % détectés</dd>
+                  </div>
+                )}
                 {output.codecLabel && (
                   <div><dt>Codec</dt><dd>{output.codecLabel}</dd></div>
                 )}
@@ -846,8 +896,10 @@ export default function App() {
           super-résolution open source au format ONNX, par tuiles, sur cet appareil — il reconstruit bien de la texture,
           avec le risque d’hallucination propre à ce type de réseau. <strong>Deep Focus 10+</strong> ajoute au minimum
           dix bandes de focalisation adaptatives et une restauration locale contrast-limited : cela peut étendre la
-          netteté perceptuelle sur plusieurs zones, sans prétendre recréer une profondeur physique disparue. Le
-          <strong> Quality Lab</strong> compare ensuite source et master à résolution commune : micro-détail, contours,
+          netteté perceptuelle sur plusieurs zones, sans prétendre recréer une profondeur physique disparue.
+          <strong> Precision Restore</strong> détecte ensuite les structures fines probables, privilégie le texte et les
+          contours d’objets et protège les aplats pour limiter bruit et halos. Le <strong>Quality Lab</strong> compare
+          ensuite source et master à résolution commune : micro-détail, contours,
           contraste, SSIM par blocs, PSNR et carte de différence permettent de vérifier si le traitement a réellement
           modifié le signal. Seuls les poids du modèle transitent par le réseau,
           jamais tes médias. La vidéo passe par <strong>WebCodecs</strong> quand le navigateur l’expose : démultiplexage du fichier source,
