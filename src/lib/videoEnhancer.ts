@@ -159,6 +159,7 @@ export async function enhanceVideo(
     input,
     output: out,
     showWarnings: false,
+    copy: pureCopy ? { mode: "forced" } : { mode: "preferred" },
     video: pureCopy
       ? {}
       : {
@@ -200,6 +201,10 @@ export async function enhanceVideo(
 
   for (const discarded of conversion.discardedTracks) {
     notes.push(`Piste ${discarded.track.type} écartée : ${discarded.reason}`);
+  }
+
+  if (pureCopy) {
+    notes.push("Copie directe forcée : aucun transcodage n'est autorisé sur les pistes conservées.");
   }
 
   const label = pureCopy
