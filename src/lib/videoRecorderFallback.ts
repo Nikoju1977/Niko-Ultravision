@@ -112,7 +112,6 @@ async function detectFrameRate(video: HTMLVideoElement): Promise<{ value: number
       window.clearTimeout(timer);
       video.removeEventListener("ended", wrappedFinish);
       video.pause();
-      video.currentTime = 0;
       video.muted = originalMuted;
       const elapsed = firstMediaTime == null ? 0 : lastMediaTime - firstMediaTime;
       if (frames < 3 || elapsed <= 0) {
