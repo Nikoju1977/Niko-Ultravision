@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import DeepFocusControl, { type DeepFocusSettings } from "./DeepFocusControl";
+import ComparisonPanel from "./ComparisonPanel";
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
 import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
 import { decodeImageFile } from "./lib/imageDecode";
@@ -833,6 +834,10 @@ export default function App() {
         )}
       </section>
 
+      {mode === "image" && file && output && (
+        <ComparisonPanel source={file} output={output.blob} />
+      )}
+
       <section className="truth-panel">
         <h2>Ce que fait réellement cette version</h2>
         <p>
@@ -841,7 +846,10 @@ export default function App() {
           super-résolution open source au format ONNX, par tuiles, sur cet appareil — il reconstruit bien de la texture,
           avec le risque d’hallucination propre à ce type de réseau. <strong>Deep Focus 10+</strong> ajoute au minimum
           dix bandes de focalisation adaptatives et une restauration locale contrast-limited : cela peut étendre la
-          netteté perceptuelle sur plusieurs zones, sans prétendre recréer une profondeur physique disparue. Seuls les poids du modèle transitent par le réseau,
+          netteté perceptuelle sur plusieurs zones, sans prétendre recréer une profondeur physique disparue. Le
+          <strong> Quality Lab</strong> compare ensuite source et master à résolution commune : micro-détail, contours,
+          contraste, SSIM par blocs, PSNR et carte de différence permettent de vérifier si le traitement a réellement
+          modifié le signal. Seuls les poids du modèle transitent par le réseau,
           jamais tes médias. La vidéo passe par <strong>WebCodecs</strong> quand le navigateur l’expose : démultiplexage du fichier source,
           réencodage AV1/HEVC/VP9/H.264 selon ce que la machine sait réellement faire, horodatage exact et aucune image
           perdue. Le mode <em>Mezzanine intra</em> force toutes les images en clé, ce qui donne le comportement de

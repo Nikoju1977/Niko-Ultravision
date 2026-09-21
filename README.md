@@ -47,6 +47,25 @@ Pour préserver la mémoire sur mobile, Deep Focus est limité à 10 MP en entr�
 le reste du pipeline continue normalement et l'interface indique que l'étape a été
 ignorée.
 
+
+## Quality Lab : vérifier le gain réel
+
+Après chaque master image, UltraVision affiche désormais un comparateur **avant / après**
+interactif et mesure le signal à résolution commune :
+
+- gain de micro-détail par variance du Laplacien ;
+- variation d'énergie des contours ;
+- variation de contraste ;
+- **SSIM par blocs** pour la similarité structurelle ;
+- **PSNR** pour l'écart source/master ;
+- pourcentage de pixels réellement modifiés ;
+- carte de différence visualisant les zones où le master diverge de la source.
+
+Ces métriques évitent de confondre un simple changement de conteneur ou de compression
+avec une amélioration réelle. Elles ne certifient toutefois pas qu'un détail généré par
+une IA correspond à la scène originale : une hausse de netteté doit toujours être
+interprétée avec la comparaison visuelle.
+
 ## Vie privée
 
 - Aucune dépendance `@higgsfield/*`.
