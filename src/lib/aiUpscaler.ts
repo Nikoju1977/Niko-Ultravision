@@ -196,24 +196,32 @@ export async function loadAiModel(
   const created = await createSession(ort, weights);
   session = created.session;
 
-  const inputName = session.inputNames[0];
-  const outputName = session.outputNames[0];
-  if (!inputName || !outputName) throw new Error("Modèle ONNX sans entrée/sortie exploitable.");
+  try {
+    const inputName = session.inputNames[0];
+    const outputName = session.outputNames[0];
+    if (!inputName || !outputName) throw new Error("Modèle ONNX sans entrée/sortie exploitable.");
 
-  onProgress?.(0.88, "Mesure du facteur d'échelle");
-  const scale = await probeScale(ort, session, inputName, outputName);
+    onProgress?.(0.88, "Mesure du facteur d'échelle");
+    const scale = await probeScale(ort, session, inputName, outputName);
 
-  info = {
-    scale,
-    inputName,
-    outputName,
-    provider: created.provider,
-    bytes: weights.byteLength,
-    source: source.kind === "file" ? source.file.name : (source.label ?? source.url),
-  };
+    info = {
+      scale,
+      inputName,
+      outputName,
+      provider: created.provider,
+      bytes: weights.byteLength,
+      source: source.kind === "file" ? source.file.name : (source.label ?? source.url),
+    };
 
-  onProgress?.(1, `Modèle prêt · x${scale} · ${created.provider.toUpperCase()}`);
-  return info;
+    onProgress?.(1, `Modèle prêt · x${scale} · ${created.provider.toUpperCase()}`);
+    return info;
+  } catch (reason) {
+    const failed = session as (OrtSession & { release?: () => Promise<void> }) | null;
+    session = null;
+    info = null;
+    await failed?.release?.().catch(() => undefined);
+    throw reason;
+  }
 }
 
 /** Les réseaux de la famille SwinIR/Swin2SR exigent des côtés multiples de la fenêtre (8). */
