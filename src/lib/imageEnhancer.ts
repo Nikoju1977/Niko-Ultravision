@@ -8,6 +8,11 @@ import {
   DEFAULT_DEEP_FOCUS,
   type DeepFocusSettings,
 } from "./deepFocus";
+import {
+  applyPrecisionRestore,
+  DEFAULT_PRECISION_RESTORE,
+  type PrecisionRestoreSettings,
+} from "./precisionRestore";
 
 export type ImageFormat = "image/png" | "image/jpeg" | "image/webp";
 export type EngineId = "canvas" | "ai";
@@ -25,6 +30,11 @@ export interface ImageEnhanceResult {
   deepFocusLayers: number;
   deepFocusConfidence: number;
   deepFocusReason?: string;
+  precisionRestoreApplied: boolean;
+  precisionTextCoverage: number;
+  precisionEdgeCoverage: number;
+  precisionFlatCoverage: number;
+  precisionRestoreReason?: string;
 }
 
 export interface ImageTargetAssessment {
@@ -163,6 +173,7 @@ function resampleTo(
 export interface EnhanceImageOptions {
   engine?: EngineId;
   deepFocus?: DeepFocusSettings;
+  precisionRestore?: PrecisionRestoreSettings;
   onProgress?: (value: number, label: string) => void;
 }
 
@@ -176,6 +187,7 @@ export async function enhanceImage(
   const {
     engine = "canvas",
     deepFocus = DEFAULT_DEEP_FOCUS,
+    precisionRestore = DEFAULT_PRECISION_RESTORE,
     onProgress,
   } = options;
 
@@ -211,12 +223,29 @@ export async function enhanceImage(
 
     if (deepFocus.enabled) {
       const report = await applyDeepFocus(current, deepFocus, (ratio, label) => {
-        onProgress?.(0.06 + ratio * 0.22, label);
+        onProgress?.(0.06 + ratio * 0.20, label);
       });
       deepFocusApplied = report.applied;
       deepFocusLayers = report.layers;
       deepFocusConfidence = report.confidence;
       deepFocusReason = report.skippedReason;
+    }
+
+    let precisionRestoreApplied = false;
+    let precisionTextCoverage = 0;
+    let precisionEdgeCoverage = 0;
+    let precisionFlatCoverage = 0;
+    let precisionRestoreReason: string | undefined;
+
+    if (precisionRestore.enabled) {
+      const report = await applyPrecisionRestore(current, precisionRestore, (ratio, label) => {
+        onProgress?.(0.27 + ratio * 0.15, label);
+      });
+      precisionRestoreApplied = report.applied;
+      precisionTextCoverage = report.textCoverage;
+      precisionEdgeCoverage = report.edgeCoverage;
+      precisionFlatCoverage = report.flatCoverage;
+      precisionRestoreReason = report.skippedReason;
     }
 
     let engineUsed: EngineId = "canvas";
@@ -232,9 +261,9 @@ export async function enhanceImage(
         );
       }
 
-      onProgress?.(0.3, "Inférence IA · préparation");
+      onProgress?.(0.43, "Inférence IA · préparation");
       const inferred = await upscaleWithAi(current, (ratio, label) => {
-        onProgress?.(0.3 + ratio * 0.48, label);
+        onProgress?.(0.43 + ratio * 0.36, label);
       });
       release(current);
       current = inferred;
@@ -243,17 +272,17 @@ export async function enhanceImage(
       aiProvider = model.provider;
     }
 
-    onProgress?.(engineUsed === "ai" ? 0.8 : 0.34, "Normalisation géométrique");
+    onProgress?.(engineUsed === "ai" ? 0.8 : 0.44, "Normalisation géométrique");
     current = resampleTo(current, output, PROFILES[profile].filter, (pass) => {
-      const base = engineUsed === "ai" ? 0.82 : 0.38;
+      const base = engineUsed === "ai" ? 0.82 : 0.48;
       onProgress?.(Math.min(0.9, base + pass * 0.05), `Rééchantillonnage haute qualité · passe ${pass}`);
     });
 
     onProgress?.(0.91, "Finition locale");
-    // Deep Focus réalise déjà une accentuation adaptative avant l'upscale.
-    // Après IA ou Deep Focus, un sharpen global ferait double emploi et créerait des halos.
+    // Deep Focus et Precision Restore réalisent déjà une accentuation sélective.
+    // Un sharpen global supplémentaire ferait double emploi et créerait des halos.
     const sharpenApplied =
-      engineUsed === "ai" || deepFocusApplied
+      engineUsed === "ai" || deepFocusApplied || precisionRestoreApplied
         ? false
         : sharpen(current, PROFILES[profile].sharpen);
 
@@ -274,6 +303,11 @@ export async function enhanceImage(
       deepFocusLayers,
       deepFocusConfidence,
       deepFocusReason,
+      precisionRestoreApplied,
+      precisionTextCoverage,
+      precisionEdgeCoverage,
+      precisionFlatCoverage,
+      precisionRestoreReason,
     };
   } finally {
     decoded.close();
