@@ -366,3 +366,113 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
     align-items: center;
   }
 }
+
+
+/* --- UltraVision Deep Focus 10+ --- */
+.deep-focus-box {
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(94, 156, 255, .22);
+  background: linear-gradient(180deg, rgba(22, 53, 96, .18), rgba(255,255,255,.02));
+  display: grid;
+  gap: 12px;
+}
+
+.deep-focus-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.deep-focus-head > div {
+  display: grid;
+  gap: 4px;
+}
+
+.deep-focus-head strong {
+  font-size: .88rem;
+}
+
+.deep-focus-head > div > span {
+  color: #8295ad;
+  font-size: .7rem;
+  line-height: 1.4;
+}
+
+.switch-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #9cc3ff;
+  font-size: .68rem;
+  font-weight: 800;
+  letter-spacing: .06em;
+}
+
+.switch-row input {
+  accent-color: #5e9cff;
+}
+
+.deep-focus-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.deep-focus-controls label {
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(255,255,255,.025);
+  border: 1px solid rgba(255,255,255,.06);
+}
+
+.deep-focus-controls label > span,
+.deep-focus-controls label > strong {
+  display: block;
+}
+
+.deep-focus-controls label > span {
+  color: #8295ad;
+  font-size: .68rem;
+}
+
+.deep-focus-controls label > strong {
+  margin: 4px 0 7px;
+  font-size: .88rem;
+}
+
+.deep-focus-controls input[type="range"] {
+  width: 100%;
+  accent-color: #5e9cff;
+}
+
+.focus-map-wrap {
+  display: grid;
+  gap: 7px;
+}
+
+.focus-map {
+  width: 100%;
+  max-height: 210px;
+  object-fit: contain;
+  border-radius: 12px;
+  background: #02050a;
+  border: 1px solid rgba(255,255,255,.06);
+}
+
+.focus-map-wrap > span {
+  color: #8295ad;
+  font-size: .68rem;
+  line-height: 1.4;
+}
+
+@media (max-width: 640px) {
+  .deep-focus-head {
+    align-items: center;
+  }
+
+  .deep-focus-controls {
+    grid-template-columns: 1fr;
+  }
+}
