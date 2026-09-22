@@ -35,6 +35,10 @@ import {
 import { PROFILES, type ProfileId } from "./lib/profiles";
 import { beginJob, isCancelled, isCancelledError, requestCancel, throwIfCancelled } from "./lib/cancellation";
 import { runAutoStudio, type StudioReport } from "./lib/restoration/autoStudio";
+import {
+  qualifyAllRestorationModels,
+  type ModelHealthReport,
+} from "./lib/restoration/modelHealth";
 import { enhanceVideo } from "./lib/videoEnhancer";
 import {
   CODEC_INTENTS,
@@ -222,6 +226,8 @@ export default function App() {
   const [model, setModel] = useState<AiModelInfo | null>(loadedModel());
   const [modelBusy, setModelBusy] = useState(false);
   const [modelStatus, setModelStatus] = useState<string | null>(null);
+  const [engineHealthBusy, setEngineHealthBusy] = useState(false);
+  const [engineHealth, setEngineHealth] = useState<ModelHealthReport[]>([]);
   const [aiRuntime, setAiRuntime] = useState<AiRuntimeReport | null>(null);
   const [smallSubjectMode, setSmallSubjectMode] = useState(false);
   const [videoNeuralAi, setVideoNeuralAi] = useState(false);
@@ -470,6 +476,7 @@ export default function App() {
       setModelStatus(
         `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ` +
           `${loaded.execution === "worker" ? `worker${loaded.threads > 1 ? ` ${loaded.threads} threads` : ""}` : "thread principal"} · ` +
+          `${loaded.inputLayout}→${loaded.outputLayout} · auto-test pixels ${Math.round(loaded.smokeTestMs)} ms · ` +
           `${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo${loaded.fromCache ? " · cache local" : ""}`,
       );
       return loaded;
@@ -481,6 +488,56 @@ export default function App() {
       return null;
     } finally {
       setModelBusy(false);
+    }
+  }
+
+  async function runAllEngineQualification() {
+    if (busy || auraBusy || modelBusy || engineHealthBusy) return;
+    beginJob();
+    setEngineHealthBusy(true);
+    setError(null);
+    setEngineHealth([]);
+    setProgress(0);
+    setStatus("Qualification des moteurs IA");
+    try {
+      const summary = await qualifyAllRestorationModels(
+        (ratio, label, partial) => {
+          setProgress(ratio);
+          setStatus(label);
+          setModelStatus(label);
+          setEngineHealth([...partial]);
+        },
+      );
+      setEngineHealth(summary.reports);
+      const active = loadedModel();
+      if (active) setModel(active);
+      setProgress(1);
+      if (summary.failed === 0) {
+        setStatus(`Tous les moteurs IA sont qualifiés · ${summary.passed}/${summary.reports.length}`);
+        setModelStatus(
+          `Qualification complète : ${summary.passed}/${summary.reports.length} moteurs ont exécuté une vraie tuile RGBA sur cet appareil.`,
+        );
+      } else {
+        setStatus(
+          `Qualification IA : ${summary.passed} OK · ${summary.failed} échec(s)`,
+        );
+        setModelStatus(
+          `Qualification incomplète : ${summary.failed} moteur(s) ne passent pas l'inférence réelle sur cet appareil.`,
+        );
+      }
+    } catch (reason) {
+      if (isCancelledError(reason)) {
+        setStatus("Qualification des moteurs annulée");
+      } else {
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : "Qualification des moteurs impossible.",
+        );
+        setStatus("Erreur qualification IA");
+      }
+    } finally {
+      setEngineHealthBusy(false);
     }
   }
 
@@ -1358,6 +1415,70 @@ export default function App() {
                     />
                   </label>
                 </div>
+
+                <div className="model-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={
+                      busy ||
+                      auraBusy ||
+                      modelBusy ||
+                      engineHealthBusy ||
+                      !aiEngineAvailable()
+                    }
+                    onClick={() => void runAllEngineQualification()}
+                  >
+                    {engineHealthBusy
+                      ? "Qualification des moteurs…"
+                      : "Vérifier tous les moteurs IA"}
+                  </button>
+                </div>
+
+                {engineHealth.length > 0 && (
+                  <div className="studio-table-wrap">
+                    <table className="studio-table">
+                      <thead>
+                        <tr>
+                          <th>Moteur</th>
+                          <th>État</th>
+                          <th>Backend</th>
+                          <th>Échelle</th>
+                          <th>Layout</th>
+                          <th>Auto-test</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {engineHealth.map((entry) => (
+                          <tr key={entry.id}>
+                            <td>{entry.label}</td>
+                            <td>{entry.status === "ok" ? "✓ OK" : "✗ échec"}</td>
+                            <td>
+                              {entry.provider
+                                ? `${entry.provider.toUpperCase()} · ${entry.execution}`
+                                : "—"}
+                            </td>
+                            <td>{entry.scale ? `x${entry.scale}` : "—"}</td>
+                            <td>
+                              {entry.inputLayout && entry.outputLayout
+                                ? `${entry.inputLayout}→${entry.outputLayout}`
+                                : "—"}
+                            </td>
+                            <td title={entry.error ?? ""}>
+                              {entry.smokeTestMs !== null
+                                ? `${Math.round(entry.smokeTestMs)} ms`
+                                : entry.error ?? "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <p className="model-note">
+                      Ce test charge chaque modèle du registre et lui impose une vraie inférence RGBA. Le premier passage
+                      peut télécharger plus de 200 Mo ; les poids validés sont ensuite conservés dans le cache local.
+                    </p>
+                  </div>
+                )}
 
                 {modelStatus && <div className="model-status">{modelStatus}</div>}
                 {aiNeedsPreparation && (
