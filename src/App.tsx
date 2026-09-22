@@ -80,7 +80,7 @@ const VIDEO_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
   { id: "1080p", label: "1080p", hint: "1 920 px côté long" },
   { id: "2k", label: "2K", hint: "2 048 px côté long" },
   { id: "4k", label: "4K", hint: "3 840 px côté long" },
-  { id: "8k", label: "8K", hint: "WebCodecs requis · encodeur négocié" },
+  { id: "8k", label: "8K", hint: "activée seulement après test encode + mux + lecture" },
 ];
 
 function extensionFor(type: string): string {
@@ -256,7 +256,7 @@ export default function App() {
     let alive = true;
     void codecInventory(predicted.width, predicted.height, 30)
       .then((list) => {
-        if (alive) setCodecs(list.map((entry) => `${entry.label} → ${entry.container.toUpperCase()}`));
+        if (alive) setCodecs(list.map((entry) => `✓ ${entry.label} → ${entry.container.toUpperCase()} · testé`));
       })
       .catch(() => {
         if (alive) setCodecs([]);
@@ -855,14 +855,14 @@ export default function App() {
 
               <div className="model-box">
                 <div className="model-head">
-                  <strong>Codecs disponibles ici</strong>
+                  <strong>Codecs réellement validés ici</strong>
                   <span className={webCodecsAvailable() ? "badge ok" : "badge"}>
                     {webCodecsAvailable() ? "WebCodecs" : "MediaRecorder"}
                   </span>
                 </div>
                 {webCodecsAvailable() ? (
                   codecs === null ? (
-                    <p className="model-note">Sonde des encodeurs en cours…</p>
+                    <p className="model-note">Sonde réelle encode + mux + lecture en cours…</p>
                   ) : codecs.length > 0 ? (
                     <ul className="codec-list">
                       {codecs.map((entry) => (
@@ -870,7 +870,7 @@ export default function App() {
                       ))}
                     </ul>
                   ) : (
-                    <p className="model-note">Aucun encodeur matériel ou logiciel exposé pour cette définition.</p>
+                    <p className="model-note">Aucune chaîne vidéo n’a réussi le test complet à cette définition. UltraVision réduira automatiquement la cible.</p>
                   )
                 ) : (
                   <p className="model-note">
