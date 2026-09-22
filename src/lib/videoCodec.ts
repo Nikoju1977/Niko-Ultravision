@@ -181,6 +181,175 @@ function chooseContainer(
   return candidates.find((container) => supported[container].has(codec)) ?? null;
 }
 
+
+interface CodecProbeResult {
+  ok: boolean;
+  reason?: string;
+}
+
+const codecProbeCache = new Map<string, Promise<CodecProbeResult>>();
+const CODEC_PROBE_TIMEOUT_MS = 8000;
+
+function probeKey(
+  codec: VideoCodec,
+  container: ContainerId,
+  width: number,
+  height: number,
+  frameRate: number,
+): string {
+  return [codec, container, width, height, Math.round(frameRate * 1000)].join(":");
+}
+
+async function withProbeTimeout<T>(
+  promise: Promise<T>,
+  onTimeout: () => void,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      onTimeout();
+      reject(new Error("sonde d'encodage expirée"));
+    }, CODEC_PROBE_TIMEOUT_MS);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+async function canPlayGeneratedBlob(blob: Blob): Promise<boolean> {
+  const url = URL.createObjectURL(blob);
+  const video = document.createElement("video");
+  video.preload = "auto";
+  video.muted = true;
+  video.playsInline = true;
+
+  try {
+    return await new Promise<boolean>((resolve) => {
+      const finish = (value: boolean) => {
+        clearTimeout(timer);
+        video.removeEventListener("loadeddata", onLoaded);
+        video.removeEventListener("error", onError);
+        resolve(value);
+      };
+      const onLoaded = () => finish(video.videoWidth > 0 && video.videoHeight > 0);
+      const onError = () => finish(false);
+      const timer = setTimeout(() => finish(false), 3500);
+
+      video.addEventListener("loadeddata", onLoaded, { once: true });
+      video.addEventListener("error", onError, { once: true });
+      video.src = url;
+      video.load();
+    });
+  } finally {
+    video.removeAttribute("src");
+    video.load();
+    URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * Sonde réelle : encode une image à la définition demandée, la muxe dans le
+ * conteneur final, puis vérifie que le navigateur peut décoder le fichier créé.
+ * On ne marque donc plus un codec comme "disponible" sur la seule foi d'une
+ * déclaration WebCodecs.
+ */
+async function probeCodecPipeline(
+  codec: VideoCodec,
+  container: ContainerId,
+  width: number,
+  height: number,
+  frameRate: number,
+): Promise<CodecProbeResult> {
+  const key = probeKey(codec, container, width, height, frameRate);
+  const cached = codecProbeCache.get(key);
+  if (cached) return cached;
+
+  const running = (async (): Promise<CodecProbeResult> => {
+    if (!webCodecsAvailable()) {
+      return { ok: false, reason: "WebCodecs indisponible" };
+    }
+
+    const {
+      BufferTarget,
+      CanvasSource,
+      Mp4OutputFormat,
+      Output,
+      QUALITY_MEDIUM,
+      WebMOutputFormat,
+    } = await import("mediabunny");
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx || canvas.width !== width || canvas.height !== height) {
+      canvas.width = 1;
+      canvas.height = 1;
+      return { ok: false, reason: "canvas cible non allouable" };
+    }
+
+    // Motif non uniforme pour éviter qu'un encodeur optimise un frame vide
+    // d'une manière non représentative.
+    ctx.fillStyle = "#101820";
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = "#e8edf5";
+    ctx.fillRect(0, 0, Math.max(2, Math.floor(width / 8)), Math.max(2, Math.floor(height / 8)));
+
+    const target = new BufferTarget();
+    const format = container === "mp4" ? new Mp4OutputFormat() : new WebMOutputFormat();
+    const output = new Output({ format, target });
+    const source = new CanvasSource(canvas, {
+      codec,
+      quality: QUALITY_MEDIUM,
+    });
+
+    try {
+      output.addVideoTrack(source, { frameRate });
+      const work = (async () => {
+        await output.start();
+        await source.add(0, 1 / Math.max(1, frameRate), { keyFrame: true });
+        source.close();
+        await output.finalize();
+      })();
+
+      await withProbeTimeout(work, () => {
+        void output.cancel();
+      });
+
+      const buffer = target.buffer;
+      if (!buffer || buffer.byteLength === 0) {
+        return { ok: false, reason: "aucune donnée muxée" };
+      }
+
+      const blob = new Blob([buffer], { type: mimeFor(container) });
+      if (!(await canPlayGeneratedBlob(blob))) {
+        return { ok: false, reason: "fichier test non décodable par ce navigateur" };
+      }
+
+      return { ok: true };
+    } catch (reason) {
+      try {
+        await output.cancel();
+      } catch {
+        // Rien à faire : l'échec de la sonde suffit.
+      }
+      return {
+        ok: false,
+        reason: reason instanceof Error && reason.message ? reason.message : "échec de la sonde réelle",
+      };
+    } finally {
+      canvas.width = 1;
+      canvas.height = 1;
+    }
+  })();
+
+  codecProbeCache.set(key, running);
+  return running;
+}
+
 /**
  * Retourne tous les plans réellement encodables et muxables, dans l'ordre de
  * préférence. Le premier est le plan nominal ; les suivants sont les replis.
@@ -218,22 +387,27 @@ export async function negotiateCodecCandidates(
   const supportedContainers = await supportedContainerMap();
 
   const rejected: string[] = [];
+  const plans: CodecPlan[] = [];
+
   for (const codec of preference) {
     if (!encodable.includes(codec)) {
-      rejected.push(`${CODEC_LABELS[codec]} : non encodable en ${width}×${height} sur ce navigateur`);
+      rejected.push(`${CODEC_LABELS[codec]} : non annoncé comme encodable en ${width}×${height}`);
       continue;
     }
-    if (!chooseContainer(codec, supportedContainers)) {
-      rejected.push(`${CODEC_LABELS[codec]} : aucun conteneur MP4/WebM compatible dans Mediabunny`);
-    }
-  }
 
-  return preference.flatMap((codec) => {
-    if (!encodable.includes(codec)) return [];
     const container = chooseContainer(codec, supportedContainers);
-    if (!container) return [];
+    if (!container) {
+      rejected.push(`${CODEC_LABELS[codec]} : aucun conteneur MP4/WebM compatible dans Mediabunny`);
+      continue;
+    }
 
-    return [{
+    const probe = await probeCodecPipeline(codec, container, width, height, frameRate);
+    if (!probe.ok) {
+      rejected.push(`${CODEC_LABELS[codec]} : sonde réelle refusée (${probe.reason ?? "raison inconnue"})`);
+      continue;
+    }
+
+    plans.push({
       codec,
       container,
       mimeType: mimeFor(container),
@@ -243,8 +417,10 @@ export async function negotiateCodecCandidates(
       intent,
       rationale: codecRationale(codec, intent, width, height, frameRate),
       rejected,
-    } satisfies CodecPlan];
-  });
+    });
+  }
+
+  return plans;
 }
 
 /** Retourne le premier plan nominal pour les écrans qui n'ont besoin que d'un choix. */
@@ -258,14 +434,14 @@ export async function negotiateCodec(
   return plans[0] ?? null;
 }
 
-/** Inventaire complet, filtré par encodabilité ET compatibilité conteneur. */
+/** Inventaire complet, validé par encode + mux + décodage local d'un fichier test. */
 export async function codecInventory(
   width: number,
   height: number,
   frameRate: number,
-): Promise<{ codec: VideoCodec; label: string; container: ContainerId }[]> {
+): Promise<{ codec: VideoCodec; label: string; container: ContainerId; verified: true }[]> {
   const { getEncodableVideoCodecs, QUALITY_HIGH } = await import("mediabunny");
-  const all: VideoCodec[] = ["av1", "hevc", "vp9", "avc", "vp8"];
+  const all: VideoCodec[] = ["avc", "hevc", "vp9", "av1", "vp8"];
   const encodable = await getEncodableVideoCodecs(all, {
     width,
     height,
@@ -273,10 +449,23 @@ export async function codecInventory(
     frameRate,
   });
   const supportedContainers = await supportedContainerMap();
+  const verified: { codec: VideoCodec; label: string; container: ContainerId; verified: true }[] = [];
 
-  return encodable.flatMap((codec) => {
+  for (const codec of all) {
+    if (!encodable.includes(codec)) continue;
     const container = chooseContainer(codec, supportedContainers);
-    if (!container) return [];
-    return [{ codec, label: CODEC_LABELS[codec], container }];
-  });
+    if (!container) continue;
+
+    const probe = await probeCodecPipeline(codec, container, width, height, frameRate);
+    if (!probe.ok) continue;
+
+    verified.push({
+      codec,
+      label: CODEC_LABELS[codec],
+      container,
+      verified: true,
+    });
+  }
+
+  return verified;
 }
