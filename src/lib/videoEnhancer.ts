@@ -32,6 +32,12 @@ export interface EnhanceVideoOptions {
 type Probe = Awaited<ReturnType<typeof inspectWithMediabunny>>;
 
 const VIDEO_FALLBACK_ORDER: TargetId[] = ["original", "1080p", "2k", "4k", "8k"];
+const OUTPUT_PAGE_SIZE = 4 * 1024 * 1024;
+const STALL_TIMEOUT_MS = 30_000;
+
+function isAndroidRuntime(): boolean {
+  return typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+}
 
 /** Lit les dimensions et la cadence directement dans le conteneur, sans lecture temps réel. */
 async function inspectWithMediabunny(file: File) {
@@ -95,13 +101,89 @@ function errorMessage(reason: unknown): string {
   return String(reason || "erreur inconnue");
 }
 
+function orderPlansForRuntime(plans: CodecPlan[]): CodecPlan[] {
+  if (!isAndroidRuntime()) return plans;
+  const weight: Record<string, number> = {
+    avc: 0,
+    hevc: 1,
+    vp9: 2,
+    av1: 3,
+    vp8: 4,
+  };
+  return [...plans].sort((a, b) => (weight[a.codec] ?? 99) - (weight[b.codec] ?? 99));
+}
+
+/**
+ * Évite BufferTarget pour les vidéos : BufferTarget fait grossir un ArrayBuffer
+ * contigu et peut tuer l'onglet Android quand le fichier devient volumineux.
+ * StreamTarget écrit ici dans des pages fixes de 4 Mio, avec support des
+ * réécritures aléatoires nécessaires au MP4 standard.
+ */
+function createPagedStreamTarget(StreamTargetCtor: new (
+  writable: WritableStream<unknown>,
+  options?: { chunked?: boolean; chunkSize?: number },
+) => unknown) {
+  const pages: Uint8Array[] = [];
+  let logicalSize = 0;
+
+  const writable = new WritableStream<unknown>({
+    write(rawChunk) {
+      const chunk = rawChunk as { data: Uint8Array; position: number };
+      const data = chunk.data;
+      let sourceOffset = 0;
+      let position = chunk.position;
+      logicalSize = Math.max(logicalSize, position + data.byteLength);
+
+      while (sourceOffset < data.byteLength) {
+        const pageIndex = Math.floor(position / OUTPUT_PAGE_SIZE);
+        const pageOffset = position % OUTPUT_PAGE_SIZE;
+        let page = pages[pageIndex];
+        if (!page) {
+          page = new Uint8Array(OUTPUT_PAGE_SIZE);
+          pages[pageIndex] = page;
+        }
+
+        const copyLength = Math.min(
+          data.byteLength - sourceOffset,
+          OUTPUT_PAGE_SIZE - pageOffset,
+        );
+        page.set(data.subarray(sourceOffset, sourceOffset + copyLength), pageOffset);
+        sourceOffset += copyLength;
+        position += copyLength;
+      }
+    },
+  });
+
+  const target = new StreamTargetCtor(writable, {
+    chunked: true,
+    chunkSize: 1024 * 1024,
+  });
+
+  const toBlob = (mimeType: string): Blob => {
+    const parts: BlobPart[] = [];
+    let remaining = logicalSize;
+    for (const page of pages) {
+      if (remaining <= 0) break;
+      const used = Math.min(remaining, page.byteLength);
+      parts.push(page.subarray(0, used));
+      remaining -= used;
+    }
+    return new Blob(parts, { type: mimeType });
+  };
+
+  return {
+    target,
+    toBlob,
+    getSize: () => logicalSize,
+  };
+}
+
 /**
  * Traitement spatial léger et déterministe pour la vidéo.
  *
- * Le traitement est volontairement stable d'une image à l'autre : mêmes
- * paramètres, pas de seuil adaptatif qui pourrait provoquer du pompage.
- * L'accentuation est calculée à une définition de travail plafonnée puis le
- * résultat est rééchantillonné vers la cible avec un filtrage haute qualité.
+ * Les paramètres ne changent pas d'une image à l'autre afin d'éviter le
+ * pompage temporel. Le travail de micro-contraste est plafonné à 1440 px sur
+ * le grand côté, puis rééchantillonné vers la cible.
  */
 function createFrameProcessor(profile: ProfileId, output: Size) {
   const preset = PROFILES[profile];
@@ -115,7 +197,17 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
   let edgeCtx: CanvasRenderingContext2D | null = null;
   let outCtx: CanvasRenderingContext2D | null = null;
 
-  return (sample: { displayWidth: number; displayHeight: number; draw: (ctx: CanvasRenderingContext2D, x: number, y: number, w?: number, h?: number) => void }) => {
+  return (sample: {
+    displayWidth: number;
+    displayHeight: number;
+    draw: (
+      ctx: CanvasRenderingContext2D,
+      x: number,
+      y: number,
+      w?: number,
+      h?: number,
+    ) => void;
+  }) => {
     const sourceLong = Math.max(sample.displayWidth, sample.displayHeight);
     const workLong = Math.min(sourceLong, 1440);
     const scale = workLong / Math.max(1, sourceLong);
@@ -133,7 +225,9 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
       edgeCanvas.height = workHeight;
       edgeCtx = edgeCanvas.getContext("2d");
 
-      if (!workCtx || !edgeCtx) throw new Error("Canvas 2D indisponible pour le traitement vidéo.");
+      if (!workCtx || !edgeCtx) {
+        throw new Error("Canvas 2D indisponible pour le traitement vidéo.");
+      }
     }
 
     if (!outCanvas || outCanvas.width !== output.width || outCanvas.height !== output.height) {
@@ -188,6 +282,49 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
   };
 }
 
+async function executeWithStallGuard(
+  conversion: {
+    state: string;
+    onProgress?: (value: number, processedTime: number) => unknown;
+    execute: () => Promise<void>;
+    cancel: () => Promise<void>;
+  },
+  onProgress: EnhanceVideoOptions["onProgress"],
+  label: string,
+): Promise<void> {
+  let lastActivity = Date.now();
+  let stalled = false;
+
+  conversion.onProgress = (value) => {
+    lastActivity = Date.now();
+    onProgress?.(0.06 + Math.min(0.92, value) * 0.9, label);
+  };
+
+  const timer = window.setInterval(() => {
+    if (
+      conversion.state === "executing" &&
+      Date.now() - lastActivity > STALL_TIMEOUT_MS
+    ) {
+      stalled = true;
+      void conversion.cancel();
+    }
+  }, 1500);
+
+  try {
+    onProgress?.(0.05, label);
+    await conversion.execute();
+  } catch (reason) {
+    if (stalled) {
+      throw new Error(
+        "encodeur bloqué plus de 30 s sans progression ; essai automatique du codec ou de la définition suivante",
+      );
+    }
+    throw reason;
+  } finally {
+    window.clearInterval(timer);
+  }
+}
+
 async function executeWebCodecsAttempt(
   file: File,
   probe: Probe,
@@ -195,33 +332,47 @@ async function executeWebCodecsAttempt(
   profile: ProfileId,
   plan: CodecPlan,
   onProgress: EnhanceVideoOptions["onProgress"],
+  enhanceFrames: boolean,
 ): Promise<VideoEnhanceResult> {
   const {
     ALL_FORMATS,
     BlobSource,
-    BufferTarget,
     Conversion,
     Input,
     Mp4OutputFormat,
     Output,
     QUALITY_HIGH,
     QUALITY_VERY_HIGH,
+    StreamTarget,
     WebMOutputFormat,
   } = await import("mediabunny");
 
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
-  const bufferTarget = new BufferTarget();
+  const paged = createPagedStreamTarget(StreamTarget as unknown as new (
+    writable: WritableStream<unknown>,
+    options?: { chunked?: boolean; chunkSize?: number },
+  ) => unknown);
+
   const out = new Output({
-    format: plan.container === "mp4" ? new Mp4OutputFormat() : new WebMOutputFormat(),
-    target: bufferTarget,
+    format:
+      plan.container === "mp4"
+        ? new Mp4OutputFormat()
+        : new WebMOutputFormat(),
+    target: paged.target as never,
   });
 
-  const processor = createFrameProcessor(profile, outputSize);
+  const processor = enhanceFrames ? createFrameProcessor(profile, outputSize) : null;
+  const quality = plan.quality === "very-high" ? QUALITY_VERY_HIGH : QUALITY_HIGH;
+
   const videoOptions = processor
     ? {
+        width: outputSize.width,
+        height: outputSize.height,
+        fit: "fill" as const,
         codec: plan.codec,
-        quality: plan.quality === "very-high" ? QUALITY_VERY_HIGH : QUALITY_HIGH,
+        quality,
         keyFrameInterval: plan.keyFrameInterval,
+        hardwareAcceleration: isAndroidRuntime() ? ("prefer-hardware" as const) : ("no-preference" as const),
         forceTranscode: true,
         processedWidth: outputSize.width,
         processedHeight: outputSize.height,
@@ -232,8 +383,9 @@ async function executeWebCodecsAttempt(
         height: outputSize.height,
         fit: "fill" as const,
         codec: plan.codec,
-        quality: plan.quality === "very-high" ? QUALITY_VERY_HIGH : QUALITY_HIGH,
+        quality,
         keyFrameInterval: plan.keyFrameInterval,
+        hardwareAcceleration: isAndroidRuntime() ? ("prefer-hardware" as const) : ("no-preference" as const),
         forceTranscode: true,
       };
 
@@ -241,7 +393,7 @@ async function executeWebCodecsAttempt(
     input,
     output: out,
     showWarnings: false,
-    copy: { mode: "preferred" },
+    copy: false,
     video: videoOptions,
     audio: {},
   });
@@ -253,31 +405,40 @@ async function executeWebCodecsAttempt(
     throw new Error(`conversion invalide${reasons ? ` (${reasons})` : ""}`);
   }
 
-  const label = `Encodage ${plan.codec.toUpperCase()} · ${outputSize.width}×${outputSize.height} · ${Math.round(normalizeFrameRate(probe.frameRate))} i/s`;
-  conversion.onProgress = (value) => {
-    onProgress?.(0.06 + Math.min(0.92, value) * 0.9, label);
-  };
+  const modeLabel = processor ? "amélioration" : "compatibilité";
+  const label =
+    `Encodage ${plan.codec.toUpperCase()} · ${outputSize.width}×${outputSize.height} · ` +
+    `${Math.round(normalizeFrameRate(probe.frameRate))} i/s · ${modeLabel}`;
 
-  onProgress?.(0.05, label);
-  await conversion.execute();
+  await executeWithStallGuard(conversion, onProgress, label);
 
-  const buffer = bufferTarget.buffer;
-  if (!buffer || buffer.byteLength === 0) throw new Error("l'encodeur n'a produit aucune donnée");
+  const mimeType = plan.container === "mp4" ? "video/mp4" : "video/webm";
+  if (paged.getSize() <= 0) throw new Error("l'encodeur n'a produit aucune donnée");
+  const blob = paged.toBlob(mimeType);
 
   const audioPreserved = conversion.utilizedTracks.some((track) => track.type === "audio");
-  const blob = new Blob([buffer], {
-    type: plan.container === "mp4" ? "video/mp4" : "video/webm",
-  });
-
   const notes: string[] = [plan.rationale];
+
   if (processor) {
-    notes.push("Traitement vidéo image par image actif : micro-contraste stable, accentuation légère et rééchantillonnage haute qualité.");
+    notes.push(
+      "Traitement vidéo image par image actif : micro-contraste stable, accentuation légère et rééchantillonnage haute qualité.",
+    );
   } else {
-    notes.push("Traitement Fidelity : rééchantillonnage haute qualité sans accentuation artificielle.");
+    notes.push(
+      "Mode compatibilité vidéo : transcodage et redimensionnement sans filtre Canvas avancé.",
+    );
   }
+
+  if (isAndroidRuntime()) {
+    notes.push(
+      "Mode Android : priorité au H.264/AVC et à l'accélération matérielle quand le navigateur l'expose.",
+    );
+  }
+
   for (const discarded of conversion.discardedTracks) {
     notes.push(`Piste ${discarded.track.type} écartée : ${discarded.reason}`);
   }
+
   if (probe.hasAudio && !audioPreserved) {
     notes.push("La piste audio n'a pas pu être conservée dans ce conteneur.");
   }
@@ -304,16 +465,23 @@ async function attemptPureCopy(
   const {
     ALL_FORMATS,
     BlobSource,
-    BufferTarget,
     Conversion,
     Input,
     Mp4OutputFormat,
     Output,
+    StreamTarget,
   } = await import("mediabunny");
 
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
-  const bufferTarget = new BufferTarget();
-  const out = new Output({ format: new Mp4OutputFormat(), target: bufferTarget });
+  const paged = createPagedStreamTarget(StreamTarget as unknown as new (
+    writable: WritableStream<unknown>,
+    options?: { chunked?: boolean; chunkSize?: number },
+  ) => unknown);
+
+  const out = new Output({
+    format: new Mp4OutputFormat(),
+    target: paged.target as never,
+  });
 
   const conversion = await Conversion.init({
     input,
@@ -328,16 +496,18 @@ async function attemptPureCopy(
     throw new Error("remultiplexage direct incompatible avec le conteneur MP4");
   }
 
-  conversion.onProgress = (value) => {
-    onProgress?.(0.05 + Math.min(0.94, value) * 0.92, "Remultiplexage sans réencodage");
-  };
-  await conversion.execute();
+  await executeWithStallGuard(
+    conversion,
+    onProgress,
+    "Remultiplexage sans réencodage",
+  );
 
-  const buffer = bufferTarget.buffer;
-  if (!buffer || buffer.byteLength === 0) throw new Error("le remultiplexage n'a produit aucune donnée");
+  if (paged.getSize() <= 0) {
+    throw new Error("le remultiplexage n'a produit aucune donnée");
+  }
 
   const audioPreserved = conversion.utilizedTracks.some((track) => track.type === "audio");
-  const blob = new Blob([buffer], { type: "video/mp4" });
+  const blob = paged.toBlob("video/mp4");
 
   return {
     blob,
@@ -388,17 +558,32 @@ export async function enhanceVideo(
   const pureCopy = wantsCopy && !resizing && !filtering;
   const notes: string[] = [];
 
+  if (isAndroidRuntime()) {
+    notes.push(
+      "Sécurité Android active : sortie paginée en mémoire, surveillance des encodeurs bloqués et replis automatiques.",
+    );
+  }
+
   if (pureCopy) {
     try {
       const copied = await attemptPureCopy(file, probe, onProgress);
-      if (!probe.frameRateDetected) copied.notes.push("Cadence source non lisible : valeur de compatibilité 30 i/s affichée.");
+      if (!probe.frameRateDetected) {
+        copied.notes.push(
+          "Cadence source non lisible : valeur de compatibilité 30 i/s affichée.",
+        );
+      }
+      copied.notes = [...notes, ...copied.notes];
       onProgress?.(1, "Terminé");
       return copied;
     } catch (reason) {
-      notes.push(`Copie directe impossible : ${errorMessage(reason)}. Réencodage de secours activé.`);
+      notes.push(
+        `Copie directe impossible : ${errorMessage(reason)}. Réencodage de secours activé.`,
+      );
     }
   } else if (wantsCopy) {
-    notes.push("Copie directe demandée mais un redimensionnement ou un traitement d'image est actif : réencodage nécessaire.");
+    notes.push(
+      "Copie directe demandée mais un redimensionnement ou un traitement d'image est actif : réencodage nécessaire.",
+    );
   }
 
   const effectiveIntent: CodecIntent = wantsCopy ? "master" : intent;
@@ -415,45 +600,92 @@ export async function enhanceVideo(
 
     let plans: CodecPlan[] = [];
     try {
-      plans = await negotiateCodecCandidates(effectiveIntent, outputSize.width, outputSize.height, frameRate);
+      plans = orderPlansForRuntime(
+        await negotiateCodecCandidates(
+          effectiveIntent,
+          outputSize.width,
+          outputSize.height,
+          frameRate,
+        ),
+      );
     } catch (reason) {
-      notes.push(`Détection codec ${candidateTarget} impossible : ${errorMessage(reason)}.`);
+      notes.push(
+        `Détection codec ${candidateTarget} impossible : ${errorMessage(reason)}.`,
+      );
       continue;
     }
 
     if (!plans.length) {
-      notes.push(`Aucun codec WebCodecs encodable/muxable pour ${outputSize.width}×${outputSize.height} à ${Math.round(frameRate)} i/s.`);
+      notes.push(
+        `Aucun codec WebCodecs encodable/muxable pour ${outputSize.width}×${outputSize.height} à ${Math.round(frameRate)} i/s.`,
+      );
       continue;
     }
 
     for (const plan of plans) {
-      try {
-        const result = await executeWebCodecsAttempt(file, probe, outputSize, profile, plan, onProgress);
-        if (candidateTarget !== target) {
+      const heavyAndroidTarget =
+        isAndroidRuntime() && Math.max(outputSize.width, outputSize.height) > 2048;
+      const modes = heavyAndroidTarget ? [false, true] : [true, false];
+
+      for (const enhanceFrames of modes) {
+        try {
+          const result = await executeWebCodecsAttempt(
+            file,
+            probe,
+            outputSize,
+            profile,
+            plan,
+            onProgress,
+            enhanceFrames,
+          );
+
+          if (candidateTarget !== target) {
+            notes.push(
+              `La cible ${target} a été ramenée automatiquement à ${candidateTarget} après échec des encodeurs à la définition supérieure.`,
+            );
+          }
+
+          if (!enhanceFrames) {
+            notes.push(
+              "Le filtre avancé a été désactivé pour obtenir une sortie vidéo fiable sur cet appareil.",
+            );
+          }
+
+          if (!probe.frameRateDetected) {
+            notes.push(
+              "Cadence source non lisible dans le conteneur : 30 i/s retenus par compatibilité.",
+            );
+          }
+
+          result.notes = [...notes, ...result.notes, ...plan.rejected];
+          onProgress?.(1, "Terminé");
+          return result;
+        } catch (reason) {
           notes.push(
-            `La cible ${target} a été ramenée automatiquement à ${candidateTarget} après échec des encodeurs à la définition supérieure.`,
+            `${plan.codec.toUpperCase()} /${plan.container.toUpperCase()} ${outputSize.width}×${outputSize.height} ${enhanceFrames ? "avec filtre" : "sans filtre"} refusé : ${errorMessage(reason)}.`,
           );
         }
-        if (!probe.frameRateDetected) {
-          notes.push("Cadence source non lisible dans le conteneur : 30 i/s retenus par compatibilité.");
-        }
-        result.notes = [...notes, ...result.notes, ...plan.rejected];
-        onProgress?.(1, "Terminé");
-        return result;
-      } catch (reason) {
-        notes.push(
-          `${plan.codec.toUpperCase()} /${plan.container.toUpperCase()} ${outputSize.width}×${outputSize.height} refusé pendant l'encodage : ${errorMessage(reason)}.`,
-        );
       }
     }
   }
 
-  notes.push("Tous les encodeurs WebCodecs ont échoué : tentative finale via MediaRecorder.");
+  notes.push(
+    "Tous les encodeurs WebCodecs ont échoué ou se sont bloqués : tentative finale via MediaRecorder.",
+  );
   onProgress?.(0.01, "Repli final MediaRecorder");
 
-  const recorderTarget: TargetId = target === "8k" || target === "16k" ? "4k" : target;
+  const recorderTarget: TargetId =
+    target === "8k" || target === "16k" || (isAndroidRuntime() && target === "4k")
+      ? "2k"
+      : target;
+
   try {
-    const legacy = await enhanceVideoWithRecorder(file, recorderTarget, profile, onProgress);
+    const legacy = await enhanceVideoWithRecorder(
+      file,
+      recorderTarget,
+      profile,
+      onProgress,
+    );
     return {
       ...legacy,
       pipeline: "recorder",
@@ -466,7 +698,7 @@ export async function enhanceVideo(
     };
   } catch (reason) {
     throw new Error(
-      `Aucun pipeline vidéo local n'a abouti. Dernière erreur : ${errorMessage(reason)}. Essaie une cible 1080p ou 2K si la mémoire/encodeur du téléphone est limitant.`,
+      `Aucun pipeline vidéo local n'a abouti. Dernière erreur : ${errorMessage(reason)}. Essaie une cible 1080p si le navigateur Android manque de mémoire ou refuse l'encodeur.`,
     );
   }
 }
