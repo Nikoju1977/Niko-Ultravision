@@ -3,6 +3,7 @@ import { PROFILES, type ProfileId } from "./profiles";
 import { enhanceVideoWithRecorder } from "./videoRecorderFallback";
 import { measureCanvasSharpness } from "./finalSharpen";
 import { loadedModel, upscaleWithAi } from "./aiUpscaler";
+import { CancelledError, isCancelledError, isCancelled, onCancel, throwIfCancelled } from "./cancellation";
 import {
   negotiateCodecCandidates,
   webCodecsAvailable,
@@ -392,7 +393,8 @@ function createFrameProcessor(profile: ProfileId, output: Size, neuralAi = false
           neuralGuideScaleSum += model.scale;
           neural.width = 1;
           neural.height = 1;
-        } catch {
+        } catch (reason) {
+          if (isCancelledError(reason)) throw reason;
           neuralFailures += 1;
         }
       }
@@ -538,10 +540,16 @@ async function executeWithStallGuard(
     }
   }, 1500);
 
+  const unsubscribe = onCancel(() => {
+    void conversion.cancel().catch(() => undefined);
+  });
+
   try {
     onProgress?.(0.05, label);
     await conversion.execute();
+    if (isCancelled()) throw new CancelledError();
   } catch (reason) {
+    if (isCancelled() || isCancelledError(reason)) throw new CancelledError();
     if (stalled) {
       throw new Error(
         `traitement bloqué plus de ${Math.round(stallTimeoutMs / 1000)} s sans progression ; essai automatique du mode, codec ou de la définition suivante`,
@@ -549,6 +557,7 @@ async function executeWithStallGuard(
     }
     throw reason;
   } finally {
+    unsubscribe();
     window.clearInterval(timer);
   }
 }
@@ -844,6 +853,7 @@ export async function enhanceVideo(
       onProgress?.(1, "Terminé");
       return copied;
     } catch (reason) {
+      if (isCancelledError(reason)) throw reason;
       notes.push(
         `Copie directe impossible : ${errorMessage(reason)}. Réencodage de secours activé.`,
       );
@@ -903,6 +913,7 @@ export async function enhanceVideo(
           ];
 
       for (const mode of modes) {
+        throwIfCancelled();
         try {
           const result = await executeWebCodecsAttempt(
             file,
@@ -943,6 +954,7 @@ export async function enhanceVideo(
           onProgress?.(1, "Terminé");
           return result;
         } catch (reason) {
+          if (isCancelledError(reason)) throw reason;
           notes.push(
             `${plan.codec.toUpperCase()} /${plan.container.toUpperCase()} ${outputSize.width}×${outputSize.height} ${mode.label} refusé : ${errorMessage(reason)}.`,
           );
@@ -951,6 +963,7 @@ export async function enhanceVideo(
     }
   }
 
+  throwIfCancelled();
   notes.push(
     "Tous les encodeurs WebCodecs ont échoué ou se sont bloqués : tentative finale via MediaRecorder.",
   );
@@ -979,6 +992,7 @@ export async function enhanceVideo(
       ],
     };
   } catch (reason) {
+    if (isCancelledError(reason)) throw reason;
     throw new Error(
       `Aucun pipeline vidéo local n'a abouti. Dernière erreur : ${errorMessage(reason)}. Essaie une cible 1080p si le navigateur Android manque de mémoire ou refuse l'encodeur.`,
     );

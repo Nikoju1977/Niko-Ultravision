@@ -6,6 +6,7 @@
  */
 import { calculateOutputSize, megapixels, type Size, type TargetId } from "./geometry";
 import { PROFILES, type ProfileId } from "./profiles";
+import { CancelledError, onCancel } from "./cancellation";
 
 export interface RecorderResult {
   blob: Blob;
@@ -164,6 +165,7 @@ export async function enhanceVideoWithRecorder(
   let audioContext: AudioContext | null = null;
   let recorder: MediaRecorder | null = null;
   let canvas: HTMLCanvasElement | null = null;
+  let unsubscribeCancel: () => void = () => undefined;
 
   try {
     await waitForMetadata(video);
@@ -229,6 +231,7 @@ export async function enhanceVideoWithRecorder(
       recorder?.addEventListener("stop", () => resolve(), { once: true });
       recorder?.addEventListener("error", () => reject(new Error("Erreur d'encodage vidéo.")), { once: true });
       video.addEventListener("error", () => reject(new Error("Erreur de lecture vidéo pendant le traitement.")), { once: true });
+      unsubscribeCancel = onCancel(() => reject(new CancelledError()));
     });
 
     const drawFrame = () => {
@@ -275,6 +278,7 @@ export async function enhanceVideoWithRecorder(
       frameRateDetected: detectedRate.detected,
     };
   } finally {
+    unsubscribeCancel();
     video.pause();
     if (recorder && recorder.state !== "inactive") {
       try {

@@ -1,4 +1,5 @@
 import { decodeImageFile } from "./imageDecode";
+import { isCancelledError } from "./cancellation";
 import {
   AI_MODEL_PRESETS,
   loadAiModel,
@@ -1065,6 +1066,7 @@ export async function decodeAuraVision(
         neural.width = 1;
         neural.height = 1;
       } catch (reason) {
+        if (isCancelledError(reason)) throw reason;
         fallbackFilter = "Lanczos3";
         fallbackReason =
           "Reconstruction neuronale indisponible : " +

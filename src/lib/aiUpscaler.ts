@@ -12,6 +12,7 @@
  */
 
 import wasmBinaryUrl from "onnxruntime-web/ort-wasm-simd-threaded.jsep.wasm?url";
+import { throwIfCancelled } from "./cancellation";
 
 type OrtModule = typeof import("onnxruntime-web/webgpu");
 type OrtSession = Awaited<ReturnType<OrtModule["InferenceSession"]["create"]>>;
@@ -26,6 +27,8 @@ export interface AiModelInfo {
   /** Taille des poids téléchargés / chargés, en octets. */
   bytes: number;
   source: string;
+  /** true si les poids viennent du cache local (aucun téléchargement). */
+  fromCache: boolean;
 }
 
 export type ModelSource =
@@ -163,6 +166,71 @@ function downloadWeights(url: string, onProgress?: (ratio: number) => void): Pro
   });
 }
 
+/**
+ * Cache persistant des poids (Cache Storage). Un modèle Swin2SR x4 pèse
+ * plusieurs dizaines de Mo : sans cache, chaque visite le retéléchargeait.
+ * Tout échec du cache (origine opaque, navigation privée, quota) est
+ * silencieux : on retombe sur le téléchargement réseau.
+ */
+const MODEL_CACHE_NAME = "niko-ultravision-models-v1";
+
+function cacheStorageUsable(): boolean {
+  return typeof caches !== "undefined" && typeof window !== "undefined" && window.isSecureContext;
+}
+
+async function readCachedWeights(url: string): Promise<ArrayBuffer | null> {
+  if (!cacheStorageUsable()) return null;
+  try {
+    const cache = await caches.open(MODEL_CACHE_NAME);
+    const hit = await cache.match(url);
+    if (!hit) return null;
+    const buffer = await hit.arrayBuffer();
+    return buffer.byteLength > 0 ? buffer : null;
+  } catch {
+    return null;
+  }
+}
+
+async function storeCachedWeights(url: string, weights: ArrayBuffer): Promise<void> {
+  if (!cacheStorageUsable()) return;
+  try {
+    const cache = await caches.open(MODEL_CACHE_NAME);
+    await cache.put(
+      url,
+      new Response(weights.slice(0), {
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(weights.byteLength),
+        },
+      }),
+    );
+    // Demande de persistance : évite l'éviction du modèle sous pression disque.
+    await navigator.storage?.persist?.().catch(() => false);
+  } catch {
+    /* quota dépassé ou cache indisponible : non bloquant */
+  }
+}
+
+async function removeCachedWeights(url: string): Promise<void> {
+  if (!cacheStorageUsable()) return;
+  try {
+    const cache = await caches.open(MODEL_CACHE_NAME);
+    await cache.delete(url);
+  } catch {
+    /* non bloquant */
+  }
+}
+
+/** Vide le cache des modèles (bouton de maintenance). */
+export async function clearModelCache(): Promise<boolean> {
+  if (!cacheStorageUsable()) return false;
+  try {
+    return await caches.delete(MODEL_CACHE_NAME);
+  } catch {
+    return false;
+  }
+}
+
 function readFileBuffer(file: File): Promise<ArrayBuffer> {
   return file.arrayBuffer();
 }
@@ -194,6 +262,17 @@ async function createSession(
   );
 }
 
+/** Libère les tenseurs de sortie (mémoire WASM / GPU) dès qu'ils sont lus. */
+function disposeOutputs(result: Record<string, { dispose?: () => void }>): void {
+  for (const tensor of Object.values(result)) {
+    try {
+      tensor.dispose?.();
+    } catch {
+      /* déjà libéré */
+    }
+  }
+}
+
 /** Détermine le facteur d'échelle en exécutant réellement une passe 64×64. */
 async function probeScale(
   ort: OrtModule,
@@ -210,12 +289,15 @@ async function probeScale(
   ]);
 
   const result = await active.run({ [inputName]: probe });
+  probe.dispose();
   const output = result[outputName];
   if (!output || output.dims.length !== 4) {
+    disposeOutputs(result);
     throw new Error("Sortie du modèle inattendue : un tenseur NCHW est requis.");
   }
 
   const outHeight = Number(output.dims[2]);
+  disposeOutputs(result);
   const scale = outHeight / side;
   if (!Number.isFinite(scale) || scale < 1 || scale > 8) {
     throw new Error(`Facteur d'échelle du modèle non exploitable (${scale}).`);
@@ -237,8 +319,11 @@ async function probeRuntimeTile(
     [1, 3, side, side],
   );
   const result = await active.run({ [inputName]: probe });
+  probe.dispose();
   const output = result[outputName];
-  if (!output || output.dims.length !== 4) {
+  const valid = Boolean(output && output.dims.length === 4);
+  disposeOutputs(result);
+  if (!valid) {
     throw new Error("Le modèle refuse la taille de tuile réelle du navigateur.");
   }
 }
@@ -251,18 +336,36 @@ export async function loadAiModel(
   const ort = await getOrt();
 
   onProgress?.(0.08, "Récupération des poids du modèle");
-  const weights =
-    source.kind === "file"
-      ? await readFileBuffer(source.file)
-      : await downloadWeights(source.url, (ratio) =>
-          onProgress?.(0.08 + ratio * 0.62, `Téléchargement du modèle · ${Math.round(ratio * 100)} %`),
-        );
+  let fromCache = false;
+  let weights: ArrayBuffer;
+  if (source.kind === "file") {
+    weights = await readFileBuffer(source.file);
+  } else {
+    const cached = await readCachedWeights(source.url);
+    if (cached) {
+      weights = cached;
+      fromCache = true;
+      onProgress?.(0.7, "Modèle chargé depuis le cache local");
+    } else {
+      weights = await downloadWeights(source.url, (ratio) =>
+        onProgress?.(0.08 + ratio * 0.62, `Téléchargement du modèle · ${Math.round(ratio * 100)} %`),
+      );
+    }
+  }
 
   if (weights.byteLength === 0) throw new Error("Fichier de modèle vide.");
+  const byteLength = weights.byteLength;
 
   onProgress?.(0.74, "Initialisation de la session d'inférence");
   disposeModel();
-  const created = await createSession(ort, weights);
+  let created: { session: OrtSession; provider: string };
+  try {
+    created = await createSession(ort, weights);
+  } catch (reason) {
+    // Un cache corrompu ne doit pas bloquer définitivement le modèle.
+    if (fromCache && source.kind === "url") await removeCachedWeights(source.url);
+    throw reason;
+  }
   session = created.session;
 
   try {
@@ -280,11 +383,18 @@ export async function loadAiModel(
       inputName,
       outputName,
       provider: created.provider,
-      bytes: weights.byteLength,
+      bytes: byteLength,
       source: source.kind === "file" ? source.file.name : (source.label ?? source.url),
+      fromCache,
     };
 
-    onProgress?.(1, `Modèle prêt · x${scale} · ${created.provider.toUpperCase()}`);
+    // Mise en cache uniquement après validation complète du modèle.
+    if (source.kind === "url" && !fromCache) void storeCachedWeights(source.url, weights);
+
+    onProgress?.(
+      1,
+      `Modèle prêt · x${scale} · ${created.provider.toUpperCase()}${fromCache ? " · cache local" : ""}`,
+    );
     return info;
   } catch (reason) {
     const failed = session as (OrtSession & { release?: () => Promise<void> }) | null;
@@ -383,6 +493,7 @@ export async function upscaleWithAi(
       const tileWidth = endX - startX;
       const tileHeight = endY - startY;
 
+      throwIfCancelled();
       const tile = sourceCtx.getImageData(startX, startY, tileWidth, tileHeight);
       const tensor = tileToTensor(ort, tile.data, tileWidth, tileHeight);
 
@@ -390,6 +501,7 @@ export async function upscaleWithAi(
       try {
         result = await active.run({ [model.inputName]: tensor });
       } catch (reason) {
+        tensor.dispose();
         const detail = reason instanceof Error ? reason.message : "raison inconnue";
         throw new Error(
           done === 0
@@ -398,8 +510,12 @@ export async function upscaleWithAi(
         );
       }
 
+      tensor.dispose();
       const output = result[model.outputName];
-      if (!output || output.dims.length !== 4) throw new Error("Sortie IA invalide sur une tuile.");
+      if (!output || output.dims.length !== 4) {
+        disposeOutputs(result);
+        throw new Error("Sortie IA invalide sur une tuile.");
+      }
 
       const outWidth = Number(output.dims[3]);
       const outHeight = Number(output.dims[2]);
@@ -426,6 +542,7 @@ export async function upscaleWithAi(
         }
         destinationCtx.putImageData(patch, Math.round(coreX * scale), Math.round(coreY * scale));
       }
+      disposeOutputs(result);
 
       done += 1;
       onProgress?.(done / total, `Inférence IA · tuile ${done}/${total} · ${model.provider.toUpperCase()}`);

@@ -960,3 +960,7 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
     grid-column: auto;
   }
 }
+
+/* Annulation d'un traitement long */
+.cancel-button { width: 100%; margin-top: 10px; border-color: rgba(255, 120, 120, .35); color: #ffb1b1; }
+.cancel-button:hover { background: rgba(255, 120, 120, .08); }

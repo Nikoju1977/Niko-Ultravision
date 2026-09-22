@@ -33,6 +33,7 @@ import {
   type AiModelInfo,
 } from "./lib/aiUpscaler";
 import { PROFILES, type ProfileId } from "./lib/profiles";
+import { beginJob, isCancelled, isCancelledError, requestCancel } from "./lib/cancellation";
 import { enhanceVideo } from "./lib/videoEnhancer";
 import {
   CODEC_INTENTS,
@@ -458,7 +459,7 @@ export default function App() {
       setModel(loaded);
       if (activateImageEngine) setEngine("ai");
       setModelStatus(
-        `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo`,
+        `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo${loaded.fromCache ? " · cache local" : ""}`,
       );
       return loaded;
     } catch (reason) {
@@ -651,6 +652,7 @@ export default function App() {
 
   async function runEnhancement() {
     if (!file || !sourceSize) return;
+    beginJob();
     setBusy(true);
     setError(null);
     setProgress(0);
@@ -804,8 +806,13 @@ export default function App() {
       setProgress(1);
       setStatus("Master prêt");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Le traitement a échoué.");
-      setStatus("Erreur");
+      if (isCancelledError(reason)) {
+        setStatus("Traitement annulé");
+        setProgress(0);
+      } else {
+        setError(reason instanceof Error ? reason.message : "Le traitement a échoué.");
+        setStatus("Erreur");
+      }
     } finally {
       setBusy(false);
     }
@@ -824,6 +831,7 @@ export default function App() {
 
   async function runAuraEncode() {
     if (!file || mode !== "image" || auraBusy || busy) return;
+    beginJob();
     setAuraBusy(true);
     setError(null);
     setAuraStatus("Aura-Vision · préparation");
@@ -857,6 +865,7 @@ export default function App() {
     if (!file || mode !== "image" || auraBusy || busy) return;
 
     let encoded: Awaited<ReturnType<typeof encodeAuraVision>> | null = null;
+    beginJob();
     setAuraBusy(true);
     setError(null);
     setAuraStatus("AV-1X · encodage puis IA locale");
@@ -879,17 +888,21 @@ export default function App() {
       setAuraBusy(false);
     }
 
-    if (!encoded) return;
+    if (!encoded || isCancelled()) {
+      if (isCancelled()) setStatus("Traitement annulé");
+      return;
+    }
     const base = file.name.replace(/\.[^.]+$/, "") || "image";
     const avxFile = new File([encoded.blob], `${base}.avx`, {
       type: "application/x-aura-vision",
       lastModified: Date.now(),
     });
-    await runAuraDecode(avxFile, true);
+    await runAuraDecode(avxFile, true, false);
   }
 
-  async function runAuraDecode(picked: File | null, forceAi = false) {
+  async function runAuraDecode(picked: File | null, forceAi = false, freshJob = true) {
     if (!picked || auraBusy || busy) return;
+    if (freshJob) beginJob();
     setAuraBusy(true);
     setError(null);
     setAuraStatus("Aura-Vision · lecture AV-1X");
@@ -984,6 +997,12 @@ export default function App() {
       setProgress(1);
       setStatus("Aura-Vision décodé");
     } catch (reason) {
+      if (isCancelledError(reason)) {
+        setAuraStatus("Décodage annulé");
+        setStatus("Traitement annulé");
+        setProgress(0);
+        return;
+      }
       const message = reason instanceof Error ? reason.message : "Décodage Aura-Vision impossible.";
       setError(message);
       setAuraStatus(message);
@@ -1634,6 +1653,19 @@ export default function App() {
           <button className="run-button" type="button" onClick={() => void runEnhancement()} disabled={!file || busy}>
             {busy ? "Traitement en cours…" : "Créer le master local"}
           </button>
+
+          {(busy || auraBusy) && (
+            <button
+              className="secondary-button cancel-button"
+              type="button"
+              onClick={() => {
+                requestCancel();
+                setStatus("Annulation en cours…");
+              }}
+            >
+              Annuler le traitement
+            </button>
+          )}
 
           <div className="progress-wrap" aria-live="polite">
             <div className="progress-track"><span style={{ width: `${Math.round(progress * 100)}%` }} /></div>
