@@ -21,6 +21,11 @@ import {
   DEFAULT_DEPTH_FOCUS,
   type DepthFocusSettings,
 } from "./depth/depthTypes";
+import {
+  applyFinalAdaptiveSharpen,
+  finalSharpenAmountForProfile,
+  measureCanvasSharpness,
+} from "./finalSharpen";
 
 export type ImageFormat = "image/png" | "image/jpeg" | "image/webp";
 export type EngineId = "canvas" | "ai";
@@ -52,6 +57,9 @@ export interface ImageEnhanceResult {
   depthFocusFarCoverage: number;
   depthFocusMeanCorrection: number;
   depthFocusReason?: string;
+  sharpnessBefore: number;
+  sharpnessAfter: number;
+  sharpnessGain: number;
 }
 
 export interface ImageTargetAssessment {
@@ -333,12 +341,39 @@ export async function enhanceImage(
     });
 
     onProgress?.(0.91, "Finition locale");
-    // Deep Focus et Precision Restore réalisent déjà une accentuation sélective.
-    // Un sharpen global supplémentaire ferait double emploi et créerait des halos.
-    const sharpenApplied =
-      engineUsed === "ai" || deepFocusApplied || precisionRestoreApplied || depthFocusApplied
-        ? false
-        : sharpen(current, PROFILES[profile].sharpen);
+    const sharpnessBeforeMeasure = measureCanvasSharpness(current);
+    const restoredBeforeFinal =
+      deepFocusApplied || precisionRestoreApplied || depthFocusApplied;
+
+    // Netteté Pro v2 : on ne coupe plus la finition finale quand une
+    // restauration amont a travaillé. On réduit simplement son intensité.
+    // La passe finale est calculée sur la résolution de sortie afin que le
+    // gain reste visible après l'upscale.
+    const finalSharpenAmount = finalSharpenAmountForProfile(
+      profile,
+      restoredBeforeFinal,
+      engineUsed === "ai",
+    );
+    let sharpenApplied = applyFinalAdaptiveSharpen(current, {
+      amount: finalSharpenAmount,
+      edgeThreshold: profile === "detail" ? 4 : 5,
+      haloGuard: profile === "detail" ? 0.82 : 0.78,
+      maxCorrection: profile === "detail" ? 16 : 13,
+    });
+
+    // Repli vers l'ancien sharpen uniquement si la passe finale a dû être
+    // ignorée (très grande image ou contexte 2D indisponible).
+    if (!sharpenApplied && !restoredBeforeFinal) {
+      sharpenApplied = sharpen(current, PROFILES[profile].sharpen);
+    }
+
+    const sharpnessAfterMeasure = measureCanvasSharpness(current);
+    const sharpnessBefore = sharpnessBeforeMeasure.edgeEnergy;
+    const sharpnessAfter = sharpnessAfterMeasure.edgeEnergy;
+    const sharpnessGain =
+      sharpnessBefore > 0
+        ? (sharpnessAfter - sharpnessBefore) / sharpnessBefore
+        : 0;
 
     onProgress?.(0.96, "Encodage du master");
     const blob = await toBlob(current, format, format === "image/png" ? 1 : 0.96);
@@ -371,6 +406,9 @@ export async function enhanceImage(
       depthFocusFarCoverage,
       depthFocusMeanCorrection,
       depthFocusReason,
+      sharpnessBefore,
+      sharpnessAfter,
+      sharpnessGain,
     };
   } finally {
     decoded.close();
