@@ -36,14 +36,34 @@ export interface CandidateScore {
   detailGain: number;
   ringing: number;
   noiseRatio: number;
+  /** Confiance moyenne dans l'information réellement présente dans la source. */
+  meanSourceConfidence: number;
+  zoneCount: number;
   score: number;
   rejected: boolean;
   rejectReason: string | null;
 }
 
+export type EvaluationZoneKind =
+  | "detail"
+  | "flat"
+  | "edge"
+  | "midtone"
+  | "shadow"
+  | "highlight";
+
 export interface EvaluationZone {
   /** Zone source (résolution native). */
   source: HTMLCanvasElement;
+  /** Rôle de la sonde dans l'évaluation multi-régions. */
+  label?: string;
+  /** Poids relatif de la zone dans les moyennes du Quality Controller. */
+  weight?: number;
+  /**
+   * 0..1 : degré de confiance dans les informations de la source.
+   * Une source fiable doit être moins librement modifiée par l'IA.
+   */
+  sourceConfidence?: number;
   /**
    * Cible de fidélité. En mode restauration, c'est la source débarrassée de
    * son bruit/de ses blocs (lissage binomial) : un candidat qui reproduit
@@ -52,7 +72,7 @@ export interface EvaluationZone {
   target?: Luma;
   /** Référence : même zone agrandie par rééchantillonnage simple. */
   reference: HTMLCanvasElement;
-  kind: "detail" | "flat";
+  kind: EvaluationZoneKind;
 }
 
 export const QC_RULES = {
@@ -96,43 +116,86 @@ export function scoreCandidate(
   outputs: HTMLCanvasElement[],
   mode: QcMode = "fidelity",
 ): CandidateScore {
-  let ssimSum = 0, psnrSum = 0, localMax = 0, gainSum = 0, ringSum = 0, artifactSum = 0;
-  let detailZones = 0, noiseRatio = 1, artifactZones = 0;
+  let ssimSum = 0;
+  let psnrSum = 0;
+  let fidelityWeightSum = 0;
+  let localMax = 0;
+  let gainSum = 0;
+  let ringSum = 0;
+  let detailWeightSum = 0;
+  let artifactSum = 0;
+  let artifactWeightSum = 0;
+  let noiseSum = 0;
+  let noiseWeightSum = 0;
+  let confidenceSum = 0;
+  let zoneWeightSum = 0;
 
   zones.forEach((zone, index) => {
     const output = outputs[index];
+    if (!output) return;
+
+    const zoneWeight = Math.max(0.1, zone.weight ?? 1);
+    const sourceConfidence = clamp01(zone.sourceConfidence ?? 0.7);
+    const fidelityWeight = zoneWeight * (0.65 + 0.35 * sourceConfidence);
+    confidenceSum += sourceConfidence * zoneWeight;
+    zoneWeightSum += zoneWeight;
+
     const src = lumaOf(zone.source);
     const back = downTo(output, zone.source.width, zone.source.height);
     const target = mode === "restoration" ? zone.target ?? cleanedTarget(src) : src;
-    ssimSum += ssim(target, back);
-    psnrSum += psnr(target, back);
-    // L'hallucination se mesure toujours contre la vraie source.
+    ssimSum += ssim(target, back) * fidelityWeight;
+    psnrSum += psnr(target, back) * fidelityWeight;
+    fidelityWeightSum += fidelityWeight;
+
+    // L'hallucination se mesure toujours contre la vraie source : la pire
+    // zone reste bloquante, même si les autres régions sont excellentes.
     localMax = Math.max(localMax, localErrorP99(src, back));
+
     // Artefacts restants : blocs 8×8 et bruit, ramenés à la grille source.
     const sourceBlocks = jpegBlockiness(src);
-    // Sans blocs dans la source, l'indice n'a pas de sens : neutre.
     if (sourceBlocks > 1.1) {
-      artifactSum += 1 - (jpegBlockiness(back) - 1) / (sourceBlocks - 1);
-      artifactZones += 1;
+      artifactSum +=
+        (1 - (jpegBlockiness(back) - 1) / (sourceBlocks - 1)) * zoneWeight;
+      artifactWeightSum += zoneWeight;
     }
 
     const candLuma = lumaOf(output);
     const refLuma = lumaOf(zone.reference);
-    if (zone.kind === "detail") {
-      gainSum += gradientEnergy(candLuma) / Math.max(0.5, gradientEnergy(refLuma)) - 1;
-      ringSum += ringingRatio(candLuma, refLuma);
-      detailZones += 1;
-    } else {
-      noiseRatio = noiseSigma(candLuma) / Math.max(0.3, noiseSigma(refLuma));
+    const structuralProbe =
+      zone.kind === "detail" ||
+      zone.kind === "edge" ||
+      zone.kind === "midtone" ||
+      zone.kind === "highlight";
+
+    if (structuralProbe) {
+      gainSum +=
+        (gradientEnergy(candLuma) /
+          Math.max(0.5, gradientEnergy(refLuma)) -
+          1) *
+        zoneWeight;
+      ringSum += ringingRatio(candLuma, refLuma) * zoneWeight;
+      detailWeightSum += zoneWeight;
+    }
+
+    if (zone.kind === "flat" || zone.kind === "shadow") {
+      noiseSum +=
+        (noiseSigma(candLuma) /
+          Math.max(0.3, noiseSigma(refLuma))) *
+        zoneWeight;
+      noiseWeightSum += zoneWeight;
     }
   });
 
-  const n = Math.max(1, zones.length);
-  const meanSsim = ssimSum / n;
-  const meanPsnr = psnrSum / n;
-  const detailGain = detailZones ? gainSum / detailZones : 0;
-  const ringing = detailZones ? ringSum / detailZones : 0;
-  const artifactReduction = artifactZones ? Math.max(-1, Math.min(1, artifactSum / artifactZones)) : 0;
+  const meanSsim = ssimSum / Math.max(1e-6, fidelityWeightSum);
+  const meanPsnr = psnrSum / Math.max(1e-6, fidelityWeightSum);
+  const detailGain = detailWeightSum ? gainSum / detailWeightSum : 0;
+  const ringing = detailWeightSum ? ringSum / detailWeightSum : 0;
+  const noiseRatio = noiseWeightSum ? noiseSum / noiseWeightSum : 1;
+  const artifactReduction = artifactWeightSum
+    ? Math.max(-1, Math.min(1, artifactSum / artifactWeightSum))
+    : 0;
+  const meanSourceConfidence =
+    confidenceSum / Math.max(1e-6, zoneWeightSum);
 
   const localLimit = mode === "restoration" ? QC_RULES.maxLocalError * 1.4 : QC_RULES.maxLocalError;
   let rejectReason: string | null = null;
@@ -142,9 +205,14 @@ export function scoreCandidate(
   else if (mode === "restoration" && noiseRatio > 1.6) rejectReason = `bruit amplifié ×${noiseRatio.toFixed(2)}`;
 
   const fidelity = clamp01((meanSsim - QC_RULES.minSsim) / (1 - QC_RULES.minSsim));
-  // En restauration, le « détail » gagné sur une source bruitée est
-  // souvent du bruit accentué : son poids baisse.
-  const detailWeight = mode === "restoration" ? 0.2 : 0.35;
+  // Plus la source est fiable, plus la fidélité structurelle compte. Sur une
+  // source dégradée, on laisse davantage de poids à la restauration mesurée.
+  const fidelityWeight = mode === "restoration"
+    ? 0.34 + 0.12 * meanSourceConfidence
+    : 0.40 + 0.18 * meanSourceConfidence;
+  const detailWeight = mode === "restoration"
+    ? 0.16 + 0.08 * (1 - meanSourceConfidence)
+    : 0.28 + 0.08 * (1 - meanSourceConfidence);
   const detail = Math.max(-1, Math.min(1, detailGain / 0.6));
   const psnrTerm = clamp01((meanPsnr - 26) / 16);
   const noiseTerm =
@@ -154,7 +222,7 @@ export function scoreCandidate(
   const artifactTerm = mode === "restoration" ? 15 * artifactReduction : 0;
 
   const score =
-    100 * (0.4 * fidelity + detailWeight * detail + 0.1 * psnrTerm) -
+    100 * (fidelityWeight * fidelity + detailWeight * detail + 0.1 * psnrTerm) -
     100 * 0.5 * ringing +
     noiseTerm +
     artifactTerm;
@@ -167,6 +235,8 @@ export function scoreCandidate(
     ringing,
     noiseRatio,
     artifactReduction,
+    meanSourceConfidence,
+    zoneCount: zones.length,
     score: Math.round(Math.max(-100, Math.min(100, score)) * 10) / 10,
     rejected: rejectReason !== null,
     rejectReason,

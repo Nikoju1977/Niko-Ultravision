@@ -912,6 +912,11 @@ export default function App() {
         notes: [
           `Diagnostic : bruit σ ${d.noise.toFixed(1)} · netteté ${d.sharpness.toFixed(0)} · blocs JPEG ${d.blockiness.toFixed(2)} · contraste ${d.contrast} · couleur ${d.colorfulness.toFixed(1)} (variation ${d.colorVariation.toFixed(1)}).`,
           ...d.reasons.map((reason) => `Analyse : ${reason}.`),
+          `Evidence Gate : ${report.probeCount} zones témoins · confiance source moyenne ${Math.round(report.meanSourceConfidence * 100)} % · ${report.resourceProfile}.`,
+          ...(report.meanAiDisagreement !== null
+            ? [`Consensus IA : désaccord moyen ${(report.meanAiDisagreement * 100).toFixed(1)} % entre modèles valides.`]
+            : []),
+          ...report.regionalEvidence.map((entry) => `Région : ${entry}.`),
           `Validation netteté finale : ${(result.sharpnessBefore * 100).toFixed(2)} % → ${(result.sharpnessAfter * 100).toFixed(2)} %.`,
         ],
       });
@@ -1822,7 +1827,7 @@ export default function App() {
                 <div className="studio-table-wrap">
                   <table className="studio-table">
                     <thead>
-                      <tr><th>Candidat</th><th>Score</th><th>SSIM</th><th>Détail</th><th>Bruit</th><th>Artefacts</th><th>Halos</th><th>Statut</th></tr>
+                      <tr><th>Candidat</th><th>Score</th><th>SSIM</th><th>Zones</th><th>Désaccord</th><th>Détail</th><th>Bruit</th><th>Artefacts</th><th>Halos</th><th>Statut</th></tr>
                     </thead>
                     <tbody>
                       {output.studio.candidates.map((candidate) => (
@@ -1830,6 +1835,8 @@ export default function App() {
                           <td>{candidate.id === output.studio?.winner ? "★ " : ""}{candidate.label}</td>
                           <td>{candidate.score ? candidate.score.score.toFixed(1) : "—"}</td>
                           <td>{candidate.score ? candidate.score.ssim.toFixed(3) : "—"}</td>
+                          <td>{candidate.zoneWinWeight > 0 ? candidate.zoneWinWeight.toFixed(1) : "—"}</td>
+                          <td>{candidate.disagreement !== null ? `${(candidate.disagreement * 100).toFixed(1)} %` : "—"}</td>
                           <td>{candidate.score ? `${candidate.score.detailGain >= 0 ? "+" : ""}${(candidate.score.detailGain * 100).toFixed(0)} %` : "—"}</td>
                           <td>{candidate.score ? `×${candidate.score.noiseRatio.toFixed(2)}` : "—"}</td>
                           <td>{candidate.score ? `${candidate.score.artifactReduction >= 0 ? "−" : "+"}${Math.abs(candidate.score.artifactReduction * 100).toFixed(0)} %` : "—"}</td>

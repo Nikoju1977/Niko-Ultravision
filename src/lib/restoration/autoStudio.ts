@@ -16,12 +16,27 @@
 import { decodeImageFile } from "../imageDecode";
 import { calculateOutputSize, type TargetId } from "../geometry";
 import type { ProfileId } from "../profiles";
-import { loadAiModel, loadedModel, upscaleWithAi } from "../aiUpscaler";
+import { loadAiModel, loadedModel, upscaleWithAi, webGpuAvailable } from "../aiUpscaler";
 import { enhanceImage, type EnhanceImageOptions, type ImageEnhanceResult, type ImageFormat } from "../imageEnhancer";
 import { isCancelledError, throwIfCancelled } from "../cancellation";
-import { canvas2d, gradientEnergy, lumaOf, resample, smoothCanvas, unsharpMask } from "./imageMath";
+import {
+  canvas2d,
+  gradientEnergy,
+  jpegBlockiness,
+  lumaOf,
+  noiseSigma,
+  resample,
+  smoothCanvas,
+  unsharpMask,
+} from "./imageMath";
 import { diagnoseImage, planForRoute, type ImageDiagnosis, type RoutePlan } from "./imageDiagnosis";
-import { QC_RULES, scoreCandidate, type CandidateScore, type EvaluationZone } from "./qualityController";
+import {
+  QC_RULES,
+  scoreCandidate,
+  type CandidateScore,
+  type EvaluationZone,
+  type EvaluationZoneKind,
+} from "./qualityController";
 import { RESTORATION_MODELS, type RestorationModelId } from "./modelRegistry";
 
 export type CandidateId = "classic" | RestorationModelId;
@@ -34,6 +49,15 @@ export interface CandidateReport {
   error: string | null;
   elapsedMs: number;
   scale: number | null;
+  /** Nombre pondéré de régions dans lesquelles ce candidat est le meilleur. */
+  zoneWinWeight: number;
+  /** Désaccord moyen 0..1 avec les autres modèles IA valides. */
+  disagreement: number | null;
+  zoneScores: Array<{
+    label: string;
+    score: number;
+    rejected: boolean;
+  }>;
 }
 
 export interface StudioReport {
@@ -45,6 +69,11 @@ export interface StudioReport {
   decision: string;
   evaluationScale: number;
   qcMode: "fidelity" | "restoration";
+  probeCount: number;
+  meanSourceConfidence: number;
+  meanAiDisagreement: number | null;
+  resourceProfile: string;
+  regionalEvidence: string[];
 }
 
 export interface StudioResult {
@@ -54,16 +83,123 @@ export interface StudioResult {
 
 const ZONE_SIDE = 128;
 
-function lowMemoryDevice(): boolean {
-  const nav = navigator as Navigator & { deviceMemory?: number };
-  return (typeof nav.deviceMemory === "number" && nav.deviceMemory <= 4) || /Android|iPhone/i.test(navigator.userAgent);
+interface ResourcePlan {
+  label: string;
+  probeBudget: number;
+  modelBudget: number;
+  allowHeavy: boolean;
 }
 
-/** Choisit la zone la plus détaillée et une zone plate représentative. */
-function pickZones(source: CanvasImageSource, width: number, height: number): { x: number; y: number; kind: "detail" | "flat" }[] {
+interface ZoneDescriptor {
+  x: number;
+  y: number;
+  kind: EvaluationZoneKind;
+  label: string;
+  weight: number;
+}
+
+function resourcePlan(requestedMaxModels: number): ResourcePlan {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const memory = typeof nav.deviceMemory === "number" ? nav.deviceMemory : null;
+  const cores = navigator.hardwareConcurrency || 2;
+  const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const gpu = webGpuAvailable();
+
+  if (mobile || (memory !== null && memory <= 4)) {
+    return {
+      label: `Mobile prudent · ${memory ?? "RAM ?"} Go · ${cores} cœurs · ${gpu ? "WebGPU" : "WASM"}`,
+      probeBudget: 4,
+      modelBudget: Math.min(1, requestedMaxModels),
+      allowHeavy: false,
+    };
+  }
+
+  if (gpu && (memory === null || memory >= 8) && cores >= 8) {
+    return {
+      label: `Performance · ${memory ?? "RAM ?"} Go · ${cores} cœurs · WebGPU`,
+      probeBudget: 8,
+      modelBudget: Math.min(3, requestedMaxModels),
+      allowHeavy: true,
+    };
+  }
+
+  return {
+    label: `Équilibré · ${memory ?? "RAM ?"} Go · ${cores} cœurs · ${gpu ? "WebGPU" : "WASM"}`,
+    probeBudget: 6,
+    modelBudget: Math.min(2, requestedMaxModels),
+    allowHeavy: !mobile && (memory === null || memory >= 6),
+  };
+}
+
+function routeModelsForResources(
+  plan: RoutePlan,
+  resources: ResourcePlan,
+): RoutePlan {
+  const selected = plan.models.filter(
+    (id) => resources.allowHeavy || !RESTORATION_MODELS[id].heavy,
+  );
+
+  if (plan.models.length && selected.length === 0) {
+    selected.push("realesrgan-general-x4v3", "swin2sr-lightweight-x2");
+  } else if (!resources.allowHeavy && selected.length < resources.modelBudget) {
+    for (const fallback of [
+      "realesrgan-general-x4v3",
+      "swin2sr-lightweight-x2",
+    ] as RestorationModelId[]) {
+      if (!selected.includes(fallback)) selected.push(fallback);
+    }
+  }
+
+  return {
+    ...plan,
+    models: selected.slice(0, resources.modelBudget),
+  };
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function zoneConfidence(canvas: HTMLCanvasElement, kind: EvaluationZoneKind): number {
+  const luma = lumaOf(canvas);
+  const noise = noiseSigma(luma);
+  const blocks = jpegBlockiness(luma);
+  const gradient = gradientEnergy(luma);
+  const noisePenalty = clamp01(noise / 14);
+  const blockPenalty = clamp01(Math.max(0, blocks - 1) / 0.8);
+  const structureBonus =
+    kind === "detail" || kind === "edge"
+      ? 0.10 * clamp01(gradient / 28)
+      : 0;
+  return Math.max(
+    0.12,
+    Math.min(0.98, 0.93 - 0.48 * noisePenalty - 0.30 * blockPenalty + structureBonus),
+  );
+}
+
+/**
+ * Studio Auto v2 : échantillonnage multi-régions. On ne juge plus un modèle
+ * sur seulement une zone détaillée et une zone plate.
+ */
+function pickZones(
+  source: CanvasImageSource,
+  width: number,
+  height: number,
+  budget: number,
+): ZoneDescriptor[] {
   const side = Math.min(ZONE_SIDE, width, height);
-  const viewScale = Math.min(1, 256 / Math.max(width, height));
-  const view = lumaOf(resample(source, 0, 0, width, height, width * viewScale, height * viewScale));
+  const viewScale = Math.min(1, 320 / Math.max(width, height));
+  const view = lumaOf(
+    resample(
+      source,
+      0,
+      0,
+      width,
+      height,
+      Math.max(1, Math.round(width * viewScale)),
+      Math.max(1, Math.round(height * viewScale)),
+    ),
+  );
   const block = Math.max(4, Math.round(side * viewScale));
   const blocks: { x: number; y: number; energy: number; mean: number }[] = [];
 
@@ -73,36 +209,129 @@ function pickZones(source: CanvasImageSource, width: number, height: number): { 
       let mean = 0;
       for (let y = 0; y < block; y += 1) {
         for (let x = 0; x < block; x += 1) {
-          const v = view.data[(by + y) * view.width + bx + x];
-          sub[y * block + x] = v;
-          mean += v;
+          const value = view.data[(by + y) * view.width + bx + x];
+          sub[y * block + x] = value;
+          mean += value;
         }
       }
-      blocks.push({ x: bx, y: by, energy: gradientEnergy({ data: sub, width: block, height: block }), mean: mean / sub.length });
+      blocks.push({
+        x: bx,
+        y: by,
+        energy: gradientEnergy({ data: sub, width: block, height: block }),
+        mean: mean / sub.length,
+      });
     }
   }
 
-  // Alignement sur la grille 8×8 d'origine : indispensable pour mesurer
-  // les blocs JPEG au bon endroit.
   const align = (value: number, max: number) => {
     const clamped = Math.min(max, Math.max(0, Math.round(value)));
     return clamped - (clamped % 8);
   };
-  const toSource = (b: { x: number; y: number }) => ({
-    x: align(b.x / viewScale, width - side),
-    y: align(b.y / viewScale, height - side),
+  const toSource = (candidate: { x: number; y: number }) => ({
+    x: align(candidate.x / viewScale, Math.max(0, width - side)),
+    y: align(candidate.y / viewScale, Math.max(0, height - side)),
   });
 
-  if (!blocks.length) return [{ x: 0, y: 0, kind: "detail" }];
-  const byEnergy = [...blocks].sort((a, b) => b.energy - a.energy);
-  // Zone plate : faible énergie mais ni noire ni brûlée (sinon le bruit est invisible).
-  const flat = [...blocks]
-    .filter((b) => b.mean > 30 && b.mean < 225)
-    .sort((a, b) => a.energy - b.energy)[0];
+  if (!blocks.length) {
+    return [{ x: 0, y: 0, kind: "detail", label: "détail principal", weight: 1.25 }];
+  }
 
-  const zones: { x: number; y: number; kind: "detail" | "flat" }[] = [{ ...toSource(byEnergy[0]), kind: "detail" }];
-  if (flat) zones.push({ ...toSource(flat), kind: "flat" });
-  return zones;
+  const chosen: ZoneDescriptor[] = [];
+  const minDistance = side * 0.42;
+  const add = (
+    candidate: { x: number; y: number } | undefined,
+    kind: EvaluationZoneKind,
+    label: string,
+    weight: number,
+  ) => {
+    if (!candidate || chosen.length >= budget) return;
+    const point = toSource(candidate);
+    const distinct = chosen.every(
+      (zone) => Math.hypot(zone.x - point.x, zone.y - point.y) >= minDistance,
+    );
+    if (distinct || chosen.length === 0) {
+      chosen.push({ ...point, kind, label, weight });
+    }
+  };
+
+  const highEnergy = [...blocks].sort((a, b) => b.energy - a.energy);
+  const flat = [...blocks]
+    .filter((entry) => entry.mean > 30 && entry.mean < 225)
+    .sort((a, b) => a.energy - b.energy);
+  const midtone = [...blocks].sort(
+    (a, b) => Math.abs(a.mean - 128) - Math.abs(b.mean - 128),
+  );
+  const shadow = [...blocks]
+    .filter((entry) => entry.mean >= 18 && entry.mean <= 105)
+    .sort((a, b) => b.energy - a.energy);
+  const highlight = [...blocks]
+    .filter((entry) => entry.mean >= 150 && entry.mean <= 238)
+    .sort((a, b) => b.energy - a.energy);
+
+  add(highEnergy[0], "detail", "détail principal", 1.30);
+  add(highEnergy.find((entry) => entry !== highEnergy[0]), "edge", "structure / arêtes", 1.20);
+  add(flat[0], "flat", "zone plate / bruit", 1.00);
+  add(midtone[0], "midtone", "tons moyens", 1.00);
+  add(shadow[0], "shadow", "ombres", 0.90);
+  add(highlight[0], "highlight", "hautes lumières", 0.90);
+
+  // Machines puissantes : deux témoins supplémentaires pour réduire le risque
+  // qu'un sujet important échappe au benchmark.
+  if (budget > 6) {
+    add(highEnergy[2], "detail", "détail secondaire", 1.10);
+    const center = [...blocks].sort((a, b) => {
+      const ax = a.x + block / 2 - view.width / 2;
+      const ay = a.y + block / 2 - view.height / 2;
+      const bx = b.x + block / 2 - view.width / 2;
+      const by = b.y + block / 2 - view.height / 2;
+      return ax * ax + ay * ay - (bx * bx + by * by);
+    })[0];
+    add(center, "midtone", "centre image", 1.10);
+  }
+
+  // Si la scène est trop uniforme pour fournir toutes les catégories, on
+  // complète avec les blocs les plus éloignés spatialement.
+  for (const candidate of highEnergy) {
+    if (chosen.length >= budget) break;
+    add(candidate, "detail", `témoin ${chosen.length + 1}`, 0.85);
+  }
+
+  return chosen;
+}
+
+function signatureOf(outputs: HTMLCanvasElement[]): Float32Array[] {
+  return outputs.map((output) =>
+    lumaOf(
+      resample(
+        output,
+        0,
+        0,
+        output.width,
+        output.height,
+        32,
+        32,
+      ),
+    ).data,
+  );
+}
+
+function signatureDisagreement(
+  a: Float32Array[],
+  b: Float32Array[],
+): number {
+  let total = 0;
+  let samples = 0;
+  const zones = Math.min(a.length, b.length);
+  for (let zone = 0; zone < zones; zone += 1) {
+    const left = a[zone];
+    const right = b[zone];
+    const count = Math.min(left.length, right.length);
+    for (let i = 0; i < count; i += 1) {
+      total += Math.abs(left[i] - right[i]) / 255;
+      samples += 1;
+    }
+  }
+  return samples ? total / samples : 0;
 }
 
 function errorText(reason: unknown): string {
@@ -116,7 +345,7 @@ export async function runAutoStudio(
   format: ImageFormat,
   options: EnhanceImageOptions & { maxModels?: number } = {},
 ): Promise<StudioResult> {
-  const { onProgress, maxModels = 2, ...enhanceOptions } = options;
+  const { onProgress, maxModels = 3, ...enhanceOptions } = options;
   onProgress?.(0.02, "Studio Auto · analyse de l'image");
 
   const decoded = await decodeImageFile(file);
@@ -124,22 +353,45 @@ export async function runAutoStudio(
   let plan: RoutePlan;
   let zones: EvaluationZone[] = [];
   let evaluationScale = 1;
+  const resources = resourcePlan(maxModels);
   try {
     const output = calculateOutputSize(decoded.width, decoded.height, target);
     const requestedScale = Math.max(output.width / decoded.width, output.height / decoded.height);
     diagnosis = diagnoseImage(decoded.source, decoded.width, decoded.height, file, requestedScale);
-    plan = planForRoute(diagnosis, lowMemoryDevice());
-    plan = { ...plan, models: plan.models.slice(0, maxModels) };
+    plan = routeModelsForResources(
+      planForRoute(diagnosis, !resources.allowHeavy),
+      resources,
+    );
 
     if (plan.models.length && requestedScale >= 1.35) {
       evaluationScale = Math.min(4, Math.max(2, requestedScale));
-      zones = pickZones(decoded.source, decoded.width, decoded.height).map((zone) => {
+      zones = pickZones(
+        decoded.source,
+        decoded.width,
+        decoded.height,
+        resources.probeBudget,
+      ).map((zone) => {
         const side = Math.min(ZONE_SIDE, decoded.width, decoded.height);
         const { canvas, ctx } = canvas2d(side, side);
         ctx.imageSmoothingEnabled = false;
         ctx.drawImage(decoded.source, zone.x, zone.y, side, side, 0, 0, side, side);
-        const reference = resample(canvas, 0, 0, side, side, side * evaluationScale, side * evaluationScale);
-        return { source: canvas, reference, kind: zone.kind };
+        const reference = resample(
+          canvas,
+          0,
+          0,
+          side,
+          side,
+          Math.round(side * evaluationScale),
+          Math.round(side * evaluationScale),
+        );
+        return {
+          source: canvas,
+          reference,
+          kind: zone.kind,
+          label: zone.label,
+          weight: zone.weight,
+          sourceConfidence: zoneConfidence(canvas, zone.kind),
+        };
       });
     }
   } finally {
@@ -147,6 +399,8 @@ export async function runAutoStudio(
   }
 
   const candidates: CandidateReport[] = [];
+  const signatures = new Map<CandidateId, Float32Array[]>();
+  const zoneOutputs = new Map<CandidateId, HTMLCanvasElement[]>();
   const qcMode = plan.route === "noisy" || plan.route === "jpeg" || plan.route === "old-photo" ? "restoration" : "fidelity";
   const outputSide = (zone: EvaluationZone) => zone.reference.width;
 
@@ -166,6 +420,8 @@ export async function runAutoStudio(
       return copy;
     });
     const score = scoreCandidate(zones, outputs, qcMode);
+    signatures.set("classic", signatureOf(outputs));
+    zoneOutputs.set("classic", outputs);
     candidates.push({
       id: "classic",
       label: classicLabel,
@@ -174,6 +430,16 @@ export async function runAutoStudio(
       error: null,
       elapsedMs: performance.now() - started,
       scale: 1,
+      zoneWinWeight: 0,
+      disagreement: null,
+      zoneScores: zones.map((zone, index) => {
+        const local = scoreCandidate([zone], [outputs[index]], qcMode);
+        return {
+          label: zone.label ?? zone.kind,
+          score: local.score,
+          rejected: local.rejected,
+        };
+      }),
     });
   }
 
@@ -199,6 +465,8 @@ export async function runAutoStudio(
         raw.height = 1;
       }
       const score = scoreCandidate(zones, outputs, qcMode);
+      signatures.set(model.id, signatureOf(outputs));
+      zoneOutputs.set(model.id, outputs);
       candidates.push({
         id: model.id,
         label: model.label,
@@ -207,6 +475,16 @@ export async function runAutoStudio(
         error: null,
         elapsedMs: performance.now() - started,
         scale: loaded?.scale ?? null,
+        zoneWinWeight: 0,
+        disagreement: null,
+        zoneScores: zones.map((zone, zoneIndex) => {
+          const local = scoreCandidate([zone], [outputs[zoneIndex]], qcMode);
+          return {
+            label: zone.label ?? zone.kind,
+            score: local.score,
+            rejected: local.rejected,
+          };
+        }),
       });
     } catch (reason) {
       if (isCancelledError(reason)) throw reason;
@@ -218,14 +496,88 @@ export async function runAutoStudio(
         error: errorText(reason),
         elapsedMs: performance.now() - started,
         scale: null,
+        zoneWinWeight: 0,
+        disagreement: null,
+        zoneScores: [],
       });
     }
   }
 
-  // Sélection : l'IA doit battre la référence classique avec une marge.
-  const classic = candidates.find((c) => c.id === "classic");
-  const valid = candidates.filter((c) => c.status === "ok" && c.score);
-  const bestAi = valid.filter((c) => c.id !== "classic").sort((a, b) => b.score!.score - a.score!.score)[0];
+  // ---------------- Evidence Gate v2 ----------------
+  // 1) chaque région vote pour le candidat valide qui la traite le mieux ;
+  // 2) les IA sont pénalisées si elles se contredisent fortement ;
+  // 3) l'optimisation ne s'applique qu'après les contraintes de sûreté QC.
+  const valid = candidates.filter((candidate) => candidate.status === "ok" && candidate.score);
+  const classic = valid.find((candidate) => candidate.id === "classic") ??
+    candidates.find((candidate) => candidate.id === "classic");
+
+  let totalZoneWeight = 0;
+  const regionalEvidence: string[] = [];
+  zones.forEach((zone, zoneIndex) => {
+    const eligible = valid
+      .filter((candidate) => {
+        const local = candidate.zoneScores[zoneIndex];
+        return local && !local.rejected;
+      })
+      .sort(
+        (a, b) =>
+          b.zoneScores[zoneIndex].score -
+          a.zoneScores[zoneIndex].score,
+      );
+    const localWinner = eligible[0];
+    const weight = zone.weight ?? 1;
+    totalZoneWeight += weight;
+    if (localWinner) {
+      localWinner.zoneWinWeight += weight;
+      regionalEvidence.push(
+        `${zone.label ?? zone.kind} → ${localWinner.label} (${localWinner.zoneScores[zoneIndex].score.toFixed(1)})`,
+      );
+    }
+  });
+
+  const validAi = valid.filter((candidate) => candidate.id !== "classic");
+  let disagreementSum = 0;
+  let disagreementPairs = 0;
+  for (let i = 0; i < validAi.length; i += 1) {
+    let localSum = 0;
+    let localPairs = 0;
+    for (let j = 0; j < validAi.length; j += 1) {
+      if (i === j) continue;
+      const left = signatures.get(validAi[i].id);
+      const right = signatures.get(validAi[j].id);
+      if (!left || !right) continue;
+      const value = signatureDisagreement(left, right);
+      localSum += value;
+      localPairs += 1;
+      if (j > i) {
+        disagreementSum += value;
+        disagreementPairs += 1;
+      }
+    }
+    validAi[i].disagreement = localPairs ? localSum / localPairs : 0;
+  }
+
+  const meanAiDisagreement =
+    disagreementPairs ? disagreementSum / disagreementPairs : null;
+
+  const evidenceScore = (candidate: CandidateReport) => {
+    const regionalSupport =
+      totalZoneWeight > 0 ? candidate.zoneWinWeight / totalZoneWeight : 0;
+    const disagreementPenalty =
+      candidate.id === "classic"
+        ? 0
+        : Math.max(0, (candidate.disagreement ?? 0) - 0.035) * 85;
+    return (
+      (candidate.score?.score ?? -100) +
+      regionalSupport * 8 -
+      disagreementPenalty
+    );
+  };
+
+  const bestAi = [...validAi].sort(
+    (a, b) => evidenceScore(b) - evidenceScore(a),
+  )[0];
+
   let winner: CandidateReport | undefined = classic;
   let decision: string;
 
@@ -233,13 +585,41 @@ export async function runAutoStudio(
     decision = plan.models.length
       ? "Agrandissement trop faible pour justifier une reconstruction IA : rééchantillonnage haute qualité."
       : "Image propre : rééchantillonnage haute qualité, aucune reconstruction IA nécessaire.";
-  } else if (bestAi && (!classic?.score || classic.status !== "ok" || bestAi.score!.score >= classic.score.score + QC_RULES.aiMargin)) {
-    winner = bestAi;
-    decision = `${bestAi.label} retenu : score ${bestAi.score!.score} contre ${classic?.score?.score ?? "—"} pour la référence classique.`;
   } else if (bestAi) {
-    decision = `Référence classique conservée : ${bestAi.label} (${bestAi.score!.score}) ne la bat pas d'au moins ${QC_RULES.aiMargin} points.`;
+    const regionalSupport =
+      totalZoneWeight > 0 ? bestAi.zoneWinWeight / totalZoneWeight : 0;
+    const disagreement = bestAi.disagreement ?? 0;
+    const disagreementMargin = Math.max(0, (disagreement - 0.04) * 70);
+    const requiredMargin = QC_RULES.aiMargin + disagreementMargin;
+    const classicScore =
+      classic?.score && classic.status === "ok"
+        ? evidenceScore(classic)
+        : -Infinity;
+    const aiScore = evidenceScore(bestAi);
+    const enoughRegionalEvidence =
+      regionalSupport >= (zones.length >= 6 ? 0.18 : 0.24);
+
+    if (
+      (!Number.isFinite(classicScore) || aiScore >= classicScore + requiredMargin) &&
+      enoughRegionalEvidence
+    ) {
+      winner = bestAi;
+      decision =
+        `${bestAi.label} retenu par Evidence Gate : score ajusté ${aiScore.toFixed(1)}` +
+        `, soutien régional ${Math.round(regionalSupport * 100)} %` +
+        (validAi.length > 1
+          ? `, désaccord IA ${(disagreement * 100).toFixed(1)} %.`
+          : ".");
+    } else {
+      decision =
+        `Référence classique conservée : ${bestAi.label} n'apporte pas assez de preuves convergentes` +
+        ` (score ajusté ${aiScore.toFixed(1)}, soutien régional ${Math.round(regionalSupport * 100)} %` +
+        (validAi.length > 1
+          ? `, désaccord IA ${(disagreement * 100).toFixed(1)} %).`
+          : ").");
+    }
   } else {
-    decision = "Aucun candidat IA valide : référence classique conservée.";
+    decision = "Aucun candidat IA valide après les contraintes QC : référence classique conservée.";
   }
 
   const winnerId: CandidateId = winner?.id ?? "classic";
@@ -268,6 +648,13 @@ export async function runAutoStudio(
     });
   }
 
+  for (const outputs of zoneOutputs.values()) {
+    for (const canvas of outputs) {
+      canvas.width = 1;
+      canvas.height = 1;
+    }
+  }
+
   return {
     result,
     report: {
@@ -279,6 +666,17 @@ export async function runAutoStudio(
       decision,
       evaluationScale,
       qcMode,
+      probeCount: zones.length,
+      meanSourceConfidence:
+        zones.length
+          ? zones.reduce(
+              (sum, zone) => sum + (zone.sourceConfidence ?? 0.7),
+              0,
+            ) / zones.length
+          : 1,
+      meanAiDisagreement,
+      resourceProfile: resources.label,
+      regionalEvidence,
     },
   };
 }
