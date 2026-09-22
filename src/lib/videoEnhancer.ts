@@ -165,7 +165,8 @@ function createPagedStreamTarget(StreamTargetCtor: new (
     for (const page of pages) {
       if (remaining <= 0) break;
       const used = Math.min(remaining, page.byteLength);
-      const copy = page.slice(0, used);\n      parts.push(copy.buffer);
+      const copy = page.slice(0, used);
+      parts.push(copy.buffer);
       remaining -= used;
     }
     return new Blob(parts, { type: mimeType });
