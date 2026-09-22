@@ -16,6 +16,7 @@ import {
 import { calculateOutputSize, formatDimensions, megapixels, type Size, type TargetId } from "./lib/geometry";
 import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
 import { decodeImageFile } from "./lib/imageDecode";
+import { decodeAuraVision, encodeAuraVision } from "./lib/auraVisionCodec";
 import { orchestrateMediaAgents, type AgentDecision } from "./lib/mediaAgents";
 import { inspectAiRuntime, type AiRuntimeReport } from "./lib/aiRuntime";
 import {
@@ -219,6 +220,9 @@ export default function App() {
   const [aiRuntime, setAiRuntime] = useState<AiRuntimeReport | null>(null);
   const [smallSubjectMode, setSmallSubjectMode] = useState(false);
   const [videoNeuralAi, setVideoNeuralAi] = useState(false);
+  const [auraBusy, setAuraBusy] = useState(false);
+  const [auraStatus, setAuraStatus] = useState<string | null>(null);
+  const [auraUpscale, setAuraUpscale] = useState<1 | 2>(1);
   const [intent, setIntent] = useState<CodecIntent>("master");
   const [codecs, setCodecs] = useState<string[] | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecision[]>([]);
@@ -770,6 +774,103 @@ export default function App() {
     }
   }
 
+  function downloadNamedBlob(blob: Blob, name: string) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function runAuraEncode() {
+    if (!file || mode !== "image" || auraBusy || busy) return;
+    setAuraBusy(true);
+    setError(null);
+    setAuraStatus("Aura-Vision · préparation");
+    try {
+      const result = await encodeAuraVision(file, (value, label) => {
+        setProgress(value);
+        setStatus(label);
+        setAuraStatus(label);
+      });
+      const base = file.name.replace(/\.[^.]+$/, "") || "image";
+      downloadNamedBlob(result.blob, `${base}.avx`);
+      setAuraStatus(
+        `AV-1X prêt · ${result.width}×${result.height} · base ${result.baseWidth}×${result.baseHeight} · ` +
+          `taille ${(result.blob.size / 1024).toFixed(0)} Ko · flux/RGBA ${(result.ratioVsRgba * 100).toFixed(1)} % · ` +
+          result.semanticSummary,
+      );
+      setProgress(1);
+      setStatus("Aura-Vision AV-1X encodé");
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "Encodage Aura-Vision impossible.";
+      setError(message);
+      setAuraStatus(message);
+      setStatus("Erreur Aura-Vision");
+    } finally {
+      setAuraBusy(false);
+    }
+  }
+
+  async function runAuraDecode(picked: File | null) {
+    if (!picked || auraBusy || busy) return;
+    setAuraBusy(true);
+    setError(null);
+    setAuraStatus("Aura-Vision · lecture AV-1X");
+    try {
+      const result = await decodeAuraVision(picked, {
+        upscaleFactor: auraUpscale,
+        useAi: Boolean(model),
+        structuralThreshold: 0.95,
+        onProgress: (value, label) => {
+          setProgress(value);
+          setStatus(label);
+          setAuraStatus(label);
+        },
+      });
+      const url = URL.createObjectURL(result.blob);
+      setOutput((previous) => {
+        if (previous?.url) URL.revokeObjectURL(previous.url);
+        return {
+          url,
+          blob: result.blob,
+          size: { width: result.width, height: result.height },
+          engineUsed: result.usedAi ? "ai" : "canvas",
+          note:
+            `Aura-Vision AV-1X décodé en ${result.width}×${result.height}. ` +
+            (result.usedAi
+              ? `Reconstruction neuronale validée par garde-fou structurel${result.structuralSsim !== null ? ` (SSIM ${result.structuralSsim.toFixed(4)})` : ""}.`
+              : "Reconstruction déterministe structure/texture."),
+          notes: [
+            `Carte sémantique : ${result.semanticSummary}.`,
+            ...(result.structuralSsim !== null
+              ? [`Contrôle anti-hallucination SSIM : ${result.structuralSsim.toFixed(4)} · seuil 0.9500.`]
+              : []),
+            ...(result.fallbackReason ? [result.fallbackReason] : []),
+          ],
+        };
+      });
+      setMode("image");
+      setAuraStatus(
+        result.usedAi
+          ? `Décodage AV-1X neuronal validé · SSIM ${result.structuralSsim?.toFixed(4) ?? "n/a"}`
+          : `Décodage AV-1X déterministe · ${result.fallbackReason ?? "IA non utilisée"}`,
+      );
+      setProgress(1);
+      setStatus("Aura-Vision décodé");
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "Décodage Aura-Vision impossible.";
+      setError(message);
+      setAuraStatus(message);
+      setStatus("Erreur Aura-Vision");
+    } finally {
+      setAuraBusy(false);
+    }
+  }
+
   function downloadOutput() {
     if (!output || !file) return;
     const a = document.createElement("a");
@@ -1013,6 +1114,77 @@ export default function App() {
                     surtout sans WebGPU.
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+
+          {mode === "image" && (
+            <div className="control-block">
+              <label>Aura-Vision · AV-1X expérimental</label>
+              <div className="model-box">
+                <div className="model-head">
+                  <strong>Codec hybride structure + texture</strong>
+                  <span className="badge">V0.1</span>
+                </div>
+                <p className="model-note">
+                  Prototype réellement encodable : basse fréquence Haar/DWT, carte sémantique locale, descripteurs
+                  latents de texture et reconstruction optionnelle par le modèle ONNX déjà chargé. Le VAE appris et
+                  l'encapsulation ISOBMFF ne sont pas encore implémentés dans cette version : le conteneur .avx est
+                  propriétaire et versionné.
+                </p>
+
+                <div className="engine-grid">
+                  <button
+                    type="button"
+                    className={auraUpscale === 1 ? "choice active" : "choice"}
+                    onClick={() => setAuraUpscale(1)}
+                    disabled={busy || auraBusy}
+                  >
+                    <strong>Décodage fidèle 1×</strong>
+                    <span>Reconstruit la définition d’origine avec garde-fou structurel.</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={auraUpscale === 2 ? "choice active" : "choice"}
+                    onClick={() => setAuraUpscale(2)}
+                    disabled={busy || auraBusy}
+                  >
+                    <strong>Décodage natif 2×</strong>
+                    <span>Double la définition au décodage si le budget mémoire local le permet.</span>
+                  </button>
+                </div>
+
+                <div className="model-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => void runAuraEncode()}
+                    disabled={!file || busy || auraBusy}
+                  >
+                    {auraBusy ? "Traitement AV-1X…" : "Encoder la photo en .avx"}
+                  </button>
+
+                  <label className="file-button">
+                    Décoder un .avx
+                    <input
+                      type="file"
+                      accept=".avx,application/x-aura-vision"
+                      disabled={busy || auraBusy}
+                      onChange={(event) => {
+                        const picked = event.currentTarget.files?.[0] ?? null;
+                        event.currentTarget.value = "";
+                        void runAuraDecode(picked);
+                      }}
+                    />
+                  </label>
+                </div>
+
+                <div className={model ? "model-status" : "warning-card"}>
+                  {model
+                    ? `Décodeur neuronal disponible : ${model.source} · x${model.scale} · ${model.provider.toUpperCase()}.`
+                    : "Aucun modèle ONNX chargé : AV-1X décodera en mode déterministe. Charge IA locale pour activer la reconstruction neuronale."}
+                </div>
+                {auraStatus && <div className="model-status">{auraStatus}</div>}
               </div>
             </div>
           )}
@@ -1428,7 +1600,11 @@ export default function App() {
           contours d’objets et protège les aplats pour limiter bruit et halos. <strong>Depth Focus Precision</strong>
           estime ensuite une profondeur relative à faible résolution, calcule une carte de confiance et distribue la
           restauration sur 10 à 16 plans Z avec fusion douce. Cette carte n’est pas une distance physique ni une vraie
-          reconstruction 3D. <strong>Scene Precision Auto</strong> choisit un preset à partir d'heuristiques locales
+          reconstruction 3D. <strong>Aura-Vision AV-1X</strong> ajoute un codec image expérimental réellement encodable :
+          un flux structurel basse fréquence issu d'un Haar/DWT, une carte sémantique locale et des descripteurs compacts
+          de texture. Au décodage, le modèle ONNX chargé peut guider une reconstruction contrôlée par SSIM ; si le seuil
+          structurel n'est pas respecté, le décodeur revient automatiquement à la reconstruction déterministe. Le VAE
+          appris et le conteneur ISOBMFF restent des étapes futures. <strong>Scene Precision Auto</strong> choisit un preset à partir d'heuristiques locales
           (texte probable, contours, aplats et concentration centrale) sans prétendre reconnaître sémantiquement les
           objets. Le <strong>Quality Lab</strong> compare
           ensuite source et master à résolution commune : micro-détail, contours,
