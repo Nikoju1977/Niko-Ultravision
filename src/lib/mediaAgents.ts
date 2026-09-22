@@ -405,7 +405,7 @@ export async function orchestrateMediaAgents(context: AgentContext): Promise<Age
       );
       target = safeTarget;
     } else {
-      decisions.push(d("memory", "Agent Performance", "ok", `Cible vidéo ${target} validée sur cet appareil.`));
+      decisions.push(d("memory", "Agent Performance", "ok", `Cible vidéo ${target} validée par une sonde réelle encode + mux + lecture sur cet appareil.`));
     }
 
     if (webCodecsAvailable()) {
@@ -418,8 +418,8 @@ export async function orchestrateMediaAgents(context: AgentContext): Promise<Age
           "Agent Codec Pro",
           codecs.length ? "ok" : "warning",
           codecs.length
-            ? `Encodeurs disponibles : ${labels}. UltraVision essaiera automatiquement le codec suivant si l'encodage réel échoue.`
-            : "Aucun encodeur WebCodecs disponible à cette définition.",
+            ? `Chaînes vidéo validées par test réel : ${labels}. Chaque entrée a encodé, été muxée puis relue localement.`
+            : "Aucune chaîne encode + mux + lecture validée à cette définition.",
         ),
       );
     } else {
