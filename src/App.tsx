@@ -799,8 +799,9 @@ export default function App() {
       const base = file.name.replace(/\.[^.]+$/, "") || "image";
       downloadNamedBlob(result.blob, `${base}.avx`);
       setAuraStatus(
-        `AV-1X prêt · ${result.width}×${result.height} · base ${result.baseWidth}×${result.baseHeight} · ` +
+        `AV-1X v${result.manifest.header.version} prêt · ${result.width}×${result.height} · base ${result.baseWidth}×${result.baseHeight} · ` +
           `taille ${(result.blob.size / 1024).toFixed(0)} Ko · flux/RGBA ${(result.ratioVsRgba * 100).toFixed(1)} % · ` +
+          `SHA-256 ${result.manifest.dimensional_control.cryptographic_validation.reference_hash_sha256.slice(0, 12)}… · ` +
           result.semanticSummary,
       );
       setProgress(1);
@@ -846,6 +847,13 @@ export default function App() {
               : "Reconstruction déterministe structure/texture."),
           notes: [
             `Carte sémantique : ${result.semanticSummary}.`,
+            ...(result.manifest
+              ? [
+                  `AV-1X ${result.manifest.header.version} · ${result.manifest.header.encoding_metadata.authoring_tool} · ${result.manifest.header.encoding_metadata.compression_level}.`,
+                  `Intégrité SHA-256 : ${result.manifest.dimensional_control.cryptographic_validation.reference_hash_sha256}.`,
+                  `Colorimétrie demandée : Rec.2020 / 10-bit / HLG ; payload actuel : ${result.manifest.geometry_and_display.colorimetry.stored_payload.space} / ${result.manifest.geometry_and_display.colorimetry.stored_payload.bit_depth}-bit / ${result.manifest.geometry_and_display.colorimetry.stored_payload.hdr_profile}.`,
+                ]
+              : []),
             ...(result.structuralSsim !== null
               ? [`Contrôle anti-hallucination SSIM : ${result.structuralSsim.toFixed(4)} · seuil 0.9500.`]
               : []),
@@ -1127,10 +1135,10 @@ export default function App() {
                   <span className="badge">V0.1</span>
                 </div>
                 <p className="model-note">
-                  Prototype réellement encodable : basse fréquence Haar/DWT, carte sémantique locale, descripteurs
-                  latents de texture et reconstruction optionnelle par le modèle ONNX déjà chargé. Le VAE appris et
-                  l'encapsulation ISOBMFF ne sont pas encore implémentés dans cette version : le conteneur .avx est
-                  propriétaire et versionné.
+                  AV-1X v1.0 : basse fréquence Haar/DWT, carte sémantique RLE, descripteurs de texture INT8,
+                  manifeste structuré, contrôle SSIM et empreinte SHA-256. La cible Rec.2020 / 10-bit / HLG est inscrite
+                  dans le manifeste, mais le payload navigateur reste actuellement 8-bit SDR. Le VAE appris, CABAC et
+                  l'encapsulation ISOBMFF ne sont pas encore implémentés : le conteneur .avx reste propriétaire et versionné.
                 </p>
 
                 <div className="engine-grid">
