@@ -6,6 +6,33 @@
     <meta name="theme-color" content="#07111f" />
     <meta name="description" content="Niko UltraVision Pro — restauration et agrandissement local d'images et de vidéos, sans API payante." />
     <title>Niko UltraVision Pro</title>
+    <script>
+      /* Isolation cross-origin pour l'IA multi-thread (voir public/coi-sw.js). */
+      (function () {
+        var sw = navigator.serviceWorker;
+        if (!sw) return;
+        var params = new URLSearchParams(location.search);
+        if (params.get("coi") === "0") {
+          sw.getRegistrations().then(function (list) {
+            list.forEach(function (registration) { registration.unregister(); });
+          });
+          return;
+        }
+        if (window.crossOriginIsolated || !window.isSecureContext) return;
+        var flag = "uv-coi-reload";
+        sw.register("./coi-sw.js").then(function (registration) {
+          // Un seul rechargement par session : aucune boucle possible, même
+          // sur un navigateur qui ignorerait les en-têtes.
+          if (sessionStorage.getItem(flag)) return;
+          var reload = function () {
+            sessionStorage.setItem(flag, "1");
+            location.reload();
+          };
+          if (sw.controller || registration.active) { reload(); return; }
+          sw.addEventListener("controllerchange", reload, { once: true });
+        }).catch(function () { /* l'app fonctionne sans, en mono-thread */ });
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

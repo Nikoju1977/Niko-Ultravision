@@ -1,21 +1,35 @@
 /**
  * Moteur de super-résolution IA — ONNX Runtime Web.
  *
- * Ce module exécute un vrai réseau de neurones open source dans le navigateur.
- * Il est volontairement agnostique du modèle : le nom des entrées/sorties et le
- * facteur d'échelle sont lus sur la session ONNX, pas codés en dur. Tout modèle
- * de super-résolution à une entrée NCHW et une sortie NCHW fonctionne
- * (Swin2SR, Real-ESRGAN, EDSR, SwinIR…).
+ * Architecture :
+ *  - l'inférence tourne dans un Web Worker dédié (interface fluide) ;
+ *  - multi-thread WASM automatique quand la page est cross-origin isolée
+ *    (service worker COI) ;
+ *  - replis automatiques : worker multi-thread → worker mono-thread →
+ *    thread principal. Chaque étape est réellement testée (session + tuile).
  *
- * Les pixels ne quittent jamais l'appareil. Seuls les poids du modèle sont
- * téléchargés (une fois), ou fournis en local par un fichier .onnx.
+ * Le modèle est agnostique : noms d'entrée/sortie et facteur d'échelle sont
+ * lus sur la session. Les pixels ne quittent jamais l'appareil ; seuls les
+ * poids sont téléchargés une fois puis servis depuis le cache local.
  */
 
-import wasmBinaryUrl from "onnxruntime-web/ort-wasm-simd-threaded.jsep.wasm?url";
 import { throwIfCancelled } from "./cancellation";
-
-type OrtModule = typeof import("onnxruntime-web/webgpu");
-type OrtSession = Awaited<ReturnType<OrtModule["InferenceSession"]["create"]>>;
+import {
+  createSession,
+  errorText,
+  getOrt,
+  hasWebGpu,
+  isIsolated,
+  probeModel,
+  recommendedThreads,
+  releaseSession,
+  runTile,
+  type KeepRect,
+  type ModelMeta,
+  type OrtSession,
+  type TileResult,
+} from "./aiEngineCore";
+import type { WorkerRequest, WorkerResponse } from "./aiWorker";
 
 export interface AiModelInfo {
   /** Facteur d'agrandissement mesuré sur le modèle (2, 3, 4…). */
@@ -24,11 +38,15 @@ export interface AiModelInfo {
   outputName: string;
   /** "webgpu" ou "wasm" — backend réellement retenu. */
   provider: string;
-  /** Taille des poids téléchargés / chargés, en octets. */
+  /** Taille des poids, en octets. */
   bytes: number;
   source: string;
   /** true si les poids viennent du cache local (aucun téléchargement). */
   fromCache: boolean;
+  /** Où tourne l'inférence. */
+  execution: "worker" | "main";
+  /** Threads WASM réellement actifs (1 sans isolation cross-origin). */
+  threads: number;
 }
 
 export type ModelSource =
@@ -92,6 +110,7 @@ export const AI_MAX_SOURCE_PIXELS = 8_000_000;
 /** Au-delà, on prévient l'utilisateur du temps de calcul. */
 export const AI_WARN_SOURCE_PIXELS = 2_000_000;
 
+
 const DESKTOP_TILE_CORE = 192;
 const MOBILE_TILE_CORE = 128;
 const TILE_PAD = 12;
@@ -99,90 +118,168 @@ const TILE_PAD = 12;
 function runtimeTileCore(): number {
   const nav = navigator as Navigator & { deviceMemory?: number };
   const lowMemory = typeof nav.deviceMemory === "number" && nav.deviceMemory <= 4;
-  return /Android/i.test(navigator.userAgent) || lowMemory ? MOBILE_TILE_CORE : DESKTOP_TILE_CORE;
+  return /Android|iPhone|iPad/i.test(navigator.userAgent) || lowMemory ? MOBILE_TILE_CORE : DESKTOP_TILE_CORE;
 }
-
-let ortModule: OrtModule | null = null;
-let session: OrtSession | null = null;
-let info: AiModelInfo | null = null;
 
 export function aiEngineAvailable(): boolean {
   return typeof WebAssembly !== "undefined";
 }
 
 export function webGpuAvailable(): boolean {
-  return typeof navigator !== "undefined" && "gpu" in navigator;
+  return hasWebGpu();
 }
 
-export function loadedModel(): AiModelInfo | null {
-  return info;
+export function crossOriginIsolatedRuntime(): boolean {
+  return isIsolated();
 }
 
-export function disposeModel(): void {
-  const current = session as (OrtSession & { release?: () => Promise<void> }) | null;
-  void current?.release?.().catch(() => undefined);
-  session = null;
-  info = null;
+/* ------------------------------------------------------------------ */
+/* Moteurs d'exécution                                                  */
+/* ------------------------------------------------------------------ */
+
+interface LoadResult {
+  meta: ModelMeta;
+  threads: number;
 }
 
-async function getOrt(): Promise<OrtModule> {
-  if (ortModule) return ortModule;
-
-  const mod = await import("onnxruntime-web/webgpu");
-  // Le binaire WASM est servi depuis nos propres assets : aucun CDN tiers.
-  mod.env.wasm.wasmPaths = { wasm: wasmBinaryUrl };
-  // Le multi-thread exige l'isolation cross-origin (COOP/COEP). Sans elle,
-  // forcer numThreads > 1 fait échouer l'initialisation : on reste mono-thread.
-  const isolated = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
-  mod.env.wasm.numThreads = isolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
-  mod.env.logLevel = "error";
-
-  ortModule = mod;
-  return mod;
+interface Engine {
+  readonly execution: "worker" | "main";
+  load(weights: ArrayBuffer, tileSide: number, preferGpu: boolean): Promise<LoadResult>;
+  tile(rgba: Uint8ClampedArray, width: number, height: number, keep: KeepRect): Promise<TileResult>;
+  dispose(): void;
 }
 
-/** Téléchargement XHR (progression réelle, compatible origine null Android). */
-function downloadWeights(url: string, onProgress?: (ratio: number) => void): Promise<ArrayBuffer> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("GET", url, true);
-    xhr.responseType = "arraybuffer";
+type Pending = {
+  resolve: (value: WorkerResponse) => void;
+  reject: (reason: Error) => void;
+};
 
-    xhr.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) onProgress?.(event.loaded / event.total);
+class WorkerEngine implements Engine {
+  readonly execution = "worker" as const;
+  private worker: Worker;
+  private pending = new Map<number, Pending>();
+  private nextId = 1;
+  private dead: Error | null = null;
+
+  constructor(private readonly threads: number) {
+    this.worker = new Worker(new URL("./aiWorker.ts", import.meta.url), {
+      type: "module",
+      name: "ultravision-ai",
+    });
+    this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+      const entry = this.pending.get(event.data.id);
+      if (!entry) return;
+      this.pending.delete(event.data.id);
+      if (event.data.ok) entry.resolve(event.data);
+      else entry.reject(new Error(event.data.error));
     };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
-        resolve(xhr.response as ArrayBuffer);
-      } else {
-        reject(new Error(`Téléchargement du modèle impossible (HTTP ${xhr.status}).`));
-      }
+    const fail = (message: string) => {
+      this.dead = new Error(message);
+      for (const entry of this.pending.values()) entry.reject(this.dead);
+      this.pending.clear();
     };
-    xhr.onerror = () =>
-      reject(new Error("Téléchargement du modèle impossible : réseau ou CORS bloqué."));
-    xhr.ontimeout = () => reject(new Error("Téléchargement du modèle : délai dépassé."));
-    xhr.timeout = 180_000;
-    xhr.send();
-  });
+    this.worker.onerror = (event) => {
+      event.preventDefault();
+      fail("Worker IA arrêté : " + (event.message || "erreur de chargement du module"));
+    };
+    this.worker.onmessageerror = () => fail("Worker IA : message illisible.");
+  }
+
+  private call(request: WorkerRequest, transfer: Transferable[] = []): Promise<WorkerResponse> {
+    if (this.dead) return Promise.reject(this.dead);
+    return new Promise((resolve, reject) => {
+      this.pending.set(request.id, { resolve, reject });
+      this.worker.postMessage(request, transfer);
+    });
+  }
+
+  async load(weights: ArrayBuffer, tileSide: number, preferGpu: boolean): Promise<LoadResult> {
+    // Copie volontaire (pas de transfert) : les poids restent disponibles
+    // pour un éventuel repli sur une autre configuration.
+    const reply = await this.call({
+      id: this.nextId++,
+      type: "load",
+      weights,
+      threads: this.threads,
+      tileSide,
+      preferGpu,
+    });
+    if (!reply.ok || reply.type !== "load") throw new Error("Réponse inattendue du worker IA.");
+    return { meta: reply.meta, threads: reply.threads };
+  }
+
+  async tile(rgba: Uint8ClampedArray, width: number, height: number, keep: KeepRect): Promise<TileResult> {
+    const buffer = rgba.buffer as ArrayBuffer;
+    const reply = await this.call(
+      { id: this.nextId++, type: "tile", rgba: buffer, width, height, keep },
+      [buffer],
+    );
+    if (!reply.ok || reply.type !== "tile") throw new Error("Réponse inattendue du worker IA.");
+    return { data: new Uint8ClampedArray(reply.data), width: reply.width, height: reply.height };
+  }
+
+  dispose(): void {
+    this.dead = this.dead ?? new Error("Moteur IA libéré.");
+    for (const entry of this.pending.values()) entry.reject(this.dead);
+    this.pending.clear();
+    this.worker.terminate();
+  }
 }
 
-/**
- * Cache persistant des poids (Cache Storage). Un modèle Swin2SR x4 pèse
- * plusieurs dizaines de Mo : sans cache, chaque visite le retéléchargeait.
- * Tout échec du cache (origine opaque, navigation privée, quota) est
- * silencieux : on retombe sur le téléchargement réseau.
- */
+/** Repli ultime : même noyau, exécuté dans le thread de l'interface. */
+class MainThreadEngine implements Engine {
+  readonly execution = "main" as const;
+  private session: OrtSession | null = null;
+  private meta: ModelMeta | null = null;
+  private weights: Uint8Array | null = null;
+
+  async load(weights: ArrayBuffer, tileSide: number, preferGpu: boolean): Promise<LoadResult> {
+    const ort = await getOrt(1);
+    await releaseSession(this.session);
+    this.session = null;
+    this.weights = new Uint8Array(weights.slice(0));
+    const created = await createSession(ort, this.weights, preferGpu);
+    try {
+      this.meta = await probeModel(ort, created.session, created.provider, tileSide);
+    } catch (reason) {
+      await releaseSession(created.session);
+      throw reason;
+    }
+    this.session = created.session;
+    return { meta: this.meta, threads: 1 };
+  }
+
+  async tile(rgba: Uint8ClampedArray, width: number, height: number, keep: KeepRect): Promise<TileResult> {
+    if (!this.session || !this.meta) throw new Error("Aucun modèle IA chargé.");
+    const ort = await getOrt(1);
+    const result = await runTile(ort, this.session, this.meta, rgba, width, height, keep);
+    // Rend la main au navigateur entre deux tuiles.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    return result;
+  }
+
+  dispose(): void {
+    void releaseSession(this.session);
+    this.session = null;
+    this.meta = null;
+    this.weights = null;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Cache persistant des poids                                           */
+/* ------------------------------------------------------------------ */
+
 const MODEL_CACHE_NAME = "niko-ultravision-models-v1";
 
 function cacheStorageUsable(): boolean {
-  return typeof caches !== "undefined" && typeof window !== "undefined" && window.isSecureContext;
+  return typeof caches !== "undefined" && globalThis.isSecureContext === true;
 }
 
 async function readCachedWeights(url: string): Promise<ArrayBuffer | null> {
   if (!cacheStorageUsable()) return null;
   try {
-    const cache = await caches.open(MODEL_CACHE_NAME);
-    const hit = await cache.match(url);
+    const hit = await (await caches.open(MODEL_CACHE_NAME)).match(url);
     if (!hit) return null;
     const buffer = await hit.arrayBuffer();
     return buffer.byteLength > 0 ? buffer : null;
@@ -197,31 +294,29 @@ async function storeCachedWeights(url: string, weights: ArrayBuffer): Promise<vo
     const cache = await caches.open(MODEL_CACHE_NAME);
     await cache.put(
       url,
-      new Response(weights.slice(0), {
+      new Response(weights, {
         headers: {
           "Content-Type": "application/octet-stream",
           "Content-Length": String(weights.byteLength),
         },
       }),
     );
-    // Demande de persistance : évite l'éviction du modèle sous pression disque.
     await navigator.storage?.persist?.().catch(() => false);
   } catch {
-    /* quota dépassé ou cache indisponible : non bloquant */
+    /* quota ou cache indisponible : non bloquant */
   }
 }
 
 async function removeCachedWeights(url: string): Promise<void> {
   if (!cacheStorageUsable()) return;
   try {
-    const cache = await caches.open(MODEL_CACHE_NAME);
-    await cache.delete(url);
+    await (await caches.open(MODEL_CACHE_NAME)).delete(url);
   } catch {
     /* non bloquant */
   }
 }
 
-/** Vide le cache des modèles (bouton de maintenance). */
+/** Vide le cache des modèles. */
 export async function clearModelCache(): Promise<boolean> {
   if (!cacheStorageUsable()) return false;
   try {
@@ -231,232 +326,156 @@ export async function clearModelCache(): Promise<boolean> {
   }
 }
 
-function readFileBuffer(file: File): Promise<ArrayBuffer> {
-  return file.arrayBuffer();
+/** true si les poids de cette URL sont déjà en cache (chargement instantané). */
+export async function isModelCached(url: string): Promise<boolean> {
+  return (await readCachedWeights(url)) !== null;
 }
 
-async function createSession(
-  ort: OrtModule,
-  weights: ArrayBuffer,
-): Promise<{ session: OrtSession; provider: string }> {
-  const attempts: string[] = webGpuAvailable() ? ["webgpu", "wasm"] : ["wasm"];
-  const failures: string[] = [];
-
-  for (const provider of attempts) {
-    try {
-      const created = await ort.InferenceSession.create(weights, {
-        executionProviders: [provider],
-        graphOptimizationLevel: "all",
-      });
-      return { session: created, provider };
-    } catch (reason) {
-      failures.push(
-        provider.toUpperCase() + " : " +
-          (reason instanceof Error ? reason.message : "raison inconnue"),
-      );
-    }
-  }
-
-  throw new Error(
-    "Le modèle n'a pas pu être initialisé. " + failures.join(" | "),
-  );
+/** Téléchargement XHR (progression réelle, compatible origine null Android). */
+function downloadWeights(url: string, onProgress?: (ratio: number) => void): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", url, true);
+    xhr.responseType = "arraybuffer";
+    xhr.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) onProgress?.(event.loaded / event.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response) resolve(xhr.response as ArrayBuffer);
+      else reject(new Error(`Téléchargement du modèle impossible (HTTP ${xhr.status}).`));
+    };
+    xhr.onerror = () => reject(new Error("Téléchargement du modèle impossible : réseau ou CORS bloqué."));
+    xhr.ontimeout = () => reject(new Error("Téléchargement du modèle : délai dépassé."));
+    xhr.timeout = 300_000;
+    xhr.send();
+  });
 }
 
-/** Libère les tenseurs de sortie (mémoire WASM / GPU) dès qu'ils sont lus. */
-function disposeOutputs(result: Record<string, { dispose?: () => void }>): void {
-  for (const tensor of Object.values(result)) {
-    try {
-      tensor.dispose?.();
-    } catch {
-      /* déjà libéré */
-    }
-  }
+/* ------------------------------------------------------------------ */
+/* Chargement du modèle                                                 */
+/* ------------------------------------------------------------------ */
+
+let engine: Engine | null = null;
+let info: AiModelInfo | null = null;
+/** Dernière configuration qui a fonctionné : essayée en premier ensuite. */
+let preferredPlan: string | null = null;
+
+export function loadedModel(): AiModelInfo | null {
+  return info;
 }
 
-/** Détermine le facteur d'échelle en exécutant réellement une passe 64×64. */
-async function probeScale(
-  ort: OrtModule,
-  active: OrtSession,
-  inputName: string,
-  outputName: string,
-): Promise<number> {
-  const side = 64;
-  const probe = new ort.Tensor("float32", new Float32Array(3 * side * side).fill(0.5), [
-    1,
-    3,
-    side,
-    side,
-  ]);
-
-  const result = await active.run({ [inputName]: probe });
-  probe.dispose();
-  const output = result[outputName];
-  if (!output || output.dims.length !== 4) {
-    disposeOutputs(result);
-    throw new Error("Sortie du modèle inattendue : un tenseur NCHW est requis.");
-  }
-
-  const outHeight = Number(output.dims[2]);
-  disposeOutputs(result);
-  const scale = outHeight / side;
-  if (!Number.isFinite(scale) || scale < 1 || scale > 8) {
-    throw new Error(`Facteur d'échelle du modèle non exploitable (${scale}).`);
-  }
-  return Math.round(scale * 100) / 100;
+export function disposeModel(): void {
+  engine?.dispose();
+  engine = null;
+  info = null;
 }
 
+interface EnginePlan {
+  key: string;
+  label: string;
+  make: () => Engine;
+}
 
-async function probeRuntimeTile(
-  ort: OrtModule,
-  active: OrtSession,
-  inputName: string,
-  outputName: string,
-): Promise<void> {
-  const side = runtimeTileCore();
-  const probe = new ort.Tensor(
-    "float32",
-    new Float32Array(3 * side * side).fill(0.5),
-    [1, 3, side, side],
-  );
-  const result = await active.run({ [inputName]: probe });
-  probe.dispose();
-  const output = result[outputName];
-  const valid = Boolean(output && output.dims.length === 4);
-  disposeOutputs(result);
-  if (!valid) {
-    throw new Error("Le modèle refuse la taille de tuile réelle du navigateur.");
+function enginePlans(): EnginePlan[] {
+  const plans: EnginePlan[] = [];
+  const workers = typeof Worker !== "undefined";
+  const threads = recommendedThreads();
+  if (workers && threads > 1) {
+    plans.push({ key: "worker-mt", label: `worker ${threads} threads`, make: () => new WorkerEngine(threads) });
   }
+  if (workers) plans.push({ key: "worker-1", label: "worker", make: () => new WorkerEngine(1) });
+  plans.push({ key: "main", label: "thread principal", make: () => new MainThreadEngine() });
+
+  if (preferredPlan) {
+    const index = plans.findIndex((plan) => plan.key === preferredPlan);
+    if (index > 0) plans.unshift(...plans.splice(index, 1));
+  }
+  return plans;
 }
 
 export async function loadAiModel(
   source: ModelSource,
   onProgress?: (ratio: number, label: string) => void,
 ): Promise<AiModelInfo> {
-  onProgress?.(0.02, "Initialisation du runtime ONNX");
-  const ort = await getOrt();
-
-  onProgress?.(0.08, "Récupération des poids du modèle");
+  onProgress?.(0.04, "Récupération des poids du modèle");
   let fromCache = false;
   let weights: ArrayBuffer;
   if (source.kind === "file") {
-    weights = await readFileBuffer(source.file);
+    weights = await source.file.arrayBuffer();
   } else {
     const cached = await readCachedWeights(source.url);
     if (cached) {
       weights = cached;
       fromCache = true;
-      onProgress?.(0.7, "Modèle chargé depuis le cache local");
+      onProgress?.(0.6, "Modèle chargé depuis le cache local");
     } else {
       weights = await downloadWeights(source.url, (ratio) =>
-        onProgress?.(0.08 + ratio * 0.62, `Téléchargement du modèle · ${Math.round(ratio * 100)} %`),
+        onProgress?.(0.04 + ratio * 0.56, `Téléchargement du modèle · ${Math.round(ratio * 100)} %`),
       );
     }
   }
-
   if (weights.byteLength === 0) throw new Error("Fichier de modèle vide.");
-  const byteLength = weights.byteLength;
 
-  onProgress?.(0.74, "Initialisation de la session d'inférence");
   disposeModel();
-  let created: { session: OrtSession; provider: string };
-  try {
-    created = await createSession(ort, weights);
-  } catch (reason) {
-    // Un cache corrompu ne doit pas bloquer définitivement le modèle.
-    if (fromCache && source.kind === "url") await removeCachedWeights(source.url);
-    throw reason;
-  }
-  session = created.session;
+  const failures: string[] = [];
+  const tileSide = runtimeTileCore();
 
-  try {
-    const inputName = session.inputNames[0];
-    const outputName = session.outputNames[0];
-    if (!inputName || !outputName) throw new Error("Modèle ONNX sans entrée/sortie exploitable.");
-
-    onProgress?.(0.88, "Mesure du facteur d'échelle");
-    const scale = await probeScale(ort, session, inputName, outputName);
-    onProgress?.(0.94, "Validation d'une vraie tuile d'inférence");
-    await probeRuntimeTile(ort, session, inputName, outputName);
-
-    info = {
-      scale,
-      inputName,
-      outputName,
-      provider: created.provider,
-      bytes: byteLength,
-      source: source.kind === "file" ? source.file.name : (source.label ?? source.url),
-      fromCache,
-    };
-
-    // Mise en cache uniquement après validation complète du modèle.
-    if (source.kind === "url" && !fromCache) void storeCachedWeights(source.url, weights);
-
-    onProgress?.(
-      1,
-      `Modèle prêt · x${scale} · ${created.provider.toUpperCase()}${fromCache ? " · cache local" : ""}`,
-    );
-    return info;
-  } catch (reason) {
-    const failed = session as (OrtSession & { release?: () => Promise<void> }) | null;
-    session = null;
-    info = null;
-    await failed?.release?.().catch(() => undefined);
-    throw reason;
-  }
-}
-
-/** Les réseaux de la famille SwinIR/Swin2SR exigent des côtés multiples de la fenêtre (8). */
-const WINDOW_MULTIPLE = 8;
-
-function roundUpToWindow(value: number): number {
-  return Math.ceil(value / WINDOW_MULTIPLE) * WINDOW_MULTIPLE;
-}
-
-/**
- * Conversion RGBA → tenseur NCHW normalisé, avec complétion à droite/en bas
- * par réplication de bord jusqu'au multiple de fenêtre. La marge ajoutée est
- * en dehors de la zone conservée : elle n'apparaît jamais dans le résultat.
- */
-function tileToTensor(ort: OrtModule, data: Uint8ClampedArray, width: number, height: number) {
-  const paddedWidth = roundUpToWindow(width);
-  const paddedHeight = roundUpToWindow(height);
-  const plane = paddedWidth * paddedHeight;
-  const values = new Float32Array(plane * 3);
-
-  for (let y = 0; y < paddedHeight; y += 1) {
-    const sourceY = Math.min(y, height - 1);
-    for (let x = 0; x < paddedWidth; x += 1) {
-      const sourceX = Math.min(x, width - 1);
-      const offset = (sourceY * width + sourceX) * 4;
-      const index = y * paddedWidth + x;
-      values[index] = data[offset] / 255;
-      values[plane + index] = data[offset + 1] / 255;
-      values[plane * 2 + index] = data[offset + 2] / 255;
+  for (const plan of enginePlans()) {
+    onProgress?.(0.66, `Initialisation IA · ${plan.label}`);
+    let candidate: Engine | null = null;
+    try {
+      candidate = plan.make();
+      const loaded = await candidate.load(weights, tileSide, true);
+      engine = candidate;
+      preferredPlan = plan.key;
+      info = {
+        ...loaded.meta,
+        bytes: weights.byteLength,
+        source: source.kind === "file" ? source.file.name : (source.label ?? source.url),
+        fromCache,
+        execution: candidate.execution,
+        threads: loaded.threads,
+      };
+      break;
+    } catch (reason) {
+      candidate?.dispose();
+      failures.push(`${plan.label} : ${errorText(reason)}`);
     }
   }
 
-  return new ort.Tensor("float32", values, [1, 3, paddedHeight, paddedWidth]);
+  if (!engine || !info) {
+    if (fromCache && source.kind === "url") await removeCachedWeights(source.url);
+    throw new Error("Le modèle n'a pas pu être initialisé. " + failures.join(" | "));
+  }
+
+  // Mise en cache seulement après validation complète.
+  if (source.kind === "url" && !fromCache) await storeCachedWeights(source.url, weights);
+
+  const details = [
+    `x${info.scale}`,
+    info.provider.toUpperCase(),
+    info.execution === "worker" ? `worker${info.threads > 1 ? ` ${info.threads} threads` : ""}` : "thread principal",
+    ...(fromCache ? ["cache local"] : []),
+  ];
+  onProgress?.(1, "Modèle prêt · " + details.join(" · "));
+  return info;
 }
 
-function clamp255(value: number): number {
-  if (value <= 0) return 0;
-  if (value >= 255) return 255;
-  return value;
-}
+/* ------------------------------------------------------------------ */
+/* Inférence par tuiles                                                 */
+/* ------------------------------------------------------------------ */
 
 /**
- * Inférence par tuiles avec marge de recouvrement. La marge est calculée puis
- * jetée : chaque pixel final provient du centre d'une tuile, ce qui supprime
- * les coutures visibles aux jonctions.
+ * Inférence par tuiles avec marge de recouvrement : la marge est calculée
+ * puis jetée, chaque pixel final vient du centre d'une tuile (pas de couture).
  */
 export async function upscaleWithAi(
   source: HTMLCanvasElement,
   onProgress?: (ratio: number, label: string) => void,
 ): Promise<HTMLCanvasElement> {
-  if (!session || !info) throw new Error("Aucun modèle IA chargé.");
-  const ort = await getOrt();
-  const active = session;
+  const active = engine;
   const model = info;
+  if (!active || !model) throw new Error("Aucun modèle IA chargé.");
 
   const width = source.width;
   const height = source.height;
@@ -480,10 +499,12 @@ export async function upscaleWithAi(
   const columns = Math.ceil(width / tileCore);
   const rows = Math.ceil(height / tileCore);
   const total = columns * rows;
+  const unit = model.execution === "worker" ? "worker" : "main";
   let done = 0;
 
   for (let ty = 0; ty < rows; ty += 1) {
     for (let tx = 0; tx < columns; tx += 1) {
+      throwIfCancelled();
       const coreX = tx * tileCore;
       const coreY = ty * tileCore;
       const startX = Math.max(0, coreX - TILE_PAD);
@@ -492,62 +513,36 @@ export async function upscaleWithAi(
       const endY = Math.min(height, coreY + tileCore + TILE_PAD);
       const tileWidth = endX - startX;
       const tileHeight = endY - startY;
+      const keep: KeepRect = {
+        x: coreX - startX,
+        y: coreY - startY,
+        width: Math.min(tileCore, width - coreX),
+        height: Math.min(tileCore, height - coreY),
+      };
 
-      throwIfCancelled();
       const tile = sourceCtx.getImageData(startX, startY, tileWidth, tileHeight);
-      const tensor = tileToTensor(ort, tile.data, tileWidth, tileHeight);
-
-      let result: Awaited<ReturnType<typeof active.run>>;
+      let patch: TileResult;
       try {
-        result = await active.run({ [model.inputName]: tensor });
+        patch = await active.tile(tile.data, tileWidth, tileHeight, keep);
       } catch (reason) {
-        tensor.dispose();
-        const detail = reason instanceof Error ? reason.message : "raison inconnue";
+        const detail = errorText(reason);
         throw new Error(
           done === 0
-            ? `Ce modèle a refusé la première tuile (${tileWidth}×${tileHeight}) : ${detail}. Il attend probablement une entrée de taille fixe et n'est pas compatible avec l'inférence par tuiles.`
+            ? `Ce modèle a refusé la première tuile (${tileWidth}×${tileHeight}) : ${detail}.`
             : `Inférence interrompue à la tuile ${done + 1}/${total} : ${detail}`,
         );
       }
 
-      tensor.dispose();
-      const output = result[model.outputName];
-      if (!output || output.dims.length !== 4) {
-        disposeOutputs(result);
-        throw new Error("Sortie IA invalide sur une tuile.");
+      if (patch.width > 0 && patch.height > 0) {
+        destinationCtx.putImageData(
+          new ImageData(patch.data as Uint8ClampedArray<ArrayBuffer>, patch.width, patch.height),
+          Math.round(coreX * scale),
+          Math.round(coreY * scale),
+        );
       }
-
-      const outWidth = Number(output.dims[3]);
-      const outHeight = Number(output.dims[2]);
-      const values = output.data as Float32Array;
-      const plane = outWidth * outHeight;
-
-      const keepX = Math.round((coreX - startX) * scale);
-      const keepY = Math.round((coreY - startY) * scale);
-      const keepWidth = Math.min(Math.round(Math.min(tileCore, width - coreX) * scale), outWidth - keepX);
-      const keepHeight = Math.min(Math.round(Math.min(tileCore, height - coreY) * scale), outHeight - keepY);
-
-      if (keepWidth > 0 && keepHeight > 0) {
-        const patch = new ImageData(keepWidth, keepHeight);
-        for (let y = 0; y < keepHeight; y += 1) {
-          const sourceRow = (keepY + y) * outWidth;
-          for (let x = 0; x < keepWidth; x += 1) {
-            const sourceIndex = sourceRow + keepX + x;
-            const target = (y * keepWidth + x) * 4;
-            patch.data[target] = clamp255(Math.round(values[sourceIndex] * 255));
-            patch.data[target + 1] = clamp255(Math.round(values[plane + sourceIndex] * 255));
-            patch.data[target + 2] = clamp255(Math.round(values[plane * 2 + sourceIndex] * 255));
-            patch.data[target + 3] = 255;
-          }
-        }
-        destinationCtx.putImageData(patch, Math.round(coreX * scale), Math.round(coreY * scale));
-      }
-      disposeOutputs(result);
 
       done += 1;
-      onProgress?.(done / total, `Inférence IA · tuile ${done}/${total} · ${model.provider.toUpperCase()}`);
-      // Rend la main au navigateur : la barre de progression reste vivante.
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      onProgress?.(done / total, `Inférence IA · tuile ${done}/${total} · ${model.provider.toUpperCase()} · ${unit}`);
     }
   }
 

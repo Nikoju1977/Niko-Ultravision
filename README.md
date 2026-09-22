@@ -26,6 +26,17 @@ EDSR). Les tuiles sont complétées au multiple de 8 par réplication de bord, p
 architectures à fenêtre glissante.
 
 
+## Moteur IA local v5 — automatique, isolé, multi-thread
+
+- **Binaire WASM corrigé** : le bundle `onnxruntime-web/webgpu` 1.30 utilise la glue *asyncify* ; l'app charge désormais `ort-wasm-simd-threaded.asyncify.wasm` (l'ancien binaire *jsep* faisait planter l'initialisation du runtime). Le binaire inutilisé (28 Mo) n'est plus déployé.
+- **Web Worker** : session ONNX et conversions tenseur ↔ pixels hors du thread de l'interface.
+- **Multi-thread** : `public/coi-sw.js` ajoute COOP/COEP sur GitHub Pages → `crossOriginIsolated`, jusqu'à 4 threads WASM. Désactivation d'urgence : `?coi=0`.
+- **Replis testés en cascade** : worker multi-thread → worker mono-thread → thread principal ; WebGPU → WASM. La dernière configuration valide est réessayée en premier.
+- **Cache local des poids** (Cache Storage), rempli uniquement après validation, purgé si corrompu.
+- **IA automatique** : le modèle adapté (x2 mobile / x4 Pro Max) est chargé seul quand l'agrandissement le justifie. Le bouton *Canvas* force la fidélité stricte (aucune reconstruction neuronale).
+- **AV-1X automatique** : déposer un `.avx` dans la zone source le décode directement.
+- **Annulation** de tout traitement long, sans cascade de replis après annulation.
+
 ## UltraVision Deep Focus 10+
 
 Deep Focus est activé par défaut sur les images avec **10 plans de focalisation** et peut

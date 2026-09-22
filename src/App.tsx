@@ -33,7 +33,7 @@ import {
   type AiModelInfo,
 } from "./lib/aiUpscaler";
 import { PROFILES, type ProfileId } from "./lib/profiles";
-import { beginJob, isCancelled, isCancelledError, requestCancel } from "./lib/cancellation";
+import { beginJob, isCancelled, isCancelledError, requestCancel, throwIfCancelled } from "./lib/cancellation";
 import { enhanceVideo } from "./lib/videoEnhancer";
 import {
   CODEC_INTENTS,
@@ -214,6 +214,8 @@ export default function App() {
   const [status, setStatus] = useState("Prêt");
   const [error, setError] = useState<string | null>(null);
   const [engine, setEngine] = useState<EngineId>("canvas");
+  /** IA automatique : charge le modèle adapté quand l'agrandissement le justifie. */
+  const [autoAi, setAutoAi] = useState(true);
   const [modelUrl, setModelUrl] = useState(DEFAULT_MODEL_URL);
   const [model, setModel] = useState<AiModelInfo | null>(loadedModel());
   const [modelBusy, setModelBusy] = useState(false);
@@ -412,6 +414,11 @@ export default function App() {
 
   async function handleFile(next: File | null) {
     if (!next) return;
+    if (/\.avx$/i.test(next.name) || next.type === "application/x-aura-vision") {
+      // Décodage AV-1X automatique, IA locale incluse si l'automatisme est actif.
+      await runAuraDecode(next, autoAi);
+      return;
+    }
     const requestId = ++inspectionId.current;
     setError(null);
     setStatus("Analyse de la source");
@@ -459,7 +466,9 @@ export default function App() {
       setModel(loaded);
       if (activateImageEngine) setEngine("ai");
       setModelStatus(
-        `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo${loaded.fromCache ? " · cache local" : ""}`,
+        `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ` +
+          `${loaded.execution === "worker" ? `worker${loaded.threads > 1 ? ` ${loaded.threads} threads` : ""}` : "thread principal"} · ` +
+          `${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo${loaded.fromCache ? " · cache local" : ""}`,
       );
       return loaded;
     } catch (reason) {
@@ -662,6 +671,39 @@ export default function App() {
     });
 
     try {
+      let activeModel = model;
+      const autoNotes: string[] = [];
+      if (autoAi && !activeModel && aiEngineAvailable() && mode === "image" && predicted) {
+        const sourcePixels = sourceSize.width * sourceSize.height;
+        const requestedScale = Math.max(
+          predicted.width / Math.max(1, sourceSize.width),
+          predicted.height / Math.max(1, sourceSize.height),
+        );
+        if (requestedScale >= 1.35 && sourcePixels <= AI_MAX_SOURCE_PIXELS) {
+          const preset = chooseAiPresetForTarget(
+            sourceSize.width,
+            sourceSize.height,
+            predicted.width,
+            predicted.height,
+          );
+          setStatus(`IA automatique · ${preset.label}`);
+          activeModel = await acquireModel({ kind: "url", url: preset.url, label: preset.label }, false);
+          if (!activeModel && preset.id === "pro-real-x4") {
+            const fallback = AI_MODEL_PRESETS["mobile-x2"];
+            setStatus("IA automatique · repli Mobile x2");
+            activeModel = await acquireModel({ kind: "url", url: fallback.url, label: fallback.label }, false);
+          }
+          if (activeModel) {
+            autoNotes.push(`IA automatique : ${activeModel.source} chargé (x${activeModel.scale}, ${activeModel.provider.toUpperCase()}).`);
+          } else {
+            setError(null);
+            autoNotes.push("IA automatique indisponible sur cet appareil : rééchantillonnage haute qualité utilisé.");
+          }
+          throwIfCancelled();
+        }
+      }
+      const aiAllowed = Boolean(activeModel) && (autoAi || engine === "ai");
+
       setStatus("Agents AutoPilot · analyse");
       const plan = await orchestrateMediaAgents({
         file,
@@ -672,7 +714,7 @@ export default function App() {
         engine,
         format,
         intent,
-        aiModelLoaded: Boolean(model),
+        aiModelLoaded: aiAllowed,
         webGpu: webGpuAvailable(),
         mistralEnabled,
         mistralApiKey,
@@ -685,7 +727,10 @@ export default function App() {
       if (plan.engine !== engine) setEngine(plan.engine);
       if (plan.intent !== intent) setIntent(plan.intent);
 
-      const agentNotes = plan.decisions.map((entry) => `${entry.label} : ${entry.message}`);
+      const agentNotes = [
+        ...autoNotes,
+        ...plan.decisions.map((entry) => `${entry.label} : ${entry.message}`),
+      ];
 
       if (mode === "image") {
         const resolvedScenePreset: ScenePresetId =
@@ -774,7 +819,7 @@ export default function App() {
       } else {
         const result = await enhanceVideo(file, plan.target, plan.profile, {
           intent: plan.intent,
-          neuralAi: videoNeuralAi && Boolean(model),
+          neuralAi: videoNeuralAi && Boolean(activeModel),
           onProgress: (value, label) => {
             setProgress(value);
             setStatus(label);
@@ -1051,7 +1096,7 @@ export default function App() {
           <label className="dropzone">
             <input
               type="file"
-              accept="image/*,video/*"
+              accept="image/*,video/*,.avx,application/x-aura-vision"
               onChange={(event) => {
                 const picked = event.currentTarget.files?.[0] ?? null;
                 event.currentTarget.value = "";
@@ -1140,8 +1185,11 @@ export default function App() {
               <div className="engine-grid">
                 <button
                   type="button"
-                  className={engine === "canvas" ? "choice active" : "choice"}
-                  onClick={() => setEngine("canvas")}
+                  className={engine === "canvas" && !autoAi ? "choice active" : "choice"}
+                  onClick={() => {
+                    setEngine("canvas");
+                    setAutoAi(false);
+                  }}
                   disabled={busy}
                 >
                   <strong>Canvas</strong>
@@ -1149,8 +1197,11 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  className={engine === "ai" ? "choice active" : "choice"}
-                  onClick={() => void selectLocalAi()}
+                  className={engine === "ai" || autoAi ? "choice active" : "choice"}
+                  onClick={() => {
+                    setAutoAi(true);
+                    void selectLocalAi();
+                  }}
                   disabled={busy || modelBusy}
                   title={
                     modelBusy
@@ -1175,6 +1226,12 @@ export default function App() {
                         : "Touchez ici : UltraVision charge et active automatiquement le modèle local."}
                   </span>
                 </button>
+              </div>
+
+              <div className="model-note">
+                {autoAi
+                  ? "Mode automatique : le modèle IA adapté (x2 mobile ou x4 Pro Max) est chargé tout seul quand l'agrandissement le justifie, puis gardé en cache local."
+                  : "Mode fidélité stricte : aucune reconstruction neuronale, seulement du rééchantillonnage."}
               </div>
 
               {!aiEngineAvailable() && (
