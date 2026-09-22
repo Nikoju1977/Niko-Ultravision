@@ -184,8 +184,9 @@ function createPagedStreamTarget(StreamTargetCtor: new (
  * Traitement spatial léger et déterministe pour la vidéo.
  *
  * Les paramètres ne changent pas d'une image à l'autre afin d'éviter le
- * pompage temporel. Le travail de micro-contraste est plafonné à 1440 px sur
- * le grand côté, puis rééchantillonné vers la cible.
+ * pompage temporel. La reconstruction travaille jusqu'à 1920 px sur Android
+ * et 2560 px ailleurs avant le rééchantillonnage final, avec une fusion
+ * temporelle faible pilotée par le mouvement pour limiter scintillement et bruit.
  */
 function createFrameProcessor(profile: ProfileId, output: Size) {
   const preset = PROFILES[profile];
