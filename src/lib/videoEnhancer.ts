@@ -184,8 +184,9 @@ function createPagedStreamTarget(StreamTargetCtor: new (
  * Traitement spatial léger et déterministe pour la vidéo.
  *
  * Les paramètres ne changent pas d'une image à l'autre afin d'éviter le
- * pompage temporel. Le travail de micro-contraste est plafonné à 1440 px sur
- * le grand côté, puis rééchantillonné vers la cible.
+ * pompage temporel. La reconstruction travaille jusqu'à 1920 px sur Android
+ * et 2560 px ailleurs avant le rééchantillonnage final, avec une fusion
+ * temporelle faible pilotée par le mouvement pour limiter scintillement et bruit.
  */
 function createFrameProcessor(profile: ProfileId, output: Size) {
   const preset = PROFILES[profile];
@@ -201,6 +202,13 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
   let measuredFrames = 0;
   let sharpnessBeforeSum = 0;
   let sharpnessAfterSum = 0;
+  let previousEnhancedCanvas: HTMLCanvasElement | null = null;
+  let previousProbe: Uint8ClampedArray | null = null;
+  let temporalFrames = 0;
+  let temporalBlendSum = 0;
+  let motionSum = 0;
+  let probeCanvas: HTMLCanvasElement | null = null;
+  let probeCtx: CanvasRenderingContext2D | null = null;
 
   const process = (sample: {
     displayWidth: number;
@@ -214,7 +222,18 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
     ) => void;
   }) => {
     const sourceLong = Math.max(sample.displayWidth, sample.displayHeight);
-    const workLong = Math.min(sourceLong, 1440);
+    const outputLong = Math.max(output.width, output.height);
+    const android = isAndroidRuntime();
+    const workCeiling = android ? 1920 : 2560;
+    const reconstructionScale =
+      sourceLong < outputLong
+        ? (android ? 1.5 : 2)
+        : 1;
+    const workLong = Math.min(
+      outputLong,
+      workCeiling,
+      Math.max(sourceLong, Math.round(sourceLong * reconstructionScale)),
+    );
     const scale = workLong / Math.max(1, sourceLong);
     const workWidth = Math.max(2, Math.round(sample.displayWidth * scale));
     const workHeight = Math.max(2, Math.round(sample.displayHeight * scale));
@@ -233,6 +252,13 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
       if (!workCtx || !edgeCtx) {
         throw new Error("Canvas 2D indisponible pour le traitement vidéo.");
       }
+
+      previousEnhancedCanvas = null;
+      previousProbe = null;
+      probeCanvas = document.createElement("canvas");
+      probeCanvas.width = 64;
+      probeCanvas.height = Math.max(24, Math.round(64 * workHeight / workWidth));
+      probeCtx = probeCanvas.getContext("2d", { willReadFrequently: true });
     }
 
     if (!outCanvas || outCanvas.width !== output.width || outCanvas.height !== output.height) {
@@ -253,18 +279,68 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
     sample.draw(workCtx!, 0, 0, workWidth, workHeight);
     workCtx!.restore();
 
+    // Temporal Pro v3 : mesure de mouvement très basse résolution.
+    // Sur plans stables, on fusionne légèrement la frame précédente pour
+    // réduire bruit et scintillement. Sur mouvement, la fusion chute presque à zéro.
+    let temporalBlend = 0;
+    let motion = 1;
+    if (probeCanvas && probeCtx) {
+      probeCtx.clearRect(0, 0, probeCanvas.width, probeCanvas.height);
+      probeCtx.drawImage(workCanvas!, 0, 0, probeCanvas.width, probeCanvas.height);
+      const now = probeCtx.getImageData(0, 0, probeCanvas.width, probeCanvas.height).data;
+      if (previousProbe && previousProbe.length === now.length) {
+        let diff = 0;
+        let samples = 0;
+        for (let i = 0; i < now.length; i += 16) {
+          diff +=
+            Math.abs(now[i] - previousProbe[i]) +
+            Math.abs(now[i + 1] - previousProbe[i + 1]) +
+            Math.abs(now[i + 2] - previousProbe[i + 2]);
+          samples += 3;
+        }
+        motion = Math.min(1, diff / Math.max(1, samples * 28));
+        const baseBlend =
+          profile === "detail"
+            ? 0.14
+            : profile === "cinema"
+              ? 0.12
+              : profile === "archive"
+                ? 0.16
+                : 0.09;
+        temporalBlend = baseBlend * Math.max(0.06, 1 - motion * 1.18);
+      }
+      previousProbe = new Uint8ClampedArray(now);
+    }
+
+    if (
+      previousEnhancedCanvas &&
+      temporalBlend > 0.008 &&
+      previousEnhancedCanvas.width === workWidth &&
+      previousEnhancedCanvas.height === workHeight
+    ) {
+      workCtx!.save();
+      workCtx!.globalCompositeOperation = "source-over";
+      workCtx!.globalAlpha = temporalBlend;
+      workCtx!.filter = "none";
+      workCtx!.drawImage(previousEnhancedCanvas, 0, 0);
+      workCtx!.restore();
+      temporalFrames += 1;
+      temporalBlendSum += temporalBlend;
+      motionSum += motion;
+    }
+
     const shouldMeasure = measuredFrames < 2;
     const beforeMeasure = shouldMeasure ? measureCanvasSharpness(workCanvas!) : null;
 
     if (preset.sharpen > 0.01 && workWidth * workHeight <= 2_200_000) {
       const fineAlpha =
         profile === "detail"
-          ? 0.16
+          ? 0.20
           : profile === "cinema"
-            ? 0.11
+            ? 0.135
             : profile === "fidelity"
-              ? 0.09
-              : 0.055;
+              ? 0.105
+              : 0.07;
       const coarseAlpha = fineAlpha * 0.42;
 
       // Passe fine : contours et micro-textures.
@@ -306,6 +382,21 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
       workCtx!.restore();
     }
 
+    if (
+      !previousEnhancedCanvas ||
+      previousEnhancedCanvas.width !== workWidth ||
+      previousEnhancedCanvas.height !== workHeight
+    ) {
+      previousEnhancedCanvas = document.createElement("canvas");
+      previousEnhancedCanvas.width = workWidth;
+      previousEnhancedCanvas.height = workHeight;
+    }
+    const previousCtx = previousEnhancedCanvas.getContext("2d");
+    if (previousCtx) {
+      previousCtx.clearRect(0, 0, workWidth, workHeight);
+      previousCtx.drawImage(workCanvas!, 0, 0);
+    }
+
     outCtx!.save();
     outCtx!.globalAlpha = 1;
     outCtx!.globalCompositeOperation = "source-over";
@@ -339,6 +430,9 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
       samples: measuredFrames,
       before: measuredFrames ? sharpnessBeforeSum / measuredFrames : 0,
       after: measuredFrames ? sharpnessAfterSum / measuredFrames : 0,
+      temporalFrames,
+      temporalBlend: temporalFrames ? temporalBlendSum / temporalFrames : 0,
+      motion: temporalFrames ? motionSum / temporalFrames : 0,
     }),
   };
 }
@@ -483,8 +577,16 @@ async function executeWebCodecsAttempt(
   if (processor) {
     const stats = processor.stats();
     notes.push(
-      "Netteté Pro v2 active : double échelle de micro-contraste, finition perceptuelle après upscale et traitement temporel stable.",
+      "Temporal Pro v3 actif : reconstruction intermédiaire haute résolution, double échelle de micro-contraste et fusion temporelle adaptative au mouvement.",
     );
+    if (stats.temporalFrames > 0) {
+      notes.push(
+        "Stabilisation temporelle : " +
+          stats.temporalFrames + " frame(s) fusionnées · intensité moyenne " +
+          (stats.temporalBlend * 100).toFixed(1) + " % · mouvement moyen " +
+          (stats.motion * 100).toFixed(1) + " %.",
+      );
+    }
     if (stats.samples > 0 && stats.before > 0) {
       const gain = ((stats.after - stats.before) / stats.before) * 100;
       notes.push(
