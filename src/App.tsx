@@ -712,7 +712,9 @@ export default function App() {
             setStatus(label);
           },
         });
-        const url = URL.createObjectURL(result.blob);
+        const activeModelAfterDecode = loadedModel();
+      if (activeModelAfterDecode) setModel(activeModelAfterDecode);
+      const url = URL.createObjectURL(result.blob);
         setOutput({
           url,
           blob: result.blob,
