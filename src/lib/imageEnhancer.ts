@@ -40,6 +40,7 @@ export interface ImageEnhanceResult {
   engineUsed: EngineId;
   aiScale: number | null;
   aiProvider: string | null;
+  aiPasses: number;
   deepFocusApplied: boolean;
   deepFocusLayers: number;
   deepFocusConfidence: number;
@@ -319,6 +320,7 @@ export async function enhanceImage(
     let engineUsed: EngineId = "canvas";
     let aiScale: number | null = null;
     let aiProvider: string | null = null;
+    let aiPasses = 0;
 
     if (engine === "ai") {
       const model = loadedModel();
@@ -329,12 +331,54 @@ export async function enhanceImage(
         );
       }
 
-      onProgress?.(0.58, "Inférence IA · préparation");
-      const inferred = await upscaleWithAi(current, (ratio, label) => {
-        onProgress?.(0.58 + ratio * 0.22, label);
+      // Pro Max : un léger pré-traitement de la ROI avant la super-résolution
+      // aide le réseau à consacrer davantage de capacité aux structures du sujet.
+      if (smallSubjectRoi.enabled && current.width * current.height <= 4_000_000) {
+        const preRoi = detectSmallSubjectRoi(current);
+        if (preRoi) {
+          enhanceRoiLocally(current, preRoi, Math.min(0.42, (smallSubjectRoi.strength ?? 0.82) * 0.48));
+        }
+      }
+
+      const requestedScale = Math.max(
+        output.width / source.width,
+        output.height / source.height,
+      );
+
+      onProgress?.(0.58, "Inférence IA · passe 1");
+      let inferred = await upscaleWithAi(current, (ratio, label) => {
+        onProgress?.(0.58 + ratio * 0.16, label);
       });
       release(current);
       current = inferred;
+      aiPasses = 1;
+
+      // Si le modèle mobile x2 a dû être retenu mais que la cible demande
+      // beaucoup plus de définition, une seconde vraie passe IA vaut mieux
+      // qu'un grand agrandissement Canvas. On la limite aux sorties sûres.
+      const achievedScale = Math.max(
+        current.width / source.width,
+        current.height / source.height,
+      );
+      const projectedPixels =
+        Math.round(current.width * model.scale) *
+        Math.round(current.height * model.scale);
+      const secondPassSafe =
+        model.scale <= 2.1 &&
+        requestedScale > achievedScale * 1.3 &&
+        current.width * current.height <= 2_200_000 &&
+        projectedPixels <= 12_000_000;
+
+      if (secondPassSafe) {
+        onProgress?.(0.75, "Inférence IA · passe 2");
+        inferred = await upscaleWithAi(current, (ratio, label) => {
+          onProgress?.(0.75 + ratio * 0.10, label);
+        });
+        release(current);
+        current = inferred;
+        aiPasses = 2;
+      }
+
       engineUsed = "ai";
       aiScale = model.scale;
       aiProvider = model.provider;
@@ -413,6 +457,7 @@ export async function enhanceImage(
       engineUsed,
       aiScale,
       aiProvider,
+      aiPasses,
       deepFocusApplied,
       deepFocusLayers,
       deepFocusConfidence,
