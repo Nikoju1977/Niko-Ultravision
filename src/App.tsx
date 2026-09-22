@@ -213,6 +213,9 @@ export default function App() {
   const [intent, setIntent] = useState<CodecIntent>("master");
   const [codecs, setCodecs] = useState<string[] | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecision[]>([]);
+  const [mistralEnabled, setMistralEnabled] = useState(false);
+  const [mistralApiKey, setMistralApiKey] = useState("");
+  const [mistralModel, setMistralModel] = useState("mistral-small-latest");
   const [deepFocus, setDeepFocus] = useState<DeepFocusSettings>({ enabled: true, layers: 10, strength: 0.58 });
   const [precisionRestore, setPrecisionRestore] = useState<PrecisionRestoreSettings>({
     enabled: true,
@@ -243,6 +246,8 @@ export default function App() {
   const sourcePixels = sourceSize ? sourceSize.width * sourceSize.height : 0;
   const aiTooLarge = sourcePixels > AI_MAX_SOURCE_PIXELS;
   const aiSlow = sourcePixels > AI_WARN_SOURCE_PIXELS && !aiTooLarge;
+  const mistralCloudActive =
+    mode === "video" && mistralEnabled && Boolean(mistralApiKey.trim());
 
   useEffect(() => {
     if (mode === "video" || aiTooLarge) setEngine("canvas");
@@ -454,6 +459,9 @@ export default function App() {
         intent,
         aiModelLoaded: Boolean(model),
         webGpu: webGpuAvailable(),
+        mistralEnabled,
+        mistralApiKey,
+        mistralModel,
       });
 
       setAgentDecisions(plan.decisions);
@@ -582,9 +590,13 @@ export default function App() {
         <div>
           <div className="eyebrow">NIKO STUDIO · LOCAL MASTERING</div>
           <h1>Niko UltraVision Pro</h1>
-          <p className="subtitle">Amélioration locale d’images et de vidéos. Aucun fichier n’est envoyé vers un service externe.</p>
+          <p className="subtitle">
+            {mistralCloudActive
+              ? "Traitement vidéo local + analyse sémantique optionnelle de 4 keyframes par Mistral Vision."
+              : "Amélioration locale d’images et de vidéos. Aucun fichier n’est envoyé vers un service externe."}
+          </p>
         </div>
-        <div className="privacy-badge"><span /> 100 % local</div>
+        <div className="privacy-badge"><span /> {mistralCloudActive ? "Local + Mistral Vision" : "100 % local"}</div>
       </header>
 
       <section className="hero-grid">
@@ -880,6 +892,62 @@ export default function App() {
                   </p>
                 )}
               </div>
+
+              <div className="model-box">
+                <div className="model-head">
+                  <strong>Mistral Vision · optionnel</strong>
+                  <span className={mistralEnabled ? "badge ok" : "badge"}>
+                    {mistralEnabled ? "ACTIF" : "LOCAL"}
+                  </span>
+                </div>
+
+                <p className="model-note">
+                  UltraVision reste autonome en local. Si ce mode est activé, 4 keyframes JPEG réduites sont envoyées
+                  à Mistral pour comprendre la scène et guider le profil vidéo. La vidéo complète n’est jamais envoyée.
+                  La clé reste uniquement dans la mémoire de cette page et n’est pas enregistrée dans GitHub.
+                </p>
+
+                <button
+                  type="button"
+                  className={mistralEnabled ? "choice active" : "choice"}
+                  onClick={() => setMistralEnabled((value) => !value)}
+                  disabled={busy}
+                >
+                  <strong>{mistralEnabled ? "Désactiver Mistral Vision" : "Activer Mistral Vision"}</strong>
+                  <span>Repli local automatique si quota gratuit, réseau ou API indisponible.</span>
+                </button>
+
+                {mistralEnabled && (
+                  <>
+                    <input
+                      type="password"
+                      value={mistralApiKey}
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder="Clé API Mistral · non sauvegardée"
+                      onChange={(event) => setMistralApiKey(event.target.value)}
+                      disabled={busy}
+                      aria-label="Clé API Mistral"
+                    />
+
+                    <input
+                      type="text"
+                      value={mistralModel}
+                      spellCheck={false}
+                      onChange={(event) => setMistralModel(event.target.value)}
+                      disabled={busy}
+                      aria-label="Modèle Mistral Vision"
+                    />
+
+                    {!mistralApiKey.trim() && (
+                      <div className="warning-card">
+                        Ajoute ta clé API Mistral gratuite pour activer l’agent cloud. Sans clé, tous les autres agents
+                        continuent en local.
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
           )}
 
@@ -887,7 +955,7 @@ export default function App() {
             <div className="agent-head">
               <div>
                 <strong>AutoPilot agents Image + Vidéo</strong>
-                <span>7 agents locaux supervisent qualité, upscale, mémoire, format et codecs.</span>
+                <span>7 agents image · 8 agents vidéo locaux · +1 agent Mistral Vision optionnel. Audit de présence à chaque traitement.</span>
               </div>
               <span className="badge ok">ACTIF</span>
             </div>
