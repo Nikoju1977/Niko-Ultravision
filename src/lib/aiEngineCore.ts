@@ -14,6 +14,7 @@ export type OrtModule = typeof import("onnxruntime-web/webgpu");
 export type OrtSession = Awaited<ReturnType<OrtModule["InferenceSession"]["create"]>>;
 
 export type IoType = "float32" | "float16";
+export type TensorLayout = "NCHW" | "NHWC";
 
 export interface ModelMeta {
   scale: number;
@@ -24,6 +25,8 @@ export interface ModelMeta {
   fixedWidth: number | null;
   fixedHeight: number | null;
   inputType: IoType;
+  inputLayout: TensorLayout;
+  outputLayout: TensorLayout;
 }
 
 export interface KeepRect {
@@ -175,17 +178,61 @@ interface InputSpec {
   fixedWidth: number | null;
   fixedHeight: number | null;
   inputType: IoType;
+  inputLayout: TensorLayout;
+  outputLayout: TensorLayout;
+}
+
+type TensorMetadata = {
+  isTensor?: boolean;
+  type?: string;
+  shape?: readonly (number | string)[];
+};
+
+function numericDim(value: number | string | undefined): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  if (typeof value === "string" && /^\\d+$/.test(value)) {
+    const parsed = Number(value);
+    return parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+function detectLayout(shape: readonly (number | string)[] | undefined): TensorLayout {
+  const dims = shape ?? [];
+  const second = numericDim(dims[1]);
+  const fourth = numericDim(dims[3]);
+  if (second === 3) return "NCHW";
+  if (fourth === 3) return "NHWC";
+  // Tous les modèles historiques d'UltraVision sont NCHW ; on conserve
+  // ce défaut pour les exports à dimensions complètement dynamiques.
+  return "NCHW";
 }
 
 function inspectInput(session: OrtSession): InputSpec {
-  const metadata = (session as unknown as {
-    inputMetadata?: readonly { isTensor: boolean; type?: string; shape?: readonly (number | string)[] }[];
-  }).inputMetadata?.[0];
-  const shape = metadata?.isTensor ? metadata.shape ?? [] : [];
-  const height = typeof shape[2] === "number" && shape[2] > 0 ? shape[2] : null;
-  const width = typeof shape[3] === "number" && shape[3] > 0 ? shape[3] : null;
-  const inputType: IoType = metadata?.isTensor && metadata.type === "float16" ? "float16" : "float32";
-  return { fixedWidth: width, fixedHeight: height, inputType };
+  const typed = session as unknown as {
+    inputMetadata?: readonly TensorMetadata[];
+    outputMetadata?: readonly TensorMetadata[];
+  };
+  const input = typed.inputMetadata?.[0];
+  const output = typed.outputMetadata?.[0];
+  const inputShape = input?.isTensor === false ? [] : input?.shape ?? [];
+  const outputShape = output?.isTensor === false ? [] : output?.shape ?? [];
+  const inputLayout = detectLayout(inputShape);
+  const outputLayout = outputShape.length ? detectLayout(outputShape) : inputLayout;
+
+  const heightIndex = inputLayout === "NCHW" ? 2 : 1;
+  const widthIndex = inputLayout === "NCHW" ? 3 : 2;
+  const fixedHeight = numericDim(inputShape[heightIndex]);
+  const fixedWidth = numericDim(inputShape[widthIndex]);
+  const inputType: IoType = input?.type === "float16" ? "float16" : "float32";
+
+  return {
+    fixedWidth,
+    fixedHeight,
+    inputType,
+    inputLayout,
+    outputLayout,
+  };
 }
 
 async function runProbe(
@@ -193,22 +240,55 @@ async function runProbe(
   session: OrtSession,
   inputName: string,
   outputName: string,
-  side: number,
+  height: number,
   type: IoType = "float32",
-  width = side,
+  width = height,
+  inputLayout: TensorLayout = "NCHW",
+  outputLayout: TensorLayout = inputLayout,
 ): Promise<number> {
-  const probe = makeInput(ort, new Float32Array(3 * side * width).fill(0.5), [1, 3, side, width], type);
+  const dims =
+    inputLayout === "NHWC"
+      ? [1, height, width, 3]
+      : [1, 3, height, width];
+  const probe = makeInput(
+    ort,
+    new Float32Array(3 * height * width).fill(0.5),
+    dims,
+    type,
+  );
   let result: OrtResult;
   try {
     result = (await session.run({ [inputName]: probe })) as unknown as OrtResult;
   } finally {
     probe.dispose();
   }
-  const output = result[outputName];
-  const height = output && output.dims.length === 4 ? Number(output.dims[2]) : NaN;
-  disposeAll(result);
-  if (!Number.isFinite(height)) throw new Error("Sortie du modèle inattendue : un tenseur NCHW est requis.");
-  return height / side;
+
+  try {
+    const output = result[outputName];
+    if (!output || output.dims.length !== 4) {
+      throw new Error("Sortie du modèle inattendue : un tenseur image 4D est requis.");
+    }
+    const outHeight = Number(
+      output.dims[outputLayout === "NCHW" ? 2 : 1],
+    );
+    const outWidth = Number(
+      output.dims[outputLayout === "NCHW" ? 3 : 2],
+    );
+    const scaleY = outHeight / height;
+    const scaleX = outWidth / width;
+    if (
+      !Number.isFinite(scaleX) ||
+      !Number.isFinite(scaleY) ||
+      Math.abs(scaleX - scaleY) > 0.01
+    ) {
+      throw new Error(
+        `Facteur d'échelle incohérent : x${scaleX.toFixed(3)} / y${scaleY.toFixed(3)}.`,
+      );
+    }
+    return (scaleX + scaleY) / 2;
+  } finally {
+    disposeAll(result);
+  }
 }
 
 /** Mesure le facteur réel et valide une vraie tuile de travail. */
@@ -228,7 +308,15 @@ export async function probeModel(
     // Modèle à entrée figée (exports Qualcomm, TFLite convertis…) :
     // une seule sonde, à la taille imposée.
     const fixedScale = await runProbe(
-      ort, session, inputName, outputName, spec.fixedHeight, spec.inputType, spec.fixedWidth,
+      ort,
+      session,
+      inputName,
+      outputName,
+      spec.fixedHeight,
+      spec.inputType,
+      spec.fixedWidth,
+      spec.inputLayout,
+      spec.outputLayout,
     );
     if (!Number.isFinite(fixedScale) || fixedScale < 1 || fixedScale > 8) {
       throw new Error(`Facteur d'échelle du modèle non exploitable (${fixedScale}).`);
@@ -236,11 +324,31 @@ export async function probeModel(
     return { scale: Math.round(fixedScale * 100) / 100, inputName, outputName, provider, ...spec };
   }
 
-  const rawScale = await runProbe(ort, session, inputName, outputName, 64, spec.inputType);
+  const rawScale = await runProbe(
+    ort,
+    session,
+    inputName,
+    outputName,
+    64,
+    spec.inputType,
+    64,
+    spec.inputLayout,
+    spec.outputLayout,
+  );
   if (!Number.isFinite(rawScale) || rawScale < 1 || rawScale > 8) {
     throw new Error(`Facteur d'échelle du modèle non exploitable (${rawScale}).`);
   }
-  const workScale = await runProbe(ort, session, inputName, outputName, tileSide, spec.inputType);
+  const workScale = await runProbe(
+    ort,
+    session,
+    inputName,
+    outputName,
+    tileSide,
+    spec.inputType,
+    tileSide,
+    spec.inputLayout,
+    spec.outputLayout,
+  );
   if (Math.abs(workScale - rawScale) > 0.01) {
     throw new Error("Le modèle refuse la taille de tuile réelle du navigateur.");
   }
@@ -279,13 +387,24 @@ export async function runTile(
     for (let x = 0; x < paddedWidth; x += 1) {
       const offset = (sourceRow + Math.min(x, width - 1)) * 4;
       const index = row + x;
-      values[index] = rgba[offset] / 255;
-      values[plane + index] = rgba[offset + 1] / 255;
-      values[plane * 2 + index] = rgba[offset + 2] / 255;
+      if (meta.inputLayout === "NHWC") {
+        const target = index * 3;
+        values[target] = rgba[offset] / 255;
+        values[target + 1] = rgba[offset + 1] / 255;
+        values[target + 2] = rgba[offset + 2] / 255;
+      } else {
+        values[index] = rgba[offset] / 255;
+        values[plane + index] = rgba[offset + 1] / 255;
+        values[plane * 2 + index] = rgba[offset + 2] / 255;
+      }
     }
   }
 
-  const tensor = makeInput(ort, values, [1, 3, paddedHeight, paddedWidth], meta.inputType);
+  const dims =
+    meta.inputLayout === "NHWC"
+      ? [1, paddedHeight, paddedWidth, 3]
+      : [1, 3, paddedHeight, paddedWidth];
+  const tensor = makeInput(ort, values, dims, meta.inputType);
   let result: OrtResult;
   try {
     result = (await session.run({ [meta.inputName]: tensor })) as unknown as OrtResult;
@@ -296,8 +415,12 @@ export async function runTile(
   try {
     const output = result[meta.outputName];
     if (!output || output.dims.length !== 4) throw new Error("Sortie IA invalide sur une tuile.");
-    const outWidth = Number(output.dims[3]);
-    const outHeight = Number(output.dims[2]);
+    const outWidth = Number(
+      output.dims[meta.outputLayout === "NCHW" ? 3 : 2],
+    );
+    const outHeight = Number(
+      output.dims[meta.outputLayout === "NCHW" ? 2 : 1],
+    );
     const data = readOutput(output as { type?: string; data: unknown });
     const outPlane = outWidth * outHeight;
     const scale = meta.scale;
@@ -315,9 +438,16 @@ export async function runTile(
         const sourceIndex = sourceRow + x;
         const target = targetRow + x * 4;
         // Uint8ClampedArray borne et arrondit automatiquement.
-        patch[target] = data[sourceIndex] * 255;
-        patch[target + 1] = data[outPlane + sourceIndex] * 255;
-        patch[target + 2] = data[outPlane * 2 + sourceIndex] * 255;
+        if (meta.outputLayout === "NHWC") {
+          const source = sourceIndex * 3;
+          patch[target] = data[source] * 255;
+          patch[target + 1] = data[source + 1] * 255;
+          patch[target + 2] = data[source + 2] * 255;
+        } else {
+          patch[target] = data[sourceIndex] * 255;
+          patch[target + 1] = data[outPlane + sourceIndex] * 255;
+          patch[target + 2] = data[outPlane * 2 + sourceIndex] * 255;
+        }
         patch[target + 3] = 255;
       }
     }
