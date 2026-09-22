@@ -458,6 +458,36 @@ export default function App() {
     }
   }
 
+  async function selectLocalAi() {
+    if (busy || modelBusy) return;
+
+    if (aiTooLarge) {
+      setEngine("canvas");
+      setError(
+        `Cette source dépasse ${(AI_MAX_SOURCE_PIXELS / 1_000_000).toFixed(0)} MP. L'IA locale est bloquée pour éviter un plantage mémoire.`,
+      );
+      return;
+    }
+
+    if (model) {
+      setError(null);
+      setEngine("ai");
+      setModelStatus(
+        `${model.source} · x${model.scale} · ${model.provider.toUpperCase()} · prêt`,
+      );
+      return;
+    }
+
+    const url = modelUrl.trim() || DEFAULT_MODEL_URL;
+    if (!modelUrl.trim()) setModelUrl(DEFAULT_MODEL_URL);
+    setStatus("IA locale · chargement automatique");
+    await acquireModel({
+      kind: "url",
+      url,
+      label: DEFAULT_MODEL_LABEL,
+    });
+  }
+
   function applySceneMode(next: SceneModeId) {
     setSceneMode(next);
     if (next === "auto") {
@@ -765,21 +795,29 @@ export default function App() {
                 <button
                   type="button"
                   className={engine === "ai" ? "choice active" : "choice"}
-                  onClick={() => setEngine("ai")}
-                  disabled={busy || !model || aiTooLarge}
+                  onClick={() => void selectLocalAi()}
+                  disabled={busy || modelBusy || aiTooLarge}
                   title={
-                    !model
-                      ? "Charge d'abord un modèle ONNX."
-                      : aiTooLarge
-                        ? "Source trop grande pour l'inférence locale."
-                        : undefined
+                    aiTooLarge
+                      ? "Source trop grande pour l'inférence locale."
+                      : modelBusy
+                        ? "Chargement du moteur IA en cours."
+                        : model
+                          ? "IA locale prête."
+                          : "Touchez pour charger automatiquement le modèle IA local."
                   }
                 >
-                  <strong>IA locale{model ? ` · x${model.scale}` : ""}</strong>
+                  <strong>
+                    {modelBusy
+                      ? "IA locale · chargement…"
+                      : `IA locale${model ? ` · x${model.scale}` : ""}`}
+                  </strong>
                   <span>
                     {model
-                      ? `Réseau de neurones exécuté sur l'appareil (${model.provider.toUpperCase()}).`
-                      : "Super-résolution par réseau de neurones. Modèle requis."}
+                      ? `Réseau de neurones prêt sur l'appareil (${model.provider.toUpperCase()}).`
+                      : modelBusy
+                        ? modelStatus ?? "Initialisation du modèle ONNX…"
+                        : "Touchez ici : UltraVision charge et active automatiquement le modèle local."}
                   </span>
                 </button>
               </div>
@@ -801,8 +839,8 @@ export default function App() {
                 </div>
 
                 <p className="model-note">
-                  Par défaut : {DEFAULT_MODEL_LABEL}. Modèle mobile léger, chargé localement par ONNX Runtime Web.
-                  Tes images ne quittent jamais l'appareil.
+                  Par défaut : {DEFAULT_MODEL_LABEL}. Un appui sur « IA locale » télécharge le modèle si nécessaire,
+                  valide WebGPU/WASM puis active automatiquement le moteur. Tes images ne quittent jamais l'appareil.
                 </p>
 
                 {aiRuntime && (
