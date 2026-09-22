@@ -223,6 +223,7 @@ export default function App() {
   const [auraBusy, setAuraBusy] = useState(false);
   const [auraStatus, setAuraStatus] = useState<string | null>(null);
   const [auraUpscale, setAuraUpscale] = useState<1 | 2>(1);
+  const [auraUseAi, setAuraUseAi] = useState(false);
   const [intent, setIntent] = useState<CodecIntent>("master");
   const [codecs, setCodecs] = useState<string[] | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecision[]>([]);
@@ -600,6 +601,45 @@ export default function App() {
     }
   }
 
+  async function toggleAuraLocalAi() {
+    if (busy || auraBusy || modelBusy) return;
+
+    if (auraUseAi) {
+      setAuraUseAi(false);
+      setAuraStatus("AV-1X · traitement déterministe Lanczos3");
+      return;
+    }
+
+    if (model) {
+      setAuraUseAi(true);
+      setError(null);
+      setAuraStatus(
+        `AV-1X · IA locale prête · ${model.provider.toUpperCase()} x${model.scale}`,
+      );
+      return;
+    }
+
+    const preferred = AI_MODEL_PRESETS["mobile-x2"];
+    setAuraStatus("AV-1X · chargement IA locale");
+    setModelUrl(preferred.url);
+    const loaded = await acquireModel(
+      {
+        kind: "url",
+        url: preferred.url,
+        label: preferred.label,
+      },
+      false,
+    );
+
+    setAuraUseAi(Boolean(loaded));
+    if (loaded) {
+      setError(null);
+      setAuraStatus(
+        `AV-1X · IA locale prête · ${loaded.provider.toUpperCase()} x${loaded.scale}`,
+      );
+    }
+  }
+
   function applySceneMode(next: SceneModeId) {
     setSceneMode(next);
     if (next === "auto") {
@@ -672,7 +712,9 @@ export default function App() {
             setStatus(label);
           },
         });
-        const url = URL.createObjectURL(result.blob);
+        const activeModelAfterDecode = loadedModel();
+      if (activeModelAfterDecode) setModel(activeModelAfterDecode);
+      const url = URL.createObjectURL(result.blob);
         setOutput({
           url,
           blob: result.blob,
@@ -822,9 +864,23 @@ export default function App() {
     setError(null);
     setAuraStatus("Aura-Vision · lecture AV-1X");
     try {
+      let localModel = model;
+      if (auraUseAi && !localModel) {
+        const preferred = AI_MODEL_PRESETS["mobile-x2"];
+        setAuraStatus("AV-1X · préparation IA locale");
+        localModel = await acquireModel(
+          {
+            kind: "url",
+            url: preferred.url,
+            label: preferred.label,
+          },
+          false,
+        );
+      }
+
       const result = await decodeAuraVision(picked, {
         upscaleFactor: auraUpscale,
-        useAi: Boolean(model),
+        useAi: auraUseAi && Boolean(localModel),
         structuralThreshold: 0.95,
         onProgress: (value, label) => {
           setProgress(value);
@@ -854,8 +910,31 @@ export default function App() {
                   `Colorimétrie demandée : Rec.2020 / 10-bit / HLG ; payload actuel : ${result.manifest.geometry_and_display.colorimetry.stored_payload.space} / ${result.manifest.geometry_and_display.colorimetry.stored_payload.bit_depth}-bit / ${result.manifest.geometry_and_display.colorimetry.stored_payload.hdr_profile}.`,
                 ]
               : []),
-            ...(result.structuralSsim !== null
-              ? [`Contrôle anti-hallucination SSIM : ${result.structuralSsim.toFixed(4)} · seuil 0.9500.`]
+            ...(result.integrityVerified === true
+              ? ["Intégrité du payload vérifiée par recalcul SHA-256."]
+              : []),
+            ...(result.qualityReport
+              ? [
+                  `Quality Gate AMDEC : ${result.qualityReport.accepted ? "VALIDÉ" : "REJETÉ"} · SSIM ${result.qualityReport.ssim.toFixed(4)} · PSNR ${result.qualityReport.psnrDb.toFixed(2)} dB.`,
+                  `Métrologie locale : peau ${result.qualityReport.skinEdgeDisplacementPx === null ? "n/a" : result.qualityReport.skinEdgeDisplacementPx.toFixed(2) + " px"} · architecture ${result.qualityReport.architectureEdgeDisplacementPx === null ? "n/a" : result.qualityReport.architectureEdgeDisplacementPx.toFixed(2) + " px"} · rectitude ${result.qualityReport.architectureStraightnessIndex === null ? "n/a" : result.qualityReport.architectureStraightnessIndex.toFixed(4)}.`,
+                  `Mémoire estimée : ${result.qualityReport.estimatedMemoryMb.toFixed(0)} Mo / limite 512 Mo.`,
+                ]
+              : result.structuralSsim !== null
+                ? [`Contrôle anti-hallucination SSIM : ${result.structuralSsim.toFixed(4)} · seuil 0.9500.`]
+                : []),
+            ...(result.inferenceTimeMs !== null
+              ? [`Inférence locale : ${Math.round(result.inferenceTimeMs)} ms · calcul ${result.actualComputeUnit}${result.modelDowngraded ? " · modèle rétrogradé automatiquement" : ""}.`]
+              : []),
+            ...(result.usedAi
+              ? [`Contribution IA estimée après fusion sémantique : ${result.aiGenerationRatioPercent.toFixed(1)} %.`]
+              : []),
+            ...(result.fallbackFilter
+              ? [`Filtre de repli : ${result.fallbackFilter}.`]
+              : []),
+            ...(result.manifest?.provenance_and_security?.c2pa_manifest
+              ? [
+                  `Provenance : assertion ${result.manifest.provenance_and_security.c2pa_manifest.assertion_type} non signée ; ce n'est pas un manifeste C2PA valide cryptographiquement.`,
+                ]
               : []),
             ...(result.fallbackReason ? [result.fallbackReason] : []),
           ],
@@ -864,8 +943,8 @@ export default function App() {
       setMode("image");
       setAuraStatus(
         result.usedAi
-          ? `Décodage AV-1X neuronal validé · SSIM ${result.structuralSsim?.toFixed(4) ?? "n/a"}`
-          : `Décodage AV-1X déterministe · ${result.fallbackReason ?? "IA non utilisée"}`,
+          ? `AV-1X IA locale validée · SSIM ${result.structuralSsim?.toFixed(4) ?? "n/a"} · PSNR ${result.qualityReport?.psnrDb.toFixed(1) ?? "n/a"} dB · ${result.actualComputeUnit}`
+          : `AV-1X repli sécurisé · ${result.fallbackReason ?? "IA non utilisée"}`,
       );
       setProgress(1);
       setStatus("Aura-Vision décodé");
@@ -1144,6 +1223,40 @@ export default function App() {
                 <div className="engine-grid">
                   <button
                     type="button"
+                    className={!auraUseAi ? "choice active" : "choice"}
+                    onClick={() => {
+                      setAuraUseAi(false);
+                      setAuraStatus("AV-1X · traitement déterministe Lanczos3");
+                    }}
+                    disabled={busy || auraBusy || modelBusy}
+                  >
+                    <strong>Déterministe sécurisé</strong>
+                    <span>Flux structurel + Lanczos3, sans reconstruction neuronale.</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={auraUseAi ? "choice active" : "choice"}
+                    onClick={() => void toggleAuraLocalAi()}
+                    disabled={busy || auraBusy || modelBusy || !aiEngineAvailable()}
+                  >
+                    <strong>
+                      {modelBusy
+                        ? "IA locale · chargement…"
+                        : auraUseAi
+                          ? "IA locale AV-1X · active"
+                          : "Activer IA locale AV-1X"}
+                    </strong>
+                    <span>
+                      {auraUseAi && model
+                        ? `ONNX ${model.provider.toUpperCase()} x${model.scale} · Quality Gate AMDEC actif.`
+                        : "Charge localement le modèle ONNX puis valide SSIM, PSNR et géométrie avant d'accepter ses pixels."}
+                    </span>
+                  </button>
+                </div>
+
+                <div className="engine-grid">
+                  <button
+                    type="button"
                     className={auraUpscale === 1 ? "choice active" : "choice"}
                     onClick={() => setAuraUpscale(1)}
                     disabled={busy || auraBusy}
@@ -1187,10 +1300,12 @@ export default function App() {
                   </label>
                 </div>
 
-                <div className={model ? "model-status" : "warning-card"}>
-                  {model
-                    ? `Décodeur neuronal disponible : ${model.source} · x${model.scale} · ${model.provider.toUpperCase()}.`
-                    : "Aucun modèle ONNX chargé : AV-1X décodera en mode déterministe. Charge IA locale pour activer la reconstruction neuronale."}
+                <div className={auraUseAi && model ? "model-status" : "warning-card"}>
+                  {auraUseAi && model
+                    ? `IA locale AV-1X : ${model.source} · x${model.scale} · ${model.provider.toUpperCase()} · AMDEC SSIM ≥ 0,95 · PSNR cible 35 dB · mémoire ≤ 512 Mo.`
+                    : auraUseAi
+                      ? "IA locale demandée : le modèle sera chargé automatiquement au prochain décodage si nécessaire."
+                      : "Mode déterministe actif. Active « IA locale AV-1X » pour autoriser la reconstruction neuronale avec repli Lanczos3."}
                 </div>
                 {auraStatus && <div className="model-status">{auraStatus}</div>}
               </div>
