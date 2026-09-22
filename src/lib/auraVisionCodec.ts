@@ -553,6 +553,13 @@ export async function decodeAuraVision(
   try {
     const width = parsed.width * upscaleFactor;
     const height = parsed.height * upscaleFactor;
+    const android = typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+    const maxOutputPixels = android ? 24_000_000 : 80_000_000;
+    if (width * height > maxOutputPixels) {
+      throw new Error(
+        `Décodage AV-1X ${width}×${height} refusé : budget mémoire local dépassé (${(maxOutputPixels / 1_000_000).toFixed(0)} MP sûrs sur ce profil).`,
+      );
+    }
 
     const deterministic = document.createElement("canvas");
     deterministic.width = width;
