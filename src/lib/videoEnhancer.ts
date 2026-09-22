@@ -2,6 +2,7 @@ import { calculateOutputSize, type Size, type TargetId } from "./geometry";
 import { PROFILES, type ProfileId } from "./profiles";
 import { enhanceVideoWithRecorder } from "./videoRecorderFallback";
 import { measureCanvasSharpness } from "./finalSharpen";
+import { loadedModel, upscaleWithAi } from "./aiUpscaler";
 import {
   negotiateCodecCandidates,
   webCodecsAvailable,
@@ -27,6 +28,7 @@ export interface VideoEnhanceResult {
 
 export interface EnhanceVideoOptions {
   intent?: CodecIntent;
+  neuralAi?: boolean;
   onProgress?: (value: number, label: string) => void;
 }
 
@@ -188,7 +190,7 @@ function createPagedStreamTarget(StreamTargetCtor: new (
  * et 2560 px ailleurs avant le rééchantillonnage final, avec une fusion
  * temporelle faible pilotée par le mouvement pour limiter scintillement et bruit.
  */
-function createFrameProcessor(profile: ProfileId, output: Size) {
+function createFrameProcessor(profile: ProfileId, output: Size, neuralAi = false) {
   const preset = PROFILES[profile];
   const shouldProcess = preset.filter !== "none" || preset.sharpen >= 0.08;
   if (!shouldProcess) return null;
@@ -209,8 +211,13 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
   let motionSum = 0;
   let probeCanvas: HTMLCanvasElement | null = null;
   let probeCtx: CanvasRenderingContext2D | null = null;
+  let aiInputCanvas: HTMLCanvasElement | null = null;
+  let aiInputCtx: CanvasRenderingContext2D | null = null;
+  let neuralFrames = 0;
+  let neuralFailures = 0;
+  let neuralGuideScaleSum = 0;
 
-  const process = (sample: {
+  const process = async (sample: {
     displayWidth: number;
     displayHeight: number;
     draw: (
@@ -329,6 +336,68 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
       motionSum += motion;
     }
 
+    if (neuralAi && loadedModel()) {
+      const model = loadedModel()!;
+      const aiLongLimit = android
+        ? (model.scale >= 3.5 ? 512 : 448)
+        : (model.scale >= 3.5 ? 768 : 640);
+      const aiLong = Math.min(sourceLong, aiLongLimit);
+      const aiScale = aiLong / Math.max(1, sourceLong);
+      const aiWidth = Math.max(32, Math.round(sample.displayWidth * aiScale));
+      const aiHeight = Math.max(32, Math.round(sample.displayHeight * aiScale));
+
+      if (
+        !aiInputCanvas ||
+        aiInputCanvas.width !== aiWidth ||
+        aiInputCanvas.height !== aiHeight
+      ) {
+        aiInputCanvas = document.createElement("canvas");
+        aiInputCanvas.width = aiWidth;
+        aiInputCanvas.height = aiHeight;
+        aiInputCtx = aiInputCanvas.getContext("2d");
+      }
+
+      if (aiInputCtx) {
+        aiInputCtx.save();
+        aiInputCtx.globalAlpha = 1;
+        aiInputCtx.globalCompositeOperation = "source-over";
+        aiInputCtx.filter = "none";
+        aiInputCtx.clearRect(0, 0, aiWidth, aiHeight);
+        aiInputCtx.imageSmoothingEnabled = true;
+        aiInputCtx.imageSmoothingQuality = "high";
+        sample.draw(aiInputCtx, 0, 0, aiWidth, aiHeight);
+        aiInputCtx.restore();
+
+        try {
+          const neural = await upscaleWithAi(aiInputCanvas);
+          const guideAlpha =
+            profile === "detail"
+              ? 0.62
+              : profile === "cinema"
+                ? 0.52
+                : profile === "archive"
+                  ? 0.46
+                  : 0.48;
+
+          workCtx!.save();
+          workCtx!.globalCompositeOperation = "source-over";
+          workCtx!.globalAlpha = guideAlpha;
+          workCtx!.filter = "none";
+          workCtx!.imageSmoothingEnabled = true;
+          workCtx!.imageSmoothingQuality = "high";
+          workCtx!.drawImage(neural, 0, 0, workWidth, workHeight);
+          workCtx!.restore();
+
+          neuralFrames += 1;
+          neuralGuideScaleSum += model.scale;
+          neural.width = 1;
+          neural.height = 1;
+        } catch {
+          neuralFailures += 1;
+        }
+      }
+    }
+
     const shouldMeasure = measuredFrames < 2;
     const beforeMeasure = shouldMeasure ? measureCanvasSharpness(workCanvas!) : null;
 
@@ -433,6 +502,9 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
       temporalFrames,
       temporalBlend: temporalFrames ? temporalBlendSum / temporalFrames : 0,
       motion: temporalFrames ? motionSum / temporalFrames : 0,
+      neuralFrames,
+      neuralFailures,
+      neuralGuideScale: neuralFrames ? neuralGuideScaleSum / neuralFrames : 0,
     }),
   };
 }
@@ -446,6 +518,7 @@ async function executeWithStallGuard(
   },
   onProgress: EnhanceVideoOptions["onProgress"],
   label: string,
+  stallTimeoutMs = STALL_TIMEOUT_MS,
 ): Promise<void> {
   let lastActivity = Date.now();
   let stalled = false;
@@ -458,7 +531,7 @@ async function executeWithStallGuard(
   const timer = window.setInterval(() => {
     if (
       conversion.state === "executing" &&
-      Date.now() - lastActivity > STALL_TIMEOUT_MS
+      Date.now() - lastActivity > stallTimeoutMs
     ) {
       stalled = true;
       void conversion.cancel();
@@ -471,7 +544,7 @@ async function executeWithStallGuard(
   } catch (reason) {
     if (stalled) {
       throw new Error(
-        "encodeur bloqué plus de 30 s sans progression ; essai automatique du codec ou de la définition suivante",
+        `traitement bloqué plus de ${Math.round(stallTimeoutMs / 1000)} s sans progression ; essai automatique du mode, codec ou de la définition suivante`,
       );
     }
     throw reason;
@@ -488,6 +561,7 @@ async function executeWebCodecsAttempt(
   plan: CodecPlan,
   onProgress: EnhanceVideoOptions["onProgress"],
   enhanceFrames: boolean,
+  neuralAi: boolean,
 ): Promise<VideoEnhanceResult> {
   const {
     ALL_FORMATS,
@@ -516,7 +590,7 @@ async function executeWebCodecsAttempt(
     target: paged.target as never,
   });
 
-  const processor = enhanceFrames ? createFrameProcessor(profile, outputSize) : null;
+  const processor = enhanceFrames ? createFrameProcessor(profile, outputSize, neuralAi) : null;
   const quality = plan.quality === "very-high" ? QUALITY_VERY_HIGH : QUALITY_HIGH;
 
   const videoOptions = processor
@@ -560,12 +634,19 @@ async function executeWebCodecsAttempt(
     throw new Error(`conversion invalide${reasons ? ` (${reasons})` : ""}`);
   }
 
-  const modeLabel = processor ? "amélioration" : "compatibilité";
+  const modeLabel = processor
+    ? neuralAi ? "Neural Video SR" : "Temporal Pro"
+    : "compatibilité";
   const label =
     `Encodage ${plan.codec.toUpperCase()} · ${outputSize.width}×${outputSize.height} · ` +
     `${Math.round(normalizeFrameRate(probe.frameRate))} i/s · ${modeLabel}`;
 
-  await executeWithStallGuard(conversion, onProgress, label);
+  await executeWithStallGuard(
+    conversion,
+    onProgress,
+    label,
+    neuralAi ? 180_000 : STALL_TIMEOUT_MS,
+  );
 
   const mimeType = plan.container === "mp4" ? "video/mp4" : "video/webm";
   if (paged.getSize() <= 0) throw new Error("l'encodeur n'a produit aucune donnée");
@@ -585,6 +666,20 @@ async function executeWebCodecsAttempt(
           stats.temporalFrames + " frame(s) fusionnées · intensité moyenne " +
           (stats.temporalBlend * 100).toFixed(1) + " % · mouvement moyen " +
           (stats.motion * 100).toFixed(1) + " %.",
+      );
+    }
+    if (stats.neuralFrames > 0) {
+      notes.push(
+        "Neural Video SR v4 : " + stats.neuralFrames +
+          " frame(s) passées dans le modèle ONNX local · facteur neuronal moyen x" +
+          stats.neuralGuideScale.toFixed(1) +
+          " · guide neuronal fusionné avant la finition temporelle.",
+      );
+    }
+    if (stats.neuralFailures > 0) {
+      notes.push(
+        "Neural Video SR : " + stats.neuralFailures +
+          " frame(s) ont utilisé le repli Temporal Pro après échec local de l'inférence.",
       );
     }
     if (stats.samples > 0 && stats.before > 0) {
@@ -702,7 +797,7 @@ export async function enhanceVideo(
   profile: ProfileId,
   options: EnhanceVideoOptions = {},
 ): Promise<VideoEnhanceResult> {
-  const { intent = "master", onProgress } = options;
+  const { intent = "master", neuralAi = false, onProgress } = options;
 
   if (!webCodecsAvailable()) {
     onProgress?.(0.01, "WebCodecs indisponible · repli MediaRecorder");
@@ -796,13 +891,18 @@ export async function enhanceVideo(
     }
 
     for (const plan of plans) {
-      const heavyAndroidTarget =
-        isAndroidRuntime() && Math.max(outputSize.width, outputSize.height) > 2048;
-      // Netteté Pro v2 : même en 4K Android, on tente d'abord le vrai
-      // traitement amélioré. Le chemin sans filtre reste uniquement un repli.
-      const modes = heavyAndroidTarget ? [true, false] : [true, false];
+      const modes = neuralAi
+        ? [
+            { enhanceFrames: true, neural: true, label: "Neural Video SR" },
+            { enhanceFrames: true, neural: false, label: "Temporal Pro" },
+            { enhanceFrames: false, neural: false, label: "compatibilité" },
+          ]
+        : [
+            { enhanceFrames: true, neural: false, label: "Temporal Pro" },
+            { enhanceFrames: false, neural: false, label: "compatibilité" },
+          ];
 
-      for (const enhanceFrames of modes) {
+      for (const mode of modes) {
         try {
           const result = await executeWebCodecsAttempt(
             file,
@@ -811,7 +911,8 @@ export async function enhanceVideo(
             profile,
             plan,
             onProgress,
-            enhanceFrames,
+            mode.enhanceFrames,
+            mode.neural,
           );
 
           if (candidateTarget !== target) {
@@ -820,7 +921,13 @@ export async function enhanceVideo(
             );
           }
 
-          if (!enhanceFrames) {
+          if (neuralAi && !mode.neural) {
+            notes.push(
+              mode.enhanceFrames
+                ? "Neural Video SR indisponible sur cet essai : repli Temporal Pro."
+                : "Traitement avancé désactivé pour obtenir une sortie vidéo fiable sur cet appareil.",
+            );
+          } else if (!mode.enhanceFrames) {
             notes.push(
               "Le filtre avancé a été désactivé pour obtenir une sortie vidéo fiable sur cet appareil.",
             );
@@ -837,7 +944,7 @@ export async function enhanceVideo(
           return result;
         } catch (reason) {
           notes.push(
-            `${plan.codec.toUpperCase()} /${plan.container.toUpperCase()} ${outputSize.width}×${outputSize.height} ${enhanceFrames ? "avec filtre" : "sans filtre"} refusé : ${errorMessage(reason)}.`,
+            `${plan.codec.toUpperCase()} /${plan.container.toUpperCase()} ${outputSize.width}×${outputSize.height} ${mode.label} refusé : ${errorMessage(reason)}.`,
           );
         }
       }
