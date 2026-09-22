@@ -34,6 +34,7 @@ import {
 } from "./lib/aiUpscaler";
 import { PROFILES, type ProfileId } from "./lib/profiles";
 import { beginJob, isCancelled, isCancelledError, requestCancel, throwIfCancelled } from "./lib/cancellation";
+import { runAutoStudio, type StudioReport } from "./lib/restoration/autoStudio";
 import { enhanceVideo } from "./lib/videoEnhancer";
 import {
   CODEC_INTENTS,
@@ -73,6 +74,7 @@ type OutputState = {
   notes?: string[];
   roiApplied?: boolean;
   roiConfidence?: number;
+  studio?: StudioReport;
 } | null;
 
 const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -715,7 +717,7 @@ export default function App() {
         format,
         intent,
         aiModelLoaded: aiAllowed,
-        webGpu: webGpuAvailable(),
+        webGpu: activeModel ? activeModel.provider === "webgpu" : webGpuAvailable(),
         mistralEnabled,
         mistralApiKey,
         mistralModel,
@@ -872,6 +874,60 @@ export default function App() {
     a.click();
     a.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function runStudio() {
+    if (!file || !sourceSize || mode !== "image" || busy || auraBusy) return;
+    beginJob();
+    setBusy(true);
+    setError(null);
+    setProgress(0);
+    setOutput((previous) => {
+      if (previous?.url) URL.revokeObjectURL(previous.url);
+      return null;
+    });
+    try {
+      const { result, report } = await runAutoStudio(file, target, profile, format, {
+        deepFocus,
+        precisionRestore,
+        depthFocusPrecision,
+        smallSubjectRoi: { enabled: smallSubjectMode, strength: profile === "detail" ? 0.92 : 0.82 },
+        onProgress: (value, label) => {
+          setProgress(value);
+          setStatus(label);
+        },
+      });
+      const active = loadedModel();
+      if (active) setModel(active);
+      const d = report.diagnosis;
+      const url = URL.createObjectURL(result.blob);
+      setOutput({
+        url,
+        blob: result.blob,
+        size: result.size,
+        engineUsed: result.engineUsed,
+        aiPasses: result.aiPasses,
+        studio: report,
+        note: `Studio Auto · ${report.plan.label} → ${report.winnerLabel}. ${report.decision}`,
+        notes: [
+          `Diagnostic : bruit σ ${d.noise.toFixed(1)} · netteté ${d.sharpness.toFixed(0)} · blocs JPEG ${d.blockiness.toFixed(2)} · contraste ${d.contrast} · couleur ${d.colorfulness.toFixed(1)} (variation ${d.colorVariation.toFixed(1)}).`,
+          ...d.reasons.map((reason) => `Analyse : ${reason}.`),
+          `Validation netteté finale : ${(result.sharpnessBefore * 100).toFixed(2)} % → ${(result.sharpnessAfter * 100).toFixed(2)} %.`,
+        ],
+      });
+      setProgress(1);
+      setStatus("Master prêt · Studio Auto");
+    } catch (reason) {
+      if (isCancelledError(reason)) {
+        setStatus("Traitement annulé");
+        setProgress(0);
+      } else {
+        setError(reason instanceof Error ? reason.message : "Studio Auto a échoué.");
+        setStatus("Erreur");
+      }
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function runAuraEncode() {
@@ -1707,8 +1763,19 @@ export default function App() {
             </div>
           )}
 
+          {mode === "image" && (
+            <button
+              className="run-button studio-button"
+              type="button"
+              onClick={() => void runStudio()}
+              disabled={!file || busy || auraBusy}
+            >
+              {busy ? "Traitement en cours…" : "Studio Auto · meilleur résultat"}
+            </button>
+          )}
+
           <button className="run-button" type="button" onClick={() => void runEnhancement()} disabled={!file || busy}>
-            {busy ? "Traitement en cours…" : "Créer le master local"}
+            {busy ? "Traitement en cours…" : mode === "image" ? "Master rapide" : "Créer le master local"}
           </button>
 
           {(busy || auraBusy) && (
@@ -1751,6 +1818,38 @@ export default function App() {
               <div className="success-mark">✓</div>
               <h3>Master terminé</h3>
               <p>{output.note}</p>
+              {output.studio && output.studio.candidates.length > 0 && (
+                <div className="studio-table-wrap">
+                  <table className="studio-table">
+                    <thead>
+                      <tr><th>Candidat</th><th>Score</th><th>SSIM</th><th>Détail</th><th>Bruit</th><th>Artefacts</th><th>Halos</th><th>Statut</th></tr>
+                    </thead>
+                    <tbody>
+                      {output.studio.candidates.map((candidate) => (
+                        <tr key={candidate.id} className={candidate.id === output.studio?.winner ? "winner" : undefined}>
+                          <td>{candidate.id === output.studio?.winner ? "★ " : ""}{candidate.label}</td>
+                          <td>{candidate.score ? candidate.score.score.toFixed(1) : "—"}</td>
+                          <td>{candidate.score ? candidate.score.ssim.toFixed(3) : "—"}</td>
+                          <td>{candidate.score ? `${candidate.score.detailGain >= 0 ? "+" : ""}${(candidate.score.detailGain * 100).toFixed(0)} %` : "—"}</td>
+                          <td>{candidate.score ? `×${candidate.score.noiseRatio.toFixed(2)}` : "—"}</td>
+                          <td>{candidate.score ? `${candidate.score.artifactReduction >= 0 ? "−" : "+"}${Math.abs(candidate.score.artifactReduction * 100).toFixed(0)} %` : "—"}</td>
+                          <td>{candidate.score ? `${(candidate.score.ringing * 100).toFixed(1)} %` : "—"}</td>
+                          <td title={candidate.error ?? candidate.score?.rejectReason ?? ""}>
+                            {candidate.status === "ok" ? "valide" : candidate.status === "rejected" ? "rejeté" : "échec"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {output.studio.candidates
+                    .filter((candidate) => candidate.status !== "ok")
+                    .map((candidate) => (
+                      <p key={candidate.id} className="studio-reason">
+                        {candidate.label} : {candidate.error ?? candidate.score?.rejectReason}
+                      </p>
+                    ))}
+                </div>
+              )}
               {output.notes && output.notes.length > 0 && (
                 <ul className="result-notes">
                   {output.notes.map((entry) => (

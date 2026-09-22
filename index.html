@@ -20,16 +20,27 @@
         }
         if (window.crossOriginIsolated || !window.isSecureContext) return;
         var flag = "uv-coi-reload";
+        // Ne jamais recharger sous les doigts de l'utilisateur : s'il a déjà
+        // commencé à utiliser l'app, l'isolation s'appliquera à la prochaine visite.
+        var touched = false;
+        var mark = function () { touched = true; };
+        ["pointerdown", "keydown", "change", "drop"].forEach(function (type) {
+          window.addEventListener(type, mark, { capture: true, passive: true });
+        });
         sw.register("./coi-sw.js").then(function (registration) {
           // Un seul rechargement par session : aucune boucle possible, même
           // sur un navigateur qui ignorerait les en-têtes.
           if (sessionStorage.getItem(flag)) return;
           var reload = function () {
+            if (touched) return;
             sessionStorage.setItem(flag, "1");
             location.reload();
           };
-          if (sw.controller || registration.active) { reload(); return; }
+          // Recharger seulement quand le SW contrôle réellement la page :
+          // la navigation suivante passera par lui et recevra COOP/COEP.
+          if (sw.controller) { reload(); return; }
           sw.addEventListener("controllerchange", reload, { once: true });
+          void registration;
         }).catch(function () { /* l'app fonctionne sans, en mono-thread */ });
       })();
     </script>

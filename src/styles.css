@@ -964,3 +964,12 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
 /* Annulation d'un traitement long */
 .cancel-button { width: 100%; margin-top: 10px; border-color: rgba(255, 120, 120, .35); color: #ffb1b1; }
 .cancel-button:hover { background: rgba(255, 120, 120, .08); }
+
+/* Studio Auto */
+.studio-button { margin-bottom: 10px; background: linear-gradient(90deg, #7c5cff, #5ee2ff); }
+.studio-table-wrap { overflow-x: auto; margin: 12px 0; }
+.studio-table { width: 100%; border-collapse: collapse; font-size: .74rem; color: #b8c7da; }
+.studio-table th, .studio-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,.06); white-space: nowrap; }
+.studio-table th { color: #71859f; font-weight: 600; }
+.studio-table tr.winner td { color: #58e7a5; font-weight: 700; }
+.studio-reason { font-size: .72rem; color: #8a9bb3; margin: 4px 0 0; }

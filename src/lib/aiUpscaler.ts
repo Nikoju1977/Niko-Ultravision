@@ -47,6 +47,10 @@ export interface AiModelInfo {
   execution: "worker" | "main";
   /** Threads WASM réellement actifs (1 sans isolation cross-origin). */
   threads: number;
+  /** Entrée figée du modèle (null = dynamique). */
+  fixedWidth: number | null;
+  fixedHeight: number | null;
+  inputType: "float32" | "float16";
 }
 
 export type ModelSource =
@@ -495,7 +499,12 @@ export async function upscaleWithAi(
   const destinationCtx = destination.getContext("2d");
   if (!destinationCtx) throw new Error("Canvas 2D indisponible pour la sortie IA.");
 
-  const tileCore = runtimeTileCore();
+  // Modèle à entrée fixe : la tuile (cœur + marges) doit tenir dans l'entrée.
+  const fixedSide =
+    model.fixedWidth && model.fixedHeight ? Math.min(model.fixedWidth, model.fixedHeight) : null;
+  const tileCore = fixedSide
+    ? Math.max(16, Math.min(runtimeTileCore(), fixedSide - 2 * TILE_PAD))
+    : runtimeTileCore();
   const columns = Math.ceil(width / tileCore);
   const rows = Math.ceil(height / tileCore);
   const total = columns * rows;
