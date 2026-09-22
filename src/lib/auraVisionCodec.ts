@@ -1,6 +1,18 @@
 import { decodeImageFile } from "./imageDecode";
-import { loadedModel, upscaleWithAi } from "./aiUpscaler";
+import {
+  AI_MODEL_PRESETS,
+  loadAiModel,
+  loadedModel,
+  upscaleWithAi,
+} from "./aiUpscaler";
 import { applyFinalAdaptiveSharpen } from "./finalSharpen";
+import {
+  DEFAULT_AURA_QUALITY_RULES,
+  estimateAuraMemoryMb,
+  lanczos3Resample,
+  validateAuraGeneration,
+  type AuraQualityReport,
+} from "./auraQualityController";
 
 const MAGIC = [0x41, 0x56, 0x31, 0x58]; // AV1X
 const HEADER_BYTES = 48;
@@ -77,6 +89,50 @@ export interface AuraVisionManifest {
       hash_scope: string;
     };
   };
+  quality_assurance_and_fallback: {
+    amdec_failure_modes: {
+      ai_hallucination_detected: {
+        trigger_condition: "structural_similarity < threshold";
+        action: "rollback_to_base_stream";
+        fallback_filter: "Lanczos3";
+      };
+      hardware_timeout: {
+        trigger_condition: "inference_time_ms > 150";
+        action: "downgrade_ai_model";
+        fallback_model: "SwinIR_Fast_Light";
+        implemented_fallback_model: string;
+      };
+    };
+  };
+  advanced_dimensional_control: {
+    global_metrics: {
+      ssim_minimum: number;
+      psnr_target_db: number;
+    };
+    geometric_tolerances: Array<{
+      roi_name: string;
+      semantic_class: string;
+      max_edge_displacement_pixels?: number;
+      straightness_preservation_index?: number;
+      enforcement: "critical" | "warning";
+    }>;
+  };
+  hardware_execution_directives: {
+    preferred_compute_unit: "NPU";
+    memory_footprint_limit_mb: number;
+    quantization_fallback_allowed: true;
+    browser_compute_note: string;
+  };
+  provenance_and_security: {
+    c2pa_manifest: {
+      assertion_type: "c2pa.actions.ai_enhanced";
+      base_image_hash: string;
+      ai_generation_ratio_percent: number;
+      signature_authority: "Vision-IA Encoder Core";
+      signed: false;
+      note: string;
+    };
+  };
   implementation_status: {
     learned_vae: false;
     cabac: false;
@@ -109,6 +165,13 @@ export interface AuraVisionDecodeResult {
   fallbackReason?: string;
   semanticSummary: string;
   manifest: AuraVisionManifest | null;
+  qualityReport: AuraQualityReport | null;
+  inferenceTimeMs: number | null;
+  modelDowngraded: boolean;
+  fallbackFilter: "Lanczos3" | null;
+  actualComputeUnit: string;
+  integrityVerified: boolean | null;
+  aiGenerationRatioPercent: number;
 }
 
 export interface AuraVisionDecodeOptions {
@@ -427,6 +490,7 @@ export async function encodeAuraVision(
     const baseBytes = new Uint8Array(await baseBlob.arrayBuffer());
     const semanticRle = rleEncode(maps.semantic);
     const hash = await sha256Hex([baseBytes, semanticRle, maps.latent]);
+    const baseHash = await sha256Hex([baseBytes]);
     const baseOffset = HEADER_BYTES;
     const semanticOffset = baseOffset + baseBytes.byteLength;
     const latentOffset = semanticOffset + semanticRle.byteLength;
@@ -495,7 +559,7 @@ export async function encodeAuraVision(
       },
       dimensional_control: {
         structural_integrity: {
-          ssim_minimum_threshold: 0.95,
+          ssim_minimum_threshold: DEFAULT_AURA_QUALITY_RULES.ssimMinimum,
           tolerance_zones: {
             text: "strict",
             skin: "moderate",
@@ -505,6 +569,60 @@ export async function encodeAuraVision(
         cryptographic_validation: {
           reference_hash_sha256: hash,
           hash_scope: "base_stream+semantic_rle+latent_texture_vectors",
+        },
+      },
+      quality_assurance_and_fallback: {
+        amdec_failure_modes: {
+          ai_hallucination_detected: {
+            trigger_condition: "structural_similarity < threshold",
+            action: "rollback_to_base_stream",
+            fallback_filter: "Lanczos3",
+          },
+          hardware_timeout: {
+            trigger_condition: "inference_time_ms > 150",
+            action: "downgrade_ai_model",
+            fallback_model: "SwinIR_Fast_Light",
+            implemented_fallback_model: AI_MODEL_PRESETS["mobile-x2"].label,
+          },
+        },
+      },
+      advanced_dimensional_control: {
+        global_metrics: {
+          ssim_minimum: DEFAULT_AURA_QUALITY_RULES.ssimMinimum,
+          psnr_target_db: DEFAULT_AURA_QUALITY_RULES.psnrTargetDb,
+        },
+        geometric_tolerances: [
+          {
+            roi_name: "facial_features",
+            semantic_class: "skin",
+            max_edge_displacement_pixels: DEFAULT_AURA_QUALITY_RULES.facialEdgeDisplacementPx,
+            enforcement: "critical",
+          },
+          {
+            roi_name: "architectural_lines",
+            semantic_class: "architecture",
+            max_edge_displacement_pixels: DEFAULT_AURA_QUALITY_RULES.architecturalEdgeDisplacementPx,
+            straightness_preservation_index: DEFAULT_AURA_QUALITY_RULES.straightnessPreservationIndex,
+            enforcement: "critical",
+          },
+        ],
+      },
+      hardware_execution_directives: {
+        preferred_compute_unit: "NPU",
+        memory_footprint_limit_mb: DEFAULT_AURA_QUALITY_RULES.memoryFootprintLimitMb,
+        quantization_fallback_allowed: true,
+        browser_compute_note:
+          "Le navigateur ne fournit pas d'API NPU générique ici ; ONNX Runtime utilise WebGPU puis WASM selon disponibilité.",
+      },
+      provenance_and_security: {
+        c2pa_manifest: {
+          assertion_type: "c2pa.actions.ai_enhanced",
+          base_image_hash: baseHash,
+          ai_generation_ratio_percent: 0,
+          signature_authority: "Vision-IA Encoder Core",
+          signed: false,
+          note:
+            "Assertion de provenance AV-1X non signée. Ce bloc n'est pas un manifeste C2PA cryptographiquement valide.",
         },
       },
       implementation_status: {
@@ -586,6 +704,7 @@ interface ParsedAura {
   semantic: Uint8Array;
   latent: Uint8Array;
   metadata: AuraVisionManifest | null;
+  integrityVerified: boolean | null;
 }
 
 async function parseAuraVision(blob: Blob): Promise<ParsedAura> {
@@ -632,6 +751,20 @@ async function parseAuraVision(blob: Blob): Promise<ParsedAura> {
     metadata = null;
   }
 
+  let integrityVerified: boolean | null = null;
+  if (metadata?.dimensional_control?.cryptographic_validation?.reference_hash_sha256) {
+    const actualHash = await sha256Hex([
+      bytes.slice(HEADER_BYTES, HEADER_BYTES + baseLength),
+      semanticCompressed,
+      latent,
+    ]);
+    integrityVerified =
+      actualHash === metadata.dimensional_control.cryptographic_validation.reference_hash_sha256;
+    if (!integrityVerified) {
+      throw new Error("Échec d'intégrité AV-1X : empreinte SHA-256 du payload invalide.");
+    }
+  }
+
   const semantic =
     metadata?.data_streams?.ai_enhancement_payload?.semantic_segmentation?.map_encoding === "RLE_compressed"
       ? rleDecode(semanticCompressed, gridW * gridH)
@@ -653,6 +786,7 @@ async function parseAuraVision(blob: Blob): Promise<ParsedAura> {
     semantic,
     latent,
     metadata,
+    integrityVerified,
   };
 }
 
@@ -780,14 +914,15 @@ export async function decodeAuraVision(
       );
     }
 
-    const deterministic = document.createElement("canvas");
-    deterministic.width = width;
-    deterministic.height = height;
-    const deterministicCtx = deterministic.getContext("2d");
-    if (!deterministicCtx) throw new Error("Canvas de reconstruction AV-1X indisponible.");
-    deterministicCtx.imageSmoothingEnabled = true;
-    deterministicCtx.imageSmoothingQuality = "high";
-    deterministicCtx.drawImage(baseDecoded.source, 0, 0, width, height);
+    const baseCanvas = document.createElement("canvas");
+    baseCanvas.width = parsed.baseWidth;
+    baseCanvas.height = parsed.baseHeight;
+    const baseCtx = baseCanvas.getContext("2d");
+    if (!baseCtx) throw new Error("Canvas du flux structurel AV-1X indisponible.");
+    baseCtx.drawImage(baseDecoded.source, 0, 0, parsed.baseWidth, parsed.baseHeight);
+
+    onProgress?.(0.14, "Aura-Vision · reconstruction Lanczos3 sécurisée");
+    const deterministic = lanczos3Resample(baseCanvas, width, height);
 
     const latentMean =
       parsed.latent.length
@@ -804,21 +939,57 @@ export async function decodeAuraVision(
     let usedAi = false;
     let structuralSsim: number | null = null;
     let fallbackReason: string | undefined;
+    let qualityReport: AuraQualityReport | null = null;
+    let inferenceTimeMs: number | null = null;
+    let modelDowngraded = false;
+    let fallbackFilter: "Lanczos3" | null = null;
+    let actualComputeUnit = "deterministic";
+    let aiGenerationRatioPercent = 0;
 
-    const model = loadedModel();
-    if (useAi && model) {
-      onProgress?.(0.35, `Aura-Vision · reconstruction neuronale x${model.scale}`);
+    let model = loadedModel();
+    const memoryEstimate = estimateAuraMemoryMb(width, height);
+    if (
+      useAi &&
+      model &&
+      memoryEstimate <= DEFAULT_AURA_QUALITY_RULES.memoryFootprintLimitMb
+    ) {
+      onProgress?.(0.30, `Aura-Vision · IA locale ${model.provider.toUpperCase()} x${model.scale}`);
       try {
-        const baseCanvas = document.createElement("canvas");
-        baseCanvas.width = parsed.baseWidth;
-        baseCanvas.height = parsed.baseHeight;
-        const baseCtx = baseCanvas.getContext("2d");
-        if (!baseCtx) throw new Error("Canvas neuronal AV-1X indisponible.");
-        baseCtx.drawImage(baseDecoded.source, 0, 0);
+        const runInference = async () => {
+          const started = performance.now();
+          const output = await upscaleWithAi(baseCanvas, (ratio, label) => {
+            onProgress?.(0.30 + ratio * 0.32, label);
+          });
+          return { output, elapsed: performance.now() - started };
+        };
 
-        const neuralRaw = await upscaleWithAi(baseCanvas, (ratio, label) => {
-          onProgress?.(0.35 + ratio * 0.40, label);
-        });
+        let inference = await runInference();
+        inferenceTimeMs = inference.elapsed;
+
+        if (
+          inference.elapsed > DEFAULT_AURA_QUALITY_RULES.inferenceTimeoutMs &&
+          model.scale > 2.1
+        ) {
+          inference.output.width = 1;
+          inference.output.height = 1;
+          onProgress?.(
+            0.48,
+            `AMDEC · ${Math.round(inference.elapsed)} ms > ${DEFAULT_AURA_QUALITY_RULES.inferenceTimeoutMs} ms · repli modèle léger`,
+          );
+          const fallback = AI_MODEL_PRESETS["mobile-x2"];
+          await loadAiModel({
+            kind: "url",
+            url: fallback.url,
+            label: fallback.label,
+          });
+          model = loadedModel();
+          if (!model) throw new Error("Le modèle IA léger n'a pas pu être chargé.");
+          modelDowngraded = true;
+          inference = await runInference();
+          inferenceTimeMs = inference.elapsed;
+        }
+
+        const neuralRaw = inference.output;
         const neural = document.createElement("canvas");
         neural.width = width;
         neural.height = height;
@@ -828,9 +999,29 @@ export async function decodeAuraVision(
         neuralCtx.imageSmoothingQuality = "high";
         neuralCtx.drawImage(neuralRaw, 0, 0, width, height);
 
-        structuralSsim = ssimCanvas(deterministic, neural);
-        if (structuralSsim >= structuralThreshold) {
-          onProgress?.(0.80, "Aura-Vision · fusion sémantique structure/texture");
+        onProgress?.(0.68, "Aura-Vision · Quality Gate AMDEC");
+        qualityReport = validateAuraGeneration(
+          deterministic,
+          neural,
+          parsed.semantic,
+          parsed.gridW,
+          parsed.gridH,
+          {
+            ...DEFAULT_AURA_QUALITY_RULES,
+            ssimMinimum: Math.max(
+              structuralThreshold,
+              parsed.metadata?.advanced_dimensional_control?.global_metrics?.ssim_minimum ??
+                DEFAULT_AURA_QUALITY_RULES.ssimMinimum,
+            ),
+            psnrTargetDb:
+              parsed.metadata?.advanced_dimensional_control?.global_metrics?.psnr_target_db ??
+              DEFAULT_AURA_QUALITY_RULES.psnrTargetDb,
+          },
+        );
+        structuralSsim = qualityReport.ssim;
+
+        if (qualityReport.accepted) {
+          onProgress?.(0.82, "Aura-Vision · fusion sémantique validée");
           finalCanvas = compositeSemanticGuide(
             deterministic,
             neural,
@@ -840,25 +1031,42 @@ export async function decodeAuraVision(
             parsed.gridH,
           );
           usedAi = true;
+          actualComputeUnit = model?.provider?.toUpperCase() ?? "ONNX";
+          let alphaSum = 0;
+          for (let i = 0; i < parsed.semantic.length; i += 1) {
+            alphaSum += semanticBlendAlpha(parsed.semantic[i] ?? 0, parsed.latent, i);
+          }
+          aiGenerationRatioPercent =
+            parsed.semantic.length ? alphaSum / parsed.semantic.length * 100 : 0;
         } else {
+          fallbackFilter = "Lanczos3";
           fallbackReason =
-            `Garde-fou structurel : SSIM ${structuralSsim.toFixed(4)} < ${structuralThreshold.toFixed(2)}. Repli déterministe.`;
+            "AMDEC : " + qualityReport.failures.join(" ; ") +
+            ". Rollback vers le flux structurel Lanczos3.";
         }
 
         neuralRaw.width = 1;
         neuralRaw.height = 1;
         neural.width = 1;
         neural.height = 1;
-        baseCanvas.width = 1;
-        baseCanvas.height = 1;
       } catch (reason) {
+        fallbackFilter = "Lanczos3";
         fallbackReason =
           "Reconstruction neuronale indisponible : " +
           (reason instanceof Error ? reason.message : "raison inconnue") +
-          ". Repli déterministe.";
+          ". Repli Lanczos3.";
       }
     } else if (useAi && !model) {
-      fallbackReason = "Aucun modèle ONNX chargé : reconstruction déterministe AV-1X.";
+      fallbackFilter = "Lanczos3";
+      fallbackReason = "Aucun modèle ONNX chargé : reconstruction déterministe Lanczos3.";
+    } else if (
+      useAi &&
+      model &&
+      memoryEstimate > DEFAULT_AURA_QUALITY_RULES.memoryFootprintLimitMb
+    ) {
+      fallbackFilter = "Lanczos3";
+      fallbackReason =
+        `AMDEC mémoire : ${memoryEstimate.toFixed(0)} Mo estimés > ${DEFAULT_AURA_QUALITY_RULES.memoryFootprintLimitMb} Mo. Repli Lanczos3.`;
     }
 
     onProgress?.(0.92, "Aura-Vision · export sans perte");
@@ -871,6 +1079,8 @@ export async function decodeAuraVision(
     }
     deterministic.width = 1;
     deterministic.height = 1;
+    baseCanvas.width = 1;
+    baseCanvas.height = 1;
 
     return {
       blob: outputBlob,
@@ -881,6 +1091,13 @@ export async function decodeAuraVision(
       fallbackReason,
       semanticSummary: semanticSummary(parsed.semantic),
       manifest: parsed.metadata,
+      qualityReport,
+      inferenceTimeMs,
+      modelDowngraded,
+      fallbackFilter,
+      actualComputeUnit,
+      integrityVerified: parsed.integrityVerified,
+      aiGenerationRatioPercent,
     };
   } finally {
     baseDecoded.close();
