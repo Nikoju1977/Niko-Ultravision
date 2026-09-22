@@ -17,6 +17,7 @@ import { calculateOutputSize, formatDimensions, megapixels, type Size, type Targ
 import { assessImageTarget, enhanceImage, type EngineId, type ImageFormat } from "./lib/imageEnhancer";
 import { decodeImageFile } from "./lib/imageDecode";
 import { orchestrateMediaAgents, type AgentDecision } from "./lib/mediaAgents";
+import { inspectAiRuntime, type AiRuntimeReport } from "./lib/aiRuntime";
 import {
   AI_MAX_SOURCE_PIXELS,
   AI_WARN_SOURCE_PIXELS,
@@ -65,6 +66,8 @@ type OutputState = {
   scenePreset?: ScenePresetId;
   codecLabel?: string;
   notes?: string[];
+  roiApplied?: boolean;
+  roiConfidence?: number;
 } | null;
 
 const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -210,6 +213,8 @@ export default function App() {
   const [model, setModel] = useState<AiModelInfo | null>(loadedModel());
   const [modelBusy, setModelBusy] = useState(false);
   const [modelStatus, setModelStatus] = useState<string | null>(null);
+  const [aiRuntime, setAiRuntime] = useState<AiRuntimeReport | null>(null);
+  const [smallSubjectMode, setSmallSubjectMode] = useState(false);
   const [intent, setIntent] = useState<CodecIntent>("master");
   const [codecs, setCodecs] = useState<string[] | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecision[]>([]);
@@ -252,6 +257,31 @@ export default function App() {
   useEffect(() => {
     if (mode === "video" || aiTooLarge) setEngine("canvas");
   }, [mode, aiTooLarge]);
+
+  useEffect(() => {
+    let alive = true;
+    void inspectAiRuntime()
+      .then((report) => {
+        if (alive) setAiRuntime(report);
+      })
+      .catch(() => {
+        if (alive) {
+          setAiRuntime({
+            available: false,
+            backend: "none",
+            webgpu: false,
+            wasm: false,
+            deviceMemoryGb: null,
+            hardwareConcurrency: navigator.hardwareConcurrency || 1,
+            recommendedTile: 128,
+            reason: "Diagnostic du runtime IA impossible.",
+          });
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (mode !== "video" || !predicted || !webCodecsAvailable()) {
@@ -403,6 +433,15 @@ export default function App() {
     setError(null);
     setModelStatus("Préparation du moteur IA");
     try {
+      const runtime = aiRuntime ?? await inspectAiRuntime();
+      setAiRuntime(runtime);
+      if (!runtime.available) {
+        throw new Error(runtime.reason);
+      }
+      setModelStatus(
+        "Runtime " + runtime.backend.toUpperCase() +
+          " prêt · tuile conseillée " + runtime.recommendedTile + " px",
+      );
       const loaded = await loadAiModel(source, (_ratio, label) => setModelStatus(label));
       setModel(loaded);
       setEngine("ai");
@@ -482,6 +521,10 @@ export default function App() {
           deepFocus,
           precisionRestore,
           depthFocusPrecision,
+          smallSubjectRoi: {
+            enabled: smallSubjectMode,
+            strength: plan.profile === "detail" ? 0.92 : 0.82,
+          },
           onProgress: (value, label) => {
             setProgress(value);
             setStatus(label);
@@ -509,6 +552,8 @@ export default function App() {
           depthFocusFarCoverage: result.depthFocusFarCoverage,
           depthFocusMeanCorrection: result.depthFocusMeanCorrection,
           scenePreset: resolvedScenePreset,
+          roiApplied: result.roiApplied,
+          roiConfidence: result.roiConfidence,
           note:
             `Scene Precision ${SCENE_PRESETS[resolvedScenePreset].label}${sceneMode === "auto" ? " (Auto)" : ""}. ` +
             (result.deepFocusApplied
@@ -520,6 +565,9 @@ export default function App() {
             (result.depthFocusApplied
               ? `Depth Focus Precision a réparti la restauration sur ${result.depthFocusPlanes} plans Z avec ${Math.round(result.depthFocusConfidence * 100)} % de confiance moyenne. `
               : "") +
+            (result.roiApplied
+              ? `Petit sujet ROI renforcé localement (confiance ${Math.round(result.roiConfidence * 100)} %). `
+              : "") +
             (result.engineUsed === "ai"
               ? `Super-résolution IA x${result.aiScale} (${result.aiProvider?.toUpperCase()}) puis normalisation géométrique vers la cible.`
               : result.sharpenApplied
@@ -528,6 +576,11 @@ export default function App() {
           notes: [
             ...agentNotes,
             `Validation netteté finale : ${(result.sharpnessBefore * 100).toFixed(2)} % → ${(result.sharpnessAfter * 100).toFixed(2)} % (${result.sharpnessGain >= 0 ? "+" : ""}${(result.sharpnessGain * 100).toFixed(1)} %).`,
+            ...(result.roiApplied
+              ? [`ROI petit sujet : zone automatique renforcée · confiance ${Math.round(result.roiConfidence * 100)} %.`]
+              : smallSubjectMode
+                ? ["ROI petit sujet : aucune zone suffisamment fiable détectée."]
+                : []),
             ...(result.deepFocusReason ? [`Deep Focus : ${result.deepFocusReason}`] : []),
             ...(result.precisionRestoreReason ? [`Precision Restore : ${result.precisionRestoreReason}`] : []),
             ...(result.depthFocusReason ? [`Depth Focus Precision : ${result.depthFocusReason}`] : []),
@@ -738,15 +791,27 @@ export default function App() {
               <div className="model-box">
                 <div className="model-head">
                   <strong>Modèle open source</strong>
-                  <span className={webGpuAvailable() ? "badge ok" : "badge"}>
-                    {webGpuAvailable() ? "WebGPU disponible" : "WASM (CPU)"}
+                  <span className={aiRuntime?.available ? "badge ok" : "badge"}>
+                    {aiRuntime
+                      ? aiRuntime.available
+                        ? aiRuntime.backend.toUpperCase() + " prêt"
+                        : "IA indisponible"
+                      : "Diagnostic…"}
                   </span>
                 </div>
 
                 <p className="model-note">
-                  Par défaut : {DEFAULT_MODEL_LABEL}. Les poids sont téléchargés une fois depuis l'URL ci-dessous, puis
-                  mis en cache par le navigateur. Tes images, elles, ne sortent jamais de l'appareil.
+                  Par défaut : {DEFAULT_MODEL_LABEL}. Modèle mobile léger, chargé localement par ONNX Runtime Web.
+                  Tes images ne quittent jamais l'appareil.
                 </p>
+
+                {aiRuntime && (
+                  <div className={aiRuntime.available ? "model-status" : "warning-card"}>
+                    Runtime : {aiRuntime.backend.toUpperCase()} · {aiRuntime.hardwareConcurrency} cœur(s)
+                    {aiRuntime.deviceMemoryGb ? ` · ~${aiRuntime.deviceMemoryGb} Go RAM déclarée` : ""}
+                    {aiRuntime.available ? ` · tuiles ${aiRuntime.recommendedTile} px` : ""}. {aiRuntime.reason}
+                  </div>
+                )}
 
                 <input
                   type="url"
@@ -797,6 +862,41 @@ export default function App() {
                   </div>
                 )}
               </div>
+            </div>
+          )}
+
+          {mode === "image" && (
+            <div className="control-block">
+              <label>Petit sujet / détail lointain</label>
+              <div className="engine-grid">
+                <button
+                  type="button"
+                  className={!smallSubjectMode ? "choice active" : "choice"}
+                  onClick={() => setSmallSubjectMode(false)}
+                  disabled={busy}
+                >
+                  <strong>Standard</strong>
+                  <span>Traitement homogène sur toute l’image.</span>
+                </button>
+                <button
+                  type="button"
+                  className={smallSubjectMode ? "choice active" : "choice"}
+                  onClick={() => {
+                    setSmallSubjectMode(true);
+                    setProfile("detail");
+                  }}
+                  disabled={busy}
+                >
+                  <strong>Petit sujet ROI</strong>
+                  <span>Détecte une petite zone structurée et la renforce davantage à la résolution finale.</span>
+                </button>
+              </div>
+              {smallSubjectMode && (
+                <div className="model-note">
+                  Recommandé pour animal, véhicule, panneau ou sujet lointain occupant une petite partie de l’image.
+                  Le renforcement est local et progressif, avec bords fondus.
+                </div>
+              )}
             </div>
           )}
 
@@ -1081,6 +1181,12 @@ export default function App() {
                   <div>
                     <dt>Correction moyenne Z</dt>
                     <dd>{(output.depthFocusMeanCorrection ?? 0).toFixed(2)} niveaux / 255</dd>
+                  </div>
+                )}
+                {output.roiApplied && (
+                  <div>
+                    <dt>Petit sujet ROI</dt>
+                    <dd>renforcé · confiance {Math.round((output.roiConfidence ?? 0) * 100)} %</dd>
                   </div>
                 )}
                 {output.codecLabel && (
