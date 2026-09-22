@@ -20,9 +20,11 @@ import { orchestrateMediaAgents, type AgentDecision } from "./lib/mediaAgents";
 import { inspectAiRuntime, type AiRuntimeReport } from "./lib/aiRuntime";
 import {
   AI_MAX_SOURCE_PIXELS,
+  AI_MODEL_PRESETS,
   AI_WARN_SOURCE_PIXELS,
   DEFAULT_MODEL_LABEL,
   DEFAULT_MODEL_URL,
+  chooseAiPresetForTarget,
   aiEngineAvailable,
   loadAiModel,
   loadedModel,
@@ -48,6 +50,7 @@ type OutputState = {
   frameRate?: number;
   frameRateDetected?: boolean;
   engineUsed?: EngineId;
+  aiPasses?: number;
   deepFocusApplied?: boolean;
   deepFocusLayers?: number;
   deepFocusConfidence?: number;
@@ -428,7 +431,7 @@ export default function App() {
     }
   }
 
-  async function acquireModel(source: Parameters<typeof loadAiModel>[0]) {
+  async function acquireModel(source: Parameters<typeof loadAiModel>[0]): Promise<AiModelInfo | null> {
     setModelBusy(true);
     setError(null);
     setModelStatus("Préparation du moteur IA");
@@ -448,11 +451,13 @@ export default function App() {
       setModelStatus(
         `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo`,
       );
+      return loaded;
     } catch (reason) {
       setModel(null);
       setEngine("canvas");
       setModelStatus(null);
       setError(reason instanceof Error ? reason.message : "Chargement du modèle impossible.");
+      return null;
     } finally {
       setModelBusy(false);
     }
@@ -478,14 +483,45 @@ export default function App() {
       return;
     }
 
-    const url = modelUrl.trim() || DEFAULT_MODEL_URL;
-    if (!modelUrl.trim()) setModelUrl(DEFAULT_MODEL_URL);
-    setStatus("IA locale · chargement automatique");
-    await acquireModel({
+    const preferred =
+      sourceSize && predicted
+        ? chooseAiPresetForTarget(
+            sourceSize.width,
+            sourceSize.height,
+            predicted.width,
+            predicted.height,
+          )
+        : AI_MODEL_PRESETS["mobile-x2"];
+
+    const customUrl = modelUrl.trim();
+    const useCustomUrl = customUrl && customUrl !== DEFAULT_MODEL_URL;
+    const primaryUrl = useCustomUrl ? customUrl : preferred.url;
+    const primaryLabel = useCustomUrl ? "Modèle ONNX personnalisé" : preferred.label;
+
+    setModelUrl(primaryUrl);
+    setStatus(
+      preferred.id === "pro-real-x4"
+        ? "IA locale · Pro Max x4"
+        : "IA locale · Mobile x2",
+    );
+
+    const loaded = await acquireModel({
       kind: "url",
-      url,
-      label: DEFAULT_MODEL_LABEL,
+      url: primaryUrl,
+      label: primaryLabel,
     });
+
+    if (!loaded && !useCustomUrl && preferred.id === "pro-real-x4") {
+      const fallback = AI_MODEL_PRESETS["mobile-x2"];
+      setError(null);
+      setModelUrl(fallback.url);
+      setStatus("Pro Max x4 indisponible · repli Mobile x2");
+      await acquireModel({
+        kind: "url",
+        url: fallback.url,
+        label: fallback.label,
+      });
+    }
   }
 
   function applySceneMode(next: SceneModeId) {
@@ -566,6 +602,7 @@ export default function App() {
           blob: result.blob,
           size: result.size,
           engineUsed: result.engineUsed,
+          aiPasses: result.aiPasses,
           deepFocusApplied: result.deepFocusApplied,
           deepFocusLayers: result.deepFocusLayers,
           deepFocusConfidence: result.deepFocusConfidence,
@@ -594,6 +631,9 @@ export default function App() {
               : "") +
             (result.depthFocusApplied
               ? `Depth Focus Precision a réparti la restauration sur ${result.depthFocusPlanes} plans Z avec ${Math.round(result.depthFocusConfidence * 100)} % de confiance moyenne. `
+              : "") +
+            (result.aiPasses > 0
+              ? `Reconstruction IA ${result.aiPasses} passe(s) · facteur modèle x${result.aiScale ?? "?"}. `
               : "") +
             (result.roiApplied
               ? `Petit sujet ROI renforcé localement (confiance ${Math.round(result.roiConfidence * 100)} %). `
@@ -828,7 +868,7 @@ export default function App() {
 
               <div className="model-box">
                 <div className="model-head">
-                  <strong>Modèle open source</strong>
+                  <strong>Modèles IA · Auto Pro</strong>
                   <span className={aiRuntime?.available ? "badge ok" : "badge"}>
                     {aiRuntime
                       ? aiRuntime.available
@@ -839,8 +879,9 @@ export default function App() {
                 </div>
 
                 <p className="model-note">
-                  Par défaut : {DEFAULT_MODEL_LABEL}. Un appui sur « IA locale » télécharge le modèle si nécessaire,
-                  valide WebGPU/WASM puis active automatiquement le moteur. Tes images ne quittent jamais l'appareil.
+                  Auto Pro choisit le modèle selon le rapport source/cible : Swin2SR Real-World x4 pour les petites
+                  sources demandant une forte reconstruction, sinon {DEFAULT_MODEL_LABEL}. Si le x4 échoue sur le
+                  téléphone, UltraVision revient automatiquement au x2. Tes images ne quittent jamais l'appareil.
                 </p>
 
                 {aiRuntime && (
@@ -1172,6 +1213,9 @@ export default function App() {
                 <div><dt>Traitement</dt><dd>Local navigateur</dd></div>
                 {output.engineUsed && (
                   <div><dt>Moteur</dt><dd>{output.engineUsed === "ai" ? "IA locale (ONNX)" : "Canvas"}</dd></div>
+                )}
+                {output.engineUsed === "ai" && (
+                  <div><dt>Reconstruction IA</dt><dd>{output.aiPasses ?? 1} passe(s)</dd></div>
                 )}
                 {output.scenePreset && (
                   <div>

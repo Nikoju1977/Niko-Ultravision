@@ -32,16 +32,57 @@ export type ModelSource =
   | { kind: "url"; url: string; label?: string }
   | { kind: "file"; file: File };
 
-/**
- * Modèle par défaut : Swin2SR classical x2, export ONNX public.
- * Licence Apache-2.0 (Swin2SR, Conde et al.).
- * L'URL est modifiable dans l'interface : si l'export change de place,
- * l'application ne devient pas inutilisable.
- */
-export const DEFAULT_MODEL_URL =
-  "https://huggingface.co/Xenova/swin2SR-lightweight-x2-64/resolve/main/onnx/model.onnx";
+export type AiModelPresetId = "mobile-x2" | "pro-real-x4";
 
-export const DEFAULT_MODEL_LABEL = "Swin2SR lightweight x2 · mobile (Apache-2.0)";
+export interface AiModelPreset {
+  id: AiModelPresetId;
+  label: string;
+  url: string;
+  expectedScale: number;
+  recommendedMaxSourcePixels: number;
+}
+
+export const AI_MODEL_PRESETS: Record<AiModelPresetId, AiModelPreset> = {
+  "mobile-x2": {
+    id: "mobile-x2",
+    label: "Swin2SR lightweight x2 · mobile",
+    url: "https://huggingface.co/Xenova/swin2SR-lightweight-x2-64/resolve/main/onnx/model.onnx",
+    expectedScale: 2,
+    recommendedMaxSourcePixels: 8_000_000,
+  },
+  "pro-real-x4": {
+    id: "pro-real-x4",
+    label: "Swin2SR Real-World x4 · Pro Max",
+    url: "https://huggingface.co/Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr/resolve/main/onnx/model.onnx",
+    expectedScale: 4,
+    recommendedMaxSourcePixels: 1_500_000,
+  },
+};
+
+export const DEFAULT_MODEL_URL = AI_MODEL_PRESETS["mobile-x2"].url;
+export const DEFAULT_MODEL_LABEL = AI_MODEL_PRESETS["mobile-x2"].label;
+
+export function chooseAiPresetForTarget(
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+): AiModelPreset {
+  const sourcePixels = Math.max(1, sourceWidth * sourceHeight);
+  const requestedScale = Math.max(
+    targetWidth / Math.max(1, sourceWidth),
+    targetHeight / Math.max(1, sourceHeight),
+  );
+  const pro = AI_MODEL_PRESETS["pro-real-x4"];
+
+  if (
+    requestedScale >= 2.6 &&
+    sourcePixels <= pro.recommendedMaxSourcePixels
+  ) {
+    return pro;
+  }
+  return AI_MODEL_PRESETS["mobile-x2"];
+}
 
 /** Au-delà, l'inférence par tuiles devient déraisonnable dans un navigateur. */
 export const AI_MAX_SOURCE_PIXELS = 8_000_000;
