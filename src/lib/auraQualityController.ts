@@ -8,8 +8,12 @@ export interface AuraQualityRules {
   memoryFootprintLimitMb: number;
 }
 
+export type AuraQualityDecision = "accept" | "blend" | "reject";
+
 export interface AuraQualityReport {
   accepted: boolean;
+  decision: AuraQualityDecision;
+  blendStrength: number;
   ssim: number;
   psnrDb: number;
   skinEdgeDisplacementPx: number | null;
@@ -17,6 +21,7 @@ export interface AuraQualityReport {
   architectureStraightnessIndex: number | null;
   estimatedMemoryMb: number;
   failures: string[];
+  warnings: string[];
 }
 
 export const DEFAULT_AURA_QUALITY_RULES: AuraQualityRules = {
@@ -274,17 +279,27 @@ export function validateAuraGeneration(
   const architecture = edgeDisplacementForClass(pair, 3);
   const estimatedMemoryMb = estimateAuraMemoryMb(ai.width, ai.height);
   const failures: string[] = [];
+  const warnings: string[] = [];
+
+  // Les métriques globales sont des objectifs de fidélité, pas des motifs de
+  // rejet systématique : une vraie super-résolution modifie les hautes fréquences.
+  // Les écarts modérés déclenchent donc une fusion IA réduite, tandis que les
+  // violations géométriques critiques restent bloquantes.
+  const globalTargetMiss =
+    global.ssim < rules.ssimMinimum ||
+    global.psnrDb < rules.psnrTargetDb;
 
   if (global.ssim < rules.ssimMinimum) {
-    failures.push(
-      `SSIM global ${global.ssim.toFixed(4)} < ${rules.ssimMinimum.toFixed(2)}`,
+    warnings.push(
+      `SSIM global ${global.ssim.toFixed(4)} < cible ${rules.ssimMinimum.toFixed(2)}`,
     );
   }
   if (global.psnrDb < rules.psnrTargetDb) {
-    failures.push(
+    warnings.push(
       `PSNR ${global.psnrDb.toFixed(2)} dB < cible ${rules.psnrTargetDb.toFixed(1)} dB`,
     );
   }
+
   if (
     skin.displacementPx !== null &&
     skin.displacementPx > rules.facialEdgeDisplacementPx
@@ -315,8 +330,33 @@ export function validateAuraGeneration(
     );
   }
 
+  let decision: AuraQualityDecision = "accept";
+  let blendStrength = 1;
+
+  if (failures.length > 0) {
+    decision = "reject";
+    blendStrength = 0;
+  } else if (globalTargetMiss) {
+    // Zone de tolérance perceptuelle : si la structure reste suffisamment
+    // proche, on conserve l'apport neuronal à dose réduite au lieu de le jeter.
+    if (global.ssim >= 0.90 && global.psnrDb >= 26) {
+      decision = "blend";
+      const ssimWeight = clamp((global.ssim - 0.90) / 0.05, 0, 1);
+      const psnrWeight = clamp((global.psnrDb - 26) / 9, 0, 1);
+      blendStrength = clamp(0.28 + 0.42 * Math.min(ssimWeight, psnrWeight), 0.28, 0.70);
+    } else {
+      decision = "reject";
+      blendStrength = 0;
+      failures.push(
+        `fidélité globale insuffisante pour une fusion sûre (SSIM ${global.ssim.toFixed(4)}, PSNR ${global.psnrDb.toFixed(2)} dB)`,
+      );
+    }
+  }
+
   return {
-    accepted: failures.length === 0,
+    accepted: decision !== "reject",
+    decision,
+    blendStrength,
     ssim: global.ssim,
     psnrDb: global.psnrDb,
     skinEdgeDisplacementPx: skin.displacementPx,
@@ -324,6 +364,7 @@ export function validateAuraGeneration(
     architectureStraightnessIndex: architecture.straightnessIndex,
     estimatedMemoryMb,
     failures,
+    warnings,
   };
 }
 
