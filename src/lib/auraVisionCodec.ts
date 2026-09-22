@@ -859,6 +859,7 @@ function compositeSemanticGuide(
   latent: Uint8Array,
   gridW: number,
   gridH: number,
+  blendScale = 1,
 ): HTMLCanvasElement {
   const out = document.createElement("canvas");
   out.width = deterministic.width;
@@ -880,7 +881,9 @@ function compositeSemanticGuide(
       ctx.beginPath();
       ctx.rect(x0, y0, w, h);
       ctx.clip();
-      ctx.globalAlpha = semanticBlendAlpha(semantic[index] ?? 0, latent, index);
+      ctx.globalAlpha =
+        semanticBlendAlpha(semantic[index] ?? 0, latent, index) *
+        clamp(blendScale, 0, 1);
       ctx.drawImage(neural, 0, 0, out.width, out.height);
       ctx.restore();
     }
@@ -1021,7 +1024,12 @@ export async function decodeAuraVision(
         structuralSsim = qualityReport.ssim;
 
         if (qualityReport.accepted) {
-          onProgress?.(0.82, "Aura-Vision · fusion sémantique validée");
+          onProgress?.(
+            0.82,
+            qualityReport.decision === "blend"
+              ? "Aura-Vision · fusion IA réduite validée"
+              : "Aura-Vision · fusion sémantique validée",
+          );
           finalCanvas = compositeSemanticGuide(
             deterministic,
             neural,
@@ -1029,15 +1037,22 @@ export async function decodeAuraVision(
             parsed.latent,
             parsed.gridW,
             parsed.gridH,
+            qualityReport.blendStrength,
           );
           usedAi = true;
           actualComputeUnit = model?.provider?.toUpperCase() ?? "ONNX";
           let alphaSum = 0;
           for (let i = 0; i < parsed.semantic.length; i += 1) {
-            alphaSum += semanticBlendAlpha(parsed.semantic[i] ?? 0, parsed.latent, i);
+            alphaSum +=
+              semanticBlendAlpha(parsed.semantic[i] ?? 0, parsed.latent, i) *
+              qualityReport.blendStrength;
           }
           aiGenerationRatioPercent =
             parsed.semantic.length ? alphaSum / parsed.semantic.length * 100 : 0;
+          if (qualityReport.decision === "blend") {
+            fallbackReason =
+              `AMDEC : métriques globales sous la cible, IA conservée à ${Math.round(qualityReport.blendStrength * 100)} % après validation géométrique.`;
+          }
         } else {
           fallbackFilter = "Lanczos3";
           fallbackReason =

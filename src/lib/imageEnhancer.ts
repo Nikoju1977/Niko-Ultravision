@@ -41,6 +41,9 @@ export interface ImageEnhanceResult {
   aiScale: number | null;
   aiProvider: string | null;
   aiPasses: number;
+  aiPreparedInput: boolean;
+  aiPreparedSourceMegapixels: number;
+  aiPreparedWorkingMegapixels: number;
   deepFocusApplied: boolean;
   deepFocusLayers: number;
   deepFocusConfidence: number;
@@ -321,14 +324,70 @@ export async function enhanceImage(
     let aiScale: number | null = null;
     let aiProvider: string | null = null;
     let aiPasses = 0;
+    let aiPreparedInput = false;
+    let aiPreparedSourceMegapixels = source.width * source.height / 1_000_000;
+    let aiPreparedWorkingMegapixels = aiPreparedSourceMegapixels;
 
     if (engine === "ai") {
       const model = loadedModel();
       if (!model) throw new Error("Moteur IA sélectionné mais aucun modèle n'est chargé.");
+      // Les grandes photos de smartphone ne sont plus exclues de l'IA.
+      // On construit une surface neuronale maîtrisée puis l'inférence reste
+      // tuilée dans aiUpscaler. Cela évite de créer directement une sortie
+      // x2/x4 de dizaines de mégapixels en RAM sur Android.
       if (source.width * source.height > AI_MAX_SOURCE_PIXELS) {
-        throw new Error(
-          `Source de ${megapixels(source).toFixed(1)} MP : au-delà de ${(AI_MAX_SOURCE_PIXELS / 1_000_000).toFixed(0)} MP l'inférence locale n'est plus raisonnable. Utilise le moteur Canvas.`,
+        const android =
+          typeof navigator !== "undefined" &&
+          /Android/i.test(navigator.userAgent);
+        const deviceSafePixels = android ? 2_200_000 : 4_000_000;
+        const targetDrivenPixels = Math.max(
+          1_000_000,
+          Math.floor(
+            output.width * output.height /
+            Math.max(1, model.scale * model.scale),
+          ),
         );
+        const workingPixelBudget = Math.min(
+          deviceSafePixels,
+          targetDrivenPixels,
+        );
+        const currentPixels = current.width * current.height;
+        const scale = Math.min(
+          1,
+          Math.sqrt(workingPixelBudget / Math.max(1, currentPixels)),
+        );
+
+        if (scale < 0.999) {
+          const preparedWidth = Math.max(64, Math.round(current.width * scale));
+          const preparedHeight = Math.max(64, Math.round(current.height * scale));
+          const prepared = canvasFor(preparedWidth, preparedHeight);
+          const preparedCtx = prepared.getContext("2d");
+          if (!preparedCtx) {
+            throw new Error("Canvas de préparation IA indisponible.");
+          }
+          preparedCtx.imageSmoothingEnabled = true;
+          preparedCtx.imageSmoothingQuality = "high";
+          preparedCtx.drawImage(
+            current,
+            0,
+            0,
+            current.width,
+            current.height,
+            0,
+            0,
+            preparedWidth,
+            preparedHeight,
+          );
+          release(current);
+          current = prepared;
+          aiPreparedInput = true;
+          aiPreparedWorkingMegapixels =
+            preparedWidth * preparedHeight / 1_000_000;
+          onProgress?.(
+            0.56,
+            `Préparation IA mobile · ${aiPreparedSourceMegapixels.toFixed(1)} MP → ${aiPreparedWorkingMegapixels.toFixed(1)} MP`,
+          );
+        }
       }
 
       // Pro Max : un léger pré-traitement de la ROI avant la super-résolution
@@ -340,9 +399,11 @@ export async function enhanceImage(
         }
       }
 
+      const aiInputWidth = current.width;
+      const aiInputHeight = current.height;
       const requestedScale = Math.max(
-        output.width / source.width,
-        output.height / source.height,
+        output.width / Math.max(1, aiInputWidth),
+        output.height / Math.max(1, aiInputHeight),
       );
 
       onProgress?.(0.58, "Inférence IA · passe 1");
@@ -357,8 +418,8 @@ export async function enhanceImage(
       // beaucoup plus de définition, une seconde vraie passe IA vaut mieux
       // qu'un grand agrandissement Canvas. On la limite aux sorties sûres.
       const achievedScale = Math.max(
-        current.width / source.width,
-        current.height / source.height,
+        current.width / Math.max(1, aiInputWidth),
+        current.height / Math.max(1, aiInputHeight),
       );
       const projectedPixels =
         Math.round(current.width * model.scale) *
@@ -458,6 +519,9 @@ export async function enhanceImage(
       aiScale,
       aiProvider,
       aiPasses,
+      aiPreparedInput,
+      aiPreparedSourceMegapixels,
+      aiPreparedWorkingMegapixels,
       deepFocusApplied,
       deepFocusLayers,
       deepFocusConfidence,

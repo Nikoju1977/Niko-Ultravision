@@ -258,14 +258,14 @@ export default function App() {
   }, [mode, sourceSize, target]);
 
   const sourcePixels = sourceSize ? sourceSize.width * sourceSize.height : 0;
-  const aiTooLarge = sourcePixels > AI_MAX_SOURCE_PIXELS;
-  const aiSlow = sourcePixels > AI_WARN_SOURCE_PIXELS && !aiTooLarge;
+  const aiNeedsPreparation = sourcePixels > AI_MAX_SOURCE_PIXELS;
+  const aiSlow = sourcePixels > AI_WARN_SOURCE_PIXELS;
   const mistralCloudActive =
     mode === "video" && mistralEnabled && Boolean(mistralApiKey.trim());
 
   useEffect(() => {
-    if (mode === "video" || aiTooLarge) setEngine("canvas");
-  }, [mode, aiTooLarge]);
+    if (mode === "video") setEngine("canvas");
+  }, [mode]);
 
   useEffect(() => {
     let alive = true;
@@ -474,14 +474,6 @@ export default function App() {
 
   async function selectLocalAi() {
     if (busy || modelBusy) return;
-
-    if (aiTooLarge) {
-      setEngine("canvas");
-      setError(
-        `Cette source dépasse ${(AI_MAX_SOURCE_PIXELS / 1_000_000).toFixed(0)} MP. L'IA locale est bloquée pour éviter un plantage mémoire.`,
-      );
-      return;
-    }
 
     if (model) {
       setError(null);
@@ -712,9 +704,7 @@ export default function App() {
             setStatus(label);
           },
         });
-        const activeModelAfterDecode = loadedModel();
-      if (activeModelAfterDecode) setModel(activeModelAfterDecode);
-      const url = URL.createObjectURL(result.blob);
+        const url = URL.createObjectURL(result.blob);
         setOutput({
           url,
           blob: result.blob,
@@ -764,6 +754,11 @@ export default function App() {
           notes: [
             ...agentNotes,
             `Validation netteté finale : ${(result.sharpnessBefore * 100).toFixed(2)} % → ${(result.sharpnessAfter * 100).toFixed(2)} % (${result.sharpnessGain >= 0 ? "+" : ""}${(result.sharpnessGain * 100).toFixed(1)} %).`,
+            ...(result.aiPreparedInput
+              ? [
+                  `Préparation IA grande source : ${result.aiPreparedSourceMegapixels.toFixed(1)} MP → ${result.aiPreparedWorkingMegapixels.toFixed(1)} MP avant inférence tuilée.`,
+                ]
+              : []),
             ...(result.roiApplied
               ? [`ROI petit sujet : zone automatique renforcée · confiance ${Math.round(result.roiConfidence * 100)} %.`]
               : smallSubjectMode
@@ -858,14 +853,51 @@ export default function App() {
     }
   }
 
-  async function runAuraDecode(picked: File | null) {
+  async function runAuraEncodeAndProcess() {
+    if (!file || mode !== "image" || auraBusy || busy) return;
+
+    let encoded: Awaited<ReturnType<typeof encodeAuraVision>> | null = null;
+    setAuraBusy(true);
+    setError(null);
+    setAuraStatus("AV-1X · encodage puis IA locale");
+    try {
+      encoded = await encodeAuraVision(file, (value, label) => {
+        setProgress(value * 0.42);
+        setStatus(label);
+        setAuraStatus(label);
+      });
+      const base = file.name.replace(/\.[^.]+$/, "") || "image";
+      downloadNamedBlob(encoded.blob, `${base}.avx`);
+      setAuraStatus("AV-1X encodé · démarrage IA locale");
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "Encodage Aura-Vision impossible.";
+      setError(message);
+      setAuraStatus(message);
+      setStatus("Erreur Aura-Vision");
+      encoded = null;
+    } finally {
+      setAuraBusy(false);
+    }
+
+    if (!encoded) return;
+    const base = file.name.replace(/\.[^.]+$/, "") || "image";
+    const avxFile = new File([encoded.blob], `${base}.avx`, {
+      type: "application/x-aura-vision",
+      lastModified: Date.now(),
+    });
+    await runAuraDecode(avxFile, true);
+  }
+
+  async function runAuraDecode(picked: File | null, forceAi = false) {
     if (!picked || auraBusy || busy) return;
     setAuraBusy(true);
     setError(null);
     setAuraStatus("Aura-Vision · lecture AV-1X");
     try {
+      const requestedAi = forceAi || auraUseAi;
+      if (forceAi) setAuraUseAi(true);
       let localModel = model;
-      if (auraUseAi && !localModel) {
+      if (requestedAi && !localModel) {
         const preferred = AI_MODEL_PRESETS["mobile-x2"];
         setAuraStatus("AV-1X · préparation IA locale");
         localModel = await acquireModel(
@@ -880,7 +912,7 @@ export default function App() {
 
       const result = await decodeAuraVision(picked, {
         upscaleFactor: auraUpscale,
-        useAi: auraUseAi && Boolean(localModel),
+        useAi: requestedAi && Boolean(localModel),
         structuralThreshold: 0.95,
         onProgress: (value, label) => {
           setProgress(value);
@@ -888,6 +920,8 @@ export default function App() {
           setAuraStatus(label);
         },
       });
+      const activeModelAfterDecode = loadedModel();
+      if (activeModelAfterDecode) setModel(activeModelAfterDecode);
       const url = URL.createObjectURL(result.blob);
       setOutput((previous) => {
         if (previous?.url) URL.revokeObjectURL(previous.url);
@@ -915,9 +949,10 @@ export default function App() {
               : []),
             ...(result.qualityReport
               ? [
-                  `Quality Gate AMDEC : ${result.qualityReport.accepted ? "VALIDÉ" : "REJETÉ"} · SSIM ${result.qualityReport.ssim.toFixed(4)} · PSNR ${result.qualityReport.psnrDb.toFixed(2)} dB.`,
+                  `Quality Gate AMDEC : ${result.qualityReport.decision === "accept" ? "VALIDÉ" : result.qualityReport.decision === "blend" ? "FUSION RÉDUITE" : "REJETÉ"} · SSIM ${result.qualityReport.ssim.toFixed(4)} · PSNR ${result.qualityReport.psnrDb.toFixed(2)} dB · intensité IA ${Math.round(result.qualityReport.blendStrength * 100)} %.`,
                   `Métrologie locale : peau ${result.qualityReport.skinEdgeDisplacementPx === null ? "n/a" : result.qualityReport.skinEdgeDisplacementPx.toFixed(2) + " px"} · architecture ${result.qualityReport.architectureEdgeDisplacementPx === null ? "n/a" : result.qualityReport.architectureEdgeDisplacementPx.toFixed(2) + " px"} · rectitude ${result.qualityReport.architectureStraightnessIndex === null ? "n/a" : result.qualityReport.architectureStraightnessIndex.toFixed(4)}.`,
                   `Mémoire estimée : ${result.qualityReport.estimatedMemoryMb.toFixed(0)} Mo / limite 512 Mo.`,
+                  ...result.qualityReport.warnings.map((warning) => `AMDEC avertissement : ${warning}.`),
                 ]
               : result.structuralSsim !== null
                 ? [`Contrôle anti-hallucination SSIM : ${result.structuralSsim.toFixed(4)} · seuil 0.9500.`]
@@ -1097,14 +1132,14 @@ export default function App() {
                   type="button"
                   className={engine === "ai" ? "choice active" : "choice"}
                   onClick={() => void selectLocalAi()}
-                  disabled={busy || modelBusy || aiTooLarge}
+                  disabled={busy || modelBusy}
                   title={
-                    aiTooLarge
-                      ? "Source trop grande pour l'inférence locale."
-                      : modelBusy
-                        ? "Chargement du moteur IA en cours."
-                        : model
-                          ? "IA locale prête."
+                    modelBusy
+                      ? "Chargement du moteur IA en cours."
+                      : model
+                        ? "IA locale prête."
+                        : aiNeedsPreparation
+                          ? "Grande source : UltraVision préparera automatiquement une surface neuronale sûre."
                           : "Touchez pour charger automatiquement le modèle IA local."
                   }
                 >
@@ -1188,11 +1223,11 @@ export default function App() {
                 </div>
 
                 {modelStatus && <div className="model-status">{modelStatus}</div>}
-                {aiTooLarge && (
+                {aiNeedsPreparation && (
                   <div className="warning-card">
-                    Source de {(sourcePixels / 1_000_000).toFixed(1)} MP : au-delà de{" "}
-                    {(AI_MAX_SOURCE_PIXELS / 1_000_000).toFixed(0)} MP l'inférence par tuiles n'est plus tenable dans un
-                    navigateur. Moteur Canvas imposé.
+                    Source de {(sourcePixels / 1_000_000).toFixed(1)} MP : UltraVision ne coupe plus l'IA. Une surface
+                    neuronale sûre sera préparée automatiquement, puis traitée par tuiles avant normalisation vers la
+                    cible. Le master final conserve la définition demandée.
                   </div>
                 )}
                 {aiSlow && engine === "ai" && (
@@ -1283,6 +1318,15 @@ export default function App() {
                     disabled={!file || busy || auraBusy}
                   >
                     {auraBusy ? "Traitement AV-1X…" : "Encoder la photo en .avx"}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => void runAuraEncodeAndProcess()}
+                    disabled={!file || busy || auraBusy || modelBusy || !aiEngineAvailable()}
+                  >
+                    {auraBusy || modelBusy ? "AV-1X + IA locale…" : "Encoder + traiter IA locale"}
                   </button>
 
                   <label className="file-button">
