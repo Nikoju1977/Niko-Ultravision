@@ -218,6 +218,7 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState<string | null>(null);
   const [aiRuntime, setAiRuntime] = useState<AiRuntimeReport | null>(null);
   const [smallSubjectMode, setSmallSubjectMode] = useState(false);
+  const [videoNeuralAi, setVideoNeuralAi] = useState(false);
   const [intent, setIntent] = useState<CodecIntent>("master");
   const [codecs, setCodecs] = useState<string[] | null>(null);
   const [agentDecisions, setAgentDecisions] = useState<AgentDecision[]>([]);
@@ -431,7 +432,10 @@ export default function App() {
     }
   }
 
-  async function acquireModel(source: Parameters<typeof loadAiModel>[0]): Promise<AiModelInfo | null> {
+  async function acquireModel(
+    source: Parameters<typeof loadAiModel>[0],
+    activateImageEngine = true,
+  ): Promise<AiModelInfo | null> {
     setModelBusy(true);
     setError(null);
     setModelStatus("Préparation du moteur IA");
@@ -447,14 +451,14 @@ export default function App() {
       );
       const loaded = await loadAiModel(source, (_ratio, label) => setModelStatus(label));
       setModel(loaded);
-      setEngine("ai");
+      if (activateImageEngine) setEngine("ai");
       setModelStatus(
         `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo`,
       );
       return loaded;
     } catch (reason) {
       setModel(null);
-      setEngine("canvas");
+      if (activateImageEngine) setEngine("canvas");
       setModelStatus(null);
       setError(reason instanceof Error ? reason.message : "Chargement du modèle impossible.");
       return null;
@@ -521,6 +525,74 @@ export default function App() {
         url: fallback.url,
         label: fallback.label,
       });
+    }
+  }
+
+  async function toggleVideoNeuralAi() {
+    if (busy || modelBusy) return;
+
+    if (videoNeuralAi) {
+      setVideoNeuralAi(false);
+      setStatus("Neural Video SR désactivé");
+      return;
+    }
+
+    if (model) {
+      setError(null);
+      setVideoNeuralAi(true);
+      setStatus(
+        `Neural Video SR · x${model.scale} · ${model.provider.toUpperCase()}`,
+      );
+      return;
+    }
+
+    const preferred =
+      sourceSize && predicted
+        ? chooseAiPresetForTarget(
+            sourceSize.width,
+            sourceSize.height,
+            predicted.width,
+            predicted.height,
+          )
+        : AI_MODEL_PRESETS["mobile-x2"];
+
+    setStatus(
+      preferred.id === "pro-real-x4"
+        ? "Neural Video SR · chargement Pro x4"
+        : "Neural Video SR · chargement Mobile x2",
+    );
+    setModelUrl(preferred.url);
+
+    let loaded = await acquireModel(
+      {
+        kind: "url",
+        url: preferred.url,
+        label: preferred.label,
+      },
+      false,
+    );
+
+    if (!loaded && preferred.id === "pro-real-x4") {
+      const fallback = AI_MODEL_PRESETS["mobile-x2"];
+      setError(null);
+      setModelUrl(fallback.url);
+      setStatus("Neural x4 indisponible · repli x2");
+      loaded = await acquireModel(
+        {
+          kind: "url",
+          url: fallback.url,
+          label: fallback.label,
+        },
+        false,
+      );
+    }
+
+    setVideoNeuralAi(Boolean(loaded));
+    if (loaded) {
+      setError(null);
+      setStatus(
+        `Neural Video SR prêt · x${loaded.scale} · ${loaded.provider.toUpperCase()}`,
+      );
     }
   }
 
@@ -659,6 +731,7 @@ export default function App() {
       } else {
         const result = await enhanceVideo(file, plan.target, plan.profile, {
           intent: plan.intent,
+          neuralAi: videoNeuralAi && Boolean(model),
           onProgress: (value, label) => {
             setProgress(value);
             setStatus(label);
@@ -677,7 +750,7 @@ export default function App() {
           notes: [...agentNotes, ...result.notes],
           note:
             (result.pipeline === "webcodecs"
-              ? "Pipeline WebCodecs : aucune image perdue, horodatage exact. "
+              ? "Pipeline WebCodecs hors temps réel avec cadence et timestamps gérés par le conteneur. "
               : "Pipeline MediaRecorder temps réel. ") +
             (result.audioPreserved ? "Piste audio conservée. " : "Sans piste audio. ") +
             (result.frameRateDetected
@@ -1075,6 +1148,56 @@ export default function App() {
 
               <div className="model-box">
                 <div className="model-head">
+                  <strong>Neural Video SR v4 · local</strong>
+                  <span className={videoNeuralAi && model ? "badge ok" : "badge"}>
+                    {videoNeuralAi && model
+                      ? `ONNX x${model.scale}`
+                      : modelBusy
+                        ? "CHARGEMENT"
+                        : "OFF"}
+                  </span>
+                </div>
+
+                <p className="model-note">
+                  Mode qualité maximale : chaque frame passe par un guide de super-résolution ONNX local à définition
+                  maîtrisée, puis Temporal Pro stabilise le résultat avant l’encodage. Ce mode est nettement plus lent,
+                  surtout sur Android, mais les médias ne quittent pas l’appareil.
+                </p>
+
+                <button
+                  type="button"
+                  className={videoNeuralAi ? "choice active" : "choice"}
+                  onClick={() => void toggleVideoNeuralAi()}
+                  disabled={busy || modelBusy || !aiEngineAvailable()}
+                >
+                  <strong>
+                    {modelBusy
+                      ? "Neural Video SR · chargement…"
+                      : videoNeuralAi
+                        ? "Désactiver Neural Video SR"
+                        : "Activer Neural Video SR"}
+                  </strong>
+                  <span>
+                    {videoNeuralAi && model
+                      ? `Modèle ${model.provider.toUpperCase()} x${model.scale} prêt · traitement frame par frame.`
+                      : "Charge automatiquement le meilleur modèle compatible, avec repli x2 si nécessaire."}
+                  </span>
+                </button>
+
+                {modelStatus && videoNeuralAi && (
+                  <div className="model-status">{modelStatus}</div>
+                )}
+
+                {videoNeuralAi && (
+                  <div className="warning-card">
+                    Neural Video SR privilégie la qualité à la vitesse. Une vidéo longue peut demander beaucoup de temps
+                    sur téléphone ; UltraVision revient automatiquement à Temporal Pro si l’inférence échoue.
+                  </div>
+                )}
+              </div>
+
+              <div className="model-box">
+                <div className="model-head">
                   <strong>Mistral Vision · optionnel</strong>
                   <span className={mistralEnabled ? "badge ok" : "badge"}>
                     {mistralEnabled ? "ACTIF" : "LOCAL"}
@@ -1312,8 +1435,9 @@ export default function App() {
           contraste, SSIM par blocs, PSNR et carte de différence permettent de vérifier si le traitement a réellement
           modifié le signal. Seuls les poids du modèle transitent par le réseau,
           jamais tes médias. La vidéo passe par <strong>WebCodecs</strong> quand le navigateur l’expose : démultiplexage du fichier source,
-          réencodage AV1/HEVC/VP9/H.264 selon ce que la machine sait réellement faire, horodatage exact et aucune image
-          perdue. Le mode <em>Mezzanine intra</em> force toutes les images en clé, ce qui donne le comportement de
+          réencodage AV1/HEVC/VP9/H.264 selon ce que la machine sait réellement faire, avec cadence et timestamps gérés
+          par le conteneur. Neural Video SR peut ajouter une vraie passe ONNX locale frame par frame avant la stabilisation
+          temporelle. Le mode <em>Mezzanine intra</em> force toutes les images en clé, ce qui donne le comportement de
           montage d’un ProRes avec les codecs réellement encodables dans un navigateur. La copie directe remultiplexe
           sans réencoder, donc sans perte de génération. Sans WebCodecs, repli MediaRecorder temps réel, signalé comme
           tel. Le 32K a été retiré : aucun navigateur actuel n’alloue un
