@@ -527,6 +527,7 @@ export default function App() {
                 : "Agrandissement progressif haute qualité ; accentuation globale désactivée pour éviter les halos."),
           notes: [
             ...agentNotes,
+            `Validation netteté finale : ${(result.sharpnessBefore * 100).toFixed(2)} % → ${(result.sharpnessAfter * 100).toFixed(2)} % (${result.sharpnessGain >= 0 ? "+" : ""}${(result.sharpnessGain * 100).toFixed(1)} %).`,
             ...(result.deepFocusReason ? [`Deep Focus : ${result.deepFocusReason}`] : []),
             ...(result.precisionRestoreReason ? [`Precision Restore : ${result.precisionRestoreReason}`] : []),
             ...(result.depthFocusReason ? [`Depth Focus Precision : ${result.depthFocusReason}`] : []),
