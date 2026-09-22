@@ -1,6 +1,7 @@
 import { calculateOutputSize, type Size, type TargetId } from "./geometry";
 import { PROFILES, type ProfileId } from "./profiles";
 import { enhanceVideoWithRecorder } from "./videoRecorderFallback";
+import { measureCanvasSharpness } from "./finalSharpen";
 import {
   negotiateCodecCandidates,
   webCodecsAvailable,
@@ -197,8 +198,11 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
   let workCtx: CanvasRenderingContext2D | null = null;
   let edgeCtx: CanvasRenderingContext2D | null = null;
   let outCtx: CanvasRenderingContext2D | null = null;
+  let measuredFrames = 0;
+  let sharpnessBeforeSum = 0;
+  let sharpnessAfterSum = 0;
 
-  return (sample: {
+  const process = (sample: {
     displayWidth: number;
     displayHeight: number;
     draw: (
@@ -249,7 +253,21 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
     sample.draw(workCtx!, 0, 0, workWidth, workHeight);
     workCtx!.restore();
 
+    const shouldMeasure = measuredFrames < 2;
+    const beforeMeasure = shouldMeasure ? measureCanvasSharpness(workCanvas!) : null;
+
     if (preset.sharpen > 0.01 && workWidth * workHeight <= 2_200_000) {
+      const fineAlpha =
+        profile === "detail"
+          ? 0.16
+          : profile === "cinema"
+            ? 0.11
+            : profile === "fidelity"
+              ? 0.09
+              : 0.055;
+      const coarseAlpha = fineAlpha * 0.42;
+
+      // Passe fine : contours et micro-textures.
       edgeCtx!.save();
       edgeCtx!.globalAlpha = 1;
       edgeCtx!.globalCompositeOperation = "source-over";
@@ -257,13 +275,32 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
       edgeCtx!.clearRect(0, 0, workWidth, workHeight);
       edgeCtx!.drawImage(workCanvas!, 0, 0);
       edgeCtx!.globalCompositeOperation = "difference";
-      edgeCtx!.filter = "blur(0.75px)";
+      edgeCtx!.filter = "blur(0.55px)";
       edgeCtx!.drawImage(workCanvas!, 0, 0);
       edgeCtx!.restore();
 
       workCtx!.save();
       workCtx!.globalCompositeOperation = "lighter";
-      workCtx!.globalAlpha = Math.min(0.1, Math.max(0.02, preset.sharpen * 0.36));
+      workCtx!.globalAlpha = fineAlpha;
+      workCtx!.filter = "none";
+      workCtx!.drawImage(edgeCanvas!, 0, 0);
+      workCtx!.restore();
+
+      // Passe moyenne : sensation de mise au point sans forcer les très hautes fréquences.
+      edgeCtx!.save();
+      edgeCtx!.globalAlpha = 1;
+      edgeCtx!.globalCompositeOperation = "source-over";
+      edgeCtx!.filter = "none";
+      edgeCtx!.clearRect(0, 0, workWidth, workHeight);
+      edgeCtx!.drawImage(workCanvas!, 0, 0);
+      edgeCtx!.globalCompositeOperation = "difference";
+      edgeCtx!.filter = "blur(1.25px)";
+      edgeCtx!.drawImage(workCanvas!, 0, 0);
+      edgeCtx!.restore();
+
+      workCtx!.save();
+      workCtx!.globalCompositeOperation = "lighter";
+      workCtx!.globalAlpha = coarseAlpha;
       workCtx!.filter = "none";
       workCtx!.drawImage(edgeCanvas!, 0, 0);
       workCtx!.restore();
@@ -272,14 +309,37 @@ function createFrameProcessor(profile: ProfileId, output: Size) {
     outCtx!.save();
     outCtx!.globalAlpha = 1;
     outCtx!.globalCompositeOperation = "source-over";
-    outCtx!.filter = "none";
+    outCtx!.filter =
+      profile === "detail"
+        ? "contrast(1.025)"
+        : profile === "cinema"
+          ? "contrast(1.015)"
+          : profile === "fidelity"
+            ? "contrast(1.01)"
+            : "none";
     outCtx!.clearRect(0, 0, output.width, output.height);
     outCtx!.imageSmoothingEnabled = true;
     outCtx!.imageSmoothingQuality = "high";
     outCtx!.drawImage(workCanvas!, 0, 0, output.width, output.height);
     outCtx!.restore();
 
+    if (beforeMeasure) {
+      const afterMeasure = measureCanvasSharpness(outCanvas!);
+      sharpnessBeforeSum += beforeMeasure.edgeEnergy;
+      sharpnessAfterSum += afterMeasure.edgeEnergy;
+      measuredFrames += 1;
+    }
+
     return outCanvas!;
+  };
+
+  return {
+    process,
+    stats: () => ({
+      samples: measuredFrames,
+      before: measuredFrames ? sharpnessBeforeSum / measuredFrames : 0,
+      after: measuredFrames ? sharpnessAfterSum / measuredFrames : 0,
+    }),
   };
 }
 
@@ -377,7 +437,7 @@ async function executeWebCodecsAttempt(
         forceTranscode: true,
         processedWidth: outputSize.width,
         processedHeight: outputSize.height,
-        process: processor,
+        process: processor.process,
       }
     : {
         width: outputSize.width,
@@ -421,9 +481,19 @@ async function executeWebCodecsAttempt(
   const notes: string[] = [plan.rationale];
 
   if (processor) {
+    const stats = processor.stats();
     notes.push(
-      "Traitement vidéo image par image actif : micro-contraste stable, accentuation légère et rééchantillonnage haute qualité.",
+      "Netteté Pro v2 active : double échelle de micro-contraste, finition perceptuelle après upscale et traitement temporel stable.",
     );
+    if (stats.samples > 0 && stats.before > 0) {
+      const gain = ((stats.after - stats.before) / stats.before) * 100;
+      notes.push(
+        "Validation netteté (échantillon normalisé) : " +
+          (stats.before * 100).toFixed(2) + " % → " +
+          (stats.after * 100).toFixed(2) + " % (" +
+          (gain >= 0 ? "+" : "") + gain.toFixed(1) + " %).",
+      );
+    }
   } else {
     notes.push(
       "Mode compatibilité vidéo : transcodage et redimensionnement sans filtre Canvas avancé.",
@@ -626,7 +696,9 @@ export async function enhanceVideo(
     for (const plan of plans) {
       const heavyAndroidTarget =
         isAndroidRuntime() && Math.max(outputSize.width, outputSize.height) > 2048;
-      const modes = heavyAndroidTarget ? [false, true] : [true, false];
+      // Netteté Pro v2 : même en 4K Android, on tente d'abord le vrai
+      // traitement amélioré. Le chemin sans filtre reste uniquement un repli.
+      const modes = heavyAndroidTarget ? [true, false] : [true, false];
 
       for (const enhanceFrames of modes) {
         try {
