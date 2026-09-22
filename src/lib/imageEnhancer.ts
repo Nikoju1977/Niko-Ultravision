@@ -26,6 +26,7 @@ import {
   finalSharpenAmountForProfile,
   measureCanvasSharpness,
 } from "./finalSharpen";
+import { detectSmallSubjectRoi, enhanceRoiLocally } from "./roiSubject";
 
 export type ImageFormat = "image/png" | "image/jpeg" | "image/webp";
 export type EngineId = "canvas" | "ai";
@@ -60,6 +61,9 @@ export interface ImageEnhanceResult {
   sharpnessBefore: number;
   sharpnessAfter: number;
   sharpnessGain: number;
+  roiApplied: boolean;
+  roiConfidence: number;
+  roiBox: { x: number; y: number; width: number; height: number } | null;
 }
 
 export interface ImageTargetAssessment {
@@ -200,6 +204,7 @@ export interface EnhanceImageOptions {
   deepFocus?: DeepFocusSettings;
   precisionRestore?: PrecisionRestoreSettings;
   depthFocusPrecision?: DepthFocusSettings;
+  smallSubjectRoi?: { enabled: boolean; strength?: number };
   onProgress?: (value: number, label: string) => void;
 }
 
@@ -215,6 +220,7 @@ export async function enhanceImage(
     deepFocus = DEFAULT_DEEP_FOCUS,
     precisionRestore = DEFAULT_PRECISION_RESTORE,
     depthFocusPrecision = DEFAULT_DEPTH_FOCUS,
+    smallSubjectRoi = { enabled: false, strength: 0.82 },
     onProgress,
   } = options;
 
@@ -342,6 +348,25 @@ export async function enhanceImage(
 
     onProgress?.(0.91, "Finition locale");
     const sharpnessBeforeMeasure = measureCanvasSharpness(current);
+
+    let roiApplied = false;
+    let roiConfidence = 0;
+    let roiBox: { x: number; y: number; width: number; height: number } | null = null;
+
+    if (smallSubjectRoi.enabled) {
+      onProgress?.(0.915, "Petit sujet · détection ROI");
+      const roi = detectSmallSubjectRoi(current);
+      if (roi) {
+        roiConfidence = roi.confidence;
+        roiBox = { x: roi.x, y: roi.y, width: roi.width, height: roi.height };
+        roiApplied = enhanceRoiLocally(
+          current,
+          roi,
+          smallSubjectRoi.strength ?? 0.82,
+        );
+      }
+    }
+
     const restoredBeforeFinal =
       deepFocusApplied || precisionRestoreApplied || depthFocusApplied;
 
@@ -409,6 +434,9 @@ export async function enhanceImage(
       sharpnessBefore,
       sharpnessAfter,
       sharpnessGain,
+      roiApplied,
+      roiConfidence,
+      roiBox,
     };
   } finally {
     decoded.close();

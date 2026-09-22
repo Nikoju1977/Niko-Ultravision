@@ -39,17 +39,24 @@ export type ModelSource =
  * l'application ne devient pas inutilisable.
  */
 export const DEFAULT_MODEL_URL =
-  "https://huggingface.co/Xenova/swin2SR-classical-sr-x2-64/resolve/main/onnx/model.onnx";
+  "https://huggingface.co/Xenova/swin2SR-lightweight-x2-64/resolve/main/onnx/model.onnx";
 
-export const DEFAULT_MODEL_LABEL = "Swin2SR classical x2 (Apache-2.0)";
+export const DEFAULT_MODEL_LABEL = "Swin2SR lightweight x2 · mobile (Apache-2.0)";
 
 /** Au-delà, l'inférence par tuiles devient déraisonnable dans un navigateur. */
 export const AI_MAX_SOURCE_PIXELS = 8_000_000;
 /** Au-delà, on prévient l'utilisateur du temps de calcul. */
 export const AI_WARN_SOURCE_PIXELS = 2_000_000;
 
-const TILE_CORE = 192;
+const DESKTOP_TILE_CORE = 192;
+const MOBILE_TILE_CORE = 128;
 const TILE_PAD = 12;
+
+function runtimeTileCore(): number {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const lowMemory = typeof nav.deviceMemory === "number" && nav.deviceMemory <= 4;
+  return /Android/i.test(navigator.userAgent) || lowMemory ? MOBILE_TILE_CORE : DESKTOP_TILE_CORE;
+}
 
 let ortModule: OrtModule | null = null;
 let session: OrtSession | null = null;
@@ -124,7 +131,7 @@ async function createSession(
   weights: ArrayBuffer,
 ): Promise<{ session: OrtSession; provider: string }> {
   const attempts: string[] = webGpuAvailable() ? ["webgpu", "wasm"] : ["wasm"];
-  let lastError: unknown = null;
+  const failures: string[] = [];
 
   for (const provider of attempts) {
     try {
@@ -134,14 +141,15 @@ async function createSession(
       });
       return { session: created, provider };
     } catch (reason) {
-      lastError = reason;
+      failures.push(
+        provider.toUpperCase() + " : " +
+          (reason instanceof Error ? reason.message : "raison inconnue"),
+      );
     }
   }
 
   throw new Error(
-    `Le modèle n'a pas pu être initialisé (${
-      lastError instanceof Error ? lastError.message : "raison inconnue"
-    }).`,
+    "Le modèle n'a pas pu être initialisé. " + failures.join(" | "),
   );
 }
 
@@ -174,6 +182,26 @@ async function probeScale(
   return Math.round(scale * 100) / 100;
 }
 
+
+async function probeRuntimeTile(
+  ort: OrtModule,
+  active: OrtSession,
+  inputName: string,
+  outputName: string,
+): Promise<void> {
+  const side = runtimeTileCore();
+  const probe = new ort.Tensor(
+    "float32",
+    new Float32Array(3 * side * side).fill(0.5),
+    [1, 3, side, side],
+  );
+  const result = await active.run({ [inputName]: probe });
+  const output = result[outputName];
+  if (!output || output.dims.length !== 4) {
+    throw new Error("Le modèle refuse la taille de tuile réelle du navigateur.");
+  }
+}
+
 export async function loadAiModel(
   source: ModelSource,
   onProgress?: (ratio: number, label: string) => void,
@@ -203,6 +231,8 @@ export async function loadAiModel(
 
     onProgress?.(0.88, "Mesure du facteur d'échelle");
     const scale = await probeScale(ort, session, inputName, outputName);
+    onProgress?.(0.94, "Validation d'une vraie tuile d'inférence");
+    await probeRuntimeTile(ort, session, inputName, outputName);
 
     info = {
       scale,
@@ -295,19 +325,20 @@ export async function upscaleWithAi(
   const destinationCtx = destination.getContext("2d");
   if (!destinationCtx) throw new Error("Canvas 2D indisponible pour la sortie IA.");
 
-  const columns = Math.ceil(width / TILE_CORE);
-  const rows = Math.ceil(height / TILE_CORE);
+  const tileCore = runtimeTileCore();
+  const columns = Math.ceil(width / tileCore);
+  const rows = Math.ceil(height / tileCore);
   const total = columns * rows;
   let done = 0;
 
   for (let ty = 0; ty < rows; ty += 1) {
     for (let tx = 0; tx < columns; tx += 1) {
-      const coreX = tx * TILE_CORE;
-      const coreY = ty * TILE_CORE;
+      const coreX = tx * tileCore;
+      const coreY = ty * tileCore;
       const startX = Math.max(0, coreX - TILE_PAD);
       const startY = Math.max(0, coreY - TILE_PAD);
-      const endX = Math.min(width, coreX + TILE_CORE + TILE_PAD);
-      const endY = Math.min(height, coreY + TILE_CORE + TILE_PAD);
+      const endX = Math.min(width, coreX + tileCore + TILE_PAD);
+      const endY = Math.min(height, coreY + tileCore + TILE_PAD);
       const tileWidth = endX - startX;
       const tileHeight = endY - startY;
 
@@ -336,8 +367,8 @@ export async function upscaleWithAi(
 
       const keepX = Math.round((coreX - startX) * scale);
       const keepY = Math.round((coreY - startY) * scale);
-      const keepWidth = Math.min(Math.round(Math.min(TILE_CORE, width - coreX) * scale), outWidth - keepX);
-      const keepHeight = Math.min(Math.round(Math.min(TILE_CORE, height - coreY) * scale), outHeight - keepY);
+      const keepWidth = Math.min(Math.round(Math.min(tileCore, width - coreX) * scale), outWidth - keepX);
+      const keepHeight = Math.min(Math.round(Math.min(tileCore, height - coreY) * scale), outHeight - keepY);
 
       if (keepWidth > 0 && keepHeight > 0) {
         const patch = new ImageData(keepWidth, keepHeight);
