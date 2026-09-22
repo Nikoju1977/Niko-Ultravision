@@ -5,6 +5,8 @@ import { applyFinalAdaptiveSharpen } from "./finalSharpen";
 const MAGIC = [0x41, 0x56, 0x31, 0x58]; // AV1X
 const HEADER_BYTES = 48;
 const VERSION = 1;
+const VERSION_STRING = "1.0.0";
+const MAGIC_IDENTIFIER = "AURA-VISION-AV1X";
 const GRID_W = 16;
 const GRID_H = 12;
 const MAX_ENCODE_PIXELS = 12_000_000;
@@ -15,6 +17,73 @@ enum SemanticClass {
   Skin = 2,
   Geometry = 3,
   Texture = 4,
+}
+
+export interface AuraVisionManifest {
+  header: {
+    magic_identifier: string;
+    version: string;
+    encoding_metadata: {
+      timestamp: string;
+      authoring_tool: string;
+      compression_level: "ultra_latent";
+    };
+  };
+  geometry_and_display: {
+    base_resolution: { width: number; height: number; note: string };
+    target_display_resolution: { width: number; height: number; note: string };
+    colorimetry: {
+      requested: { space: "Rec.2020"; bit_depth: 10; hdr_profile: "HLG" };
+      stored_payload: { space: "browser-rgb"; bit_depth: 8; hdr_profile: "SDR"; note: string };
+    };
+  };
+  data_streams: {
+    base_stream: {
+      type: "discrete_wavelet_transform_low_freq";
+      payload_offset_bytes: number;
+      payload_size_bytes: number;
+      entropy_coding: string;
+    };
+    ai_enhancement_payload: {
+      semantic_segmentation: {
+        classes_detected: string[];
+        map_encoding: "RLE_compressed";
+        offset_bytes: number;
+      };
+      latent_texture_vectors: {
+        vae_model_reference: string | null;
+        tensor_shape: [number, number, number, number];
+        quantization: "INT8";
+        implementation: "deterministic_descriptor_v1";
+      };
+      reconstruction_directives: {
+        recommended_model: "SwinIR_Restorer";
+        denoising_strength: number;
+        sharpening_factor: number;
+      };
+    };
+  };
+  dimensional_control: {
+    structural_integrity: {
+      ssim_minimum_threshold: number;
+      tolerance_zones: {
+        text: "strict";
+        skin: "moderate";
+        sky: "flexible";
+      };
+    };
+    cryptographic_validation: {
+      reference_hash_sha256: string;
+      hash_scope: string;
+    };
+  };
+  implementation_status: {
+    learned_vae: false;
+    cabac: false;
+    native_10bit_hdr: false;
+    isobmff: false;
+    note: string;
+  };
 }
 
 export interface AuraVisionEncodeResult {
@@ -28,6 +97,7 @@ export interface AuraVisionEncodeResult {
   latentBytes: number;
   ratioVsRgba: number;
   semanticSummary: string;
+  manifest: AuraVisionManifest;
 }
 
 export interface AuraVisionDecodeResult {
@@ -38,6 +108,7 @@ export interface AuraVisionDecodeResult {
   structuralSsim: number | null;
   fallbackReason?: string;
   semanticSummary: string;
+  manifest: AuraVisionManifest | null;
 }
 
 export interface AuraVisionDecodeOptions {
@@ -73,6 +144,66 @@ function semanticName(value: number): string {
     case SemanticClass.Texture: return "texture";
     default: return "aplat";
   }
+}
+
+function semanticClasses(map: Uint8Array): string[] {
+  const present = new Set<number>();
+  for (const value of map) present.add(value);
+  const classes: string[] = [];
+  if (present.has(SemanticClass.Skin)) classes.push("skin");
+  if (present.has(SemanticClass.Geometry)) classes.push("text", "architecture");
+  if (present.has(SemanticClass.Sky)) classes.push("sky");
+  if (present.has(SemanticClass.Texture)) classes.push("texture");
+  if (present.has(SemanticClass.Flat)) classes.push("flat");
+  return classes;
+}
+
+function rleEncode(input: Uint8Array): Uint8Array {
+  if (!input.length) return new Uint8Array();
+  const out: number[] = [];
+  let value = input[0];
+  let count = 1;
+  for (let i = 1; i < input.length; i += 1) {
+    const next = input[i];
+    if (next === value && count < 255) {
+      count += 1;
+    } else {
+      out.push(value, count);
+      value = next;
+      count = 1;
+    }
+  }
+  out.push(value, count);
+  return new Uint8Array(out);
+}
+
+function rleDecode(input: Uint8Array, expectedLength: number): Uint8Array {
+  const out = new Uint8Array(expectedLength);
+  let offset = 0;
+  for (let i = 0; i + 1 < input.length && offset < expectedLength; i += 2) {
+    const value = input[i];
+    const count = input[i + 1];
+    out.fill(value, offset, Math.min(expectedLength, offset + count));
+    offset += count;
+  }
+  if (offset !== expectedLength) {
+    throw new Error("Carte sémantique RLE AV-1X invalide.");
+  }
+  return out;
+}
+
+async function sha256Hex(parts: Uint8Array[]): Promise<string> {
+  const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    bytes.set(part, offset);
+    offset += part.byteLength;
+  }
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function semanticSummary(map: Uint8Array): string {
@@ -293,22 +424,103 @@ export async function encodeAuraVision(
       baseBlob = await canvasToBlob(baseCanvas, "image/jpeg", 0.86);
     }
 
-    const metadata = new TextEncoder().encode(JSON.stringify({
-      codec: "Aura-Vision AV-1X",
-      version: VERSION,
-      architecture: "hybrid-structure-texture",
-      transform: "haar-ll",
-      semantic: "heuristic-grid-v1",
-      latent: "deterministic-texture-descriptor-v1",
-      learnedVae: false,
-      createdUtc: new Date().toISOString(),
-    }));
-
     const baseBytes = new Uint8Array(await baseBlob.arrayBuffer());
+    const semanticRle = rleEncode(maps.semantic);
+    const hash = await sha256Hex([baseBytes, semanticRle, maps.latent]);
+    const baseOffset = HEADER_BYTES;
+    const semanticOffset = baseOffset + baseBytes.byteLength;
+    const latentOffset = semanticOffset + semanticRle.byteLength;
+    const timestamp = new Date().toISOString();
+
+    const manifest: AuraVisionManifest = {
+      header: {
+        magic_identifier: MAGIC_IDENTIFIER,
+        version: VERSION_STRING,
+        encoding_metadata: {
+          timestamp,
+          authoring_tool: "Vision-IA Encoder Core v1.2",
+          compression_level: "ultra_latent",
+        },
+      },
+      geometry_and_display: {
+        base_resolution: {
+          width: baseCanvas.width,
+          height: baseCanvas.height,
+          note: "Résolution physique stockée dans le flux structurel basse fréquence.",
+        },
+        target_display_resolution: {
+          width: decoded.width * 2,
+          height: decoded.height * 2,
+          note: "Cible de reconstruction native recommandée par AV-1X v1.0.",
+        },
+        colorimetry: {
+          requested: {
+            space: "Rec.2020",
+            bit_depth: 10,
+            hdr_profile: "HLG",
+          },
+          stored_payload: {
+            space: "browser-rgb",
+            bit_depth: 8,
+            hdr_profile: "SDR",
+            note: "Le prototype navigateur v1.0 ne réalise pas encore une chaîne Rec.2020 10-bit HLG native.",
+          },
+        },
+      },
+      data_streams: {
+        base_stream: {
+          type: "discrete_wavelet_transform_low_freq",
+          payload_offset_bytes: baseOffset,
+          payload_size_bytes: baseBytes.byteLength,
+          entropy_coding: baseBlob.type.includes("webp") ? "WebP entropy coding" : "JPEG entropy coding",
+        },
+        ai_enhancement_payload: {
+          semantic_segmentation: {
+            classes_detected: semanticClasses(maps.semantic),
+            map_encoding: "RLE_compressed",
+            offset_bytes: semanticOffset,
+          },
+          latent_texture_vectors: {
+            vae_model_reference: null,
+            tensor_shape: [1, 4, GRID_H, GRID_W],
+            quantization: "INT8",
+            implementation: "deterministic_descriptor_v1",
+          },
+          reconstruction_directives: {
+            recommended_model: "SwinIR_Restorer",
+            denoising_strength: 0.3,
+            sharpening_factor: 1.2,
+          },
+        },
+      },
+      dimensional_control: {
+        structural_integrity: {
+          ssim_minimum_threshold: 0.95,
+          tolerance_zones: {
+            text: "strict",
+            skin: "moderate",
+            sky: "flexible",
+          },
+        },
+        cryptographic_validation: {
+          reference_hash_sha256: hash,
+          hash_scope: "base_stream+semantic_rle+latent_texture_vectors",
+        },
+      },
+      implementation_status: {
+        learned_vae: false,
+        cabac: false,
+        native_10bit_hdr: false,
+        isobmff: false,
+        note: "AV-1X v1.0 navigateur formalise le manifeste cible sans prétendre implémenter les blocs encore absents.",
+      },
+    };
+
+    const metadata = new TextEncoder().encode(JSON.stringify(manifest));
     const total =
       HEADER_BYTES +
       baseBytes.byteLength +
-      maps.semantic.byteLength +
+      semanticRle.byteLength +
       maps.latent.byteLength +
       metadata.byteLength;
     const output = new Uint8Array(total);
@@ -324,15 +536,15 @@ export async function encodeAuraVision(
     view.setUint16(26, GRID_H, true);
     view.setUint8(28, mimeCode(baseBlob.type));
     writeU32(view, 32, baseBytes.byteLength);
-    writeU32(view, 36, maps.semantic.byteLength);
+    writeU32(view, 36, semanticRle.byteLength);
     writeU32(view, 40, maps.latent.byteLength);
     writeU32(view, 44, metadata.byteLength);
 
     let offset = HEADER_BYTES;
     output.set(baseBytes, offset);
     offset += baseBytes.byteLength;
-    output.set(maps.semantic, offset);
-    offset += maps.semantic.byteLength;
+    output.set(semanticRle, offset);
+    offset += semanticRle.byteLength;
     output.set(maps.latent, offset);
     offset += maps.latent.byteLength;
     output.set(metadata, offset);
@@ -351,10 +563,11 @@ export async function encodeAuraVision(
       baseWidth: Math.ceil(decoded.width / 2),
       baseHeight: Math.ceil(decoded.height / 2),
       baseBytes: baseBytes.byteLength,
-      semanticBytes: maps.semantic.byteLength,
+      semanticBytes: semanticRle.byteLength,
       latentBytes: maps.latent.byteLength,
       ratioVsRgba: blob.size / Math.max(1, decoded.width * decoded.height * 4),
       semanticSummary: semanticSummary(maps.semantic),
+      manifest,
     };
   } finally {
     decoded.close();
@@ -372,7 +585,7 @@ interface ParsedAura {
   base: Blob;
   semantic: Uint8Array;
   latent: Uint8Array;
-  metadata: Record<string, unknown>;
+  metadata: AuraVisionManifest | null;
 }
 
 async function parseAuraVision(blob: Blob): Promise<ParsedAura> {
@@ -405,18 +618,24 @@ async function parseAuraVision(blob: Blob): Promise<ParsedAura> {
   let offset = HEADER_BYTES;
   const base = new Blob([bytes.slice(offset, offset + baseLength)], { type: baseMime });
   offset += baseLength;
-  const semantic = bytes.slice(offset, offset + semanticLength);
+  const semanticCompressed = bytes.slice(offset, offset + semanticLength);
   offset += semanticLength;
   const latent = bytes.slice(offset, offset + latentLength);
   offset += latentLength;
   const metadataBytes = bytes.slice(offset, offset + metadataLength);
 
-  let metadata: Record<string, unknown> = {};
+  let metadata: AuraVisionManifest | null = null;
   try {
-    metadata = JSON.parse(new TextDecoder().decode(metadataBytes)) as Record<string, unknown>;
+    const parsedMetadata = JSON.parse(new TextDecoder().decode(metadataBytes)) as AuraVisionManifest;
+    if (parsedMetadata?.header?.magic_identifier === MAGIC_IDENTIFIER) metadata = parsedMetadata;
   } catch {
-    metadata = {};
+    metadata = null;
   }
+
+  const semantic =
+    metadata?.data_streams?.ai_enhancement_payload?.semantic_segmentation?.map_encoding === "RLE_compressed"
+      ? rleDecode(semanticCompressed, gridW * gridH)
+      : semanticCompressed;
 
   if (!width || !height || !baseWidth || !baseHeight || !gridW || !gridH) {
     throw new Error("Dimensions AV-1X invalides.");
@@ -661,6 +880,7 @@ export async function decodeAuraVision(
       structuralSsim,
       fallbackReason,
       semanticSummary: semanticSummary(parsed.semantic),
+      manifest: parsed.metadata,
     };
   } finally {
     baseDecoded.close();
