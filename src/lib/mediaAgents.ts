@@ -61,8 +61,13 @@ function d(agent: AgentKind, label: string, status: AgentStatus, message: string
   return { agent, label, status, message };
 }
 
-function measureCanvas(canvas: HTMLCanvasElement): VisualMetrics {
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+type ReadableCanvas = HTMLCanvasElement | OffscreenCanvas;
+
+function measureCanvas(canvas: ReadableCanvas): VisualMetrics {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true }) as
+    | CanvasRenderingContext2D
+    | OffscreenCanvasRenderingContext2D
+    | null;
   if (!ctx) throw new Error("Canvas 2D indisponible pour l'analyse agentique.");
 
   const { width, height } = canvas;
@@ -157,108 +162,221 @@ async function imageMetrics(file: Blob): Promise<VisualMetrics | null> {
 }
 
 /**
- * Analyse vidéo sans dépendre d'un élément <video>.
+ * Agent Vision vidéo.
  *
- * Sur Android, un <video> caché peut rester bloqué sur loadeddata/seeked selon le
- * conteneur et le codec. Mediabunny + VideoSampleSink lit directement des images
- * décodées via WebCodecs, ce qui rend Agent Vision beaucoup plus fiable.
+ * Stratégie 1 : CanvasSink (voie officielle Mediabunny pour extraire des
+ * miniatures décodées). C'est la voie prioritaire sur Android car elle évite
+ * de manipuler directement VideoFrame.
+ *
+ * Stratégie 2 : VideoSampleSink, conservée comme repli WebCodecs.
+ *
+ * Stratégie 3 : élément <video> réellement attaché au DOM, avec délai plus
+ * généreux et seek explicite. Certains Chromium Android ne décodent pas
+ * correctement un élément vidéo totalement détaché.
  */
+async function videoMetricsWithCanvasSink(file: File): Promise<VisualMetrics | null> {
+  if (!webCodecsAvailable()) return null;
+
+  const { ALL_FORMATS, BlobSource, CanvasSink, Input } = await import("mediabunny");
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+
+  try {
+    if (!(await input.canRead())) return null;
+
+    const track = await input.getPrimaryVideoTrack();
+    if (!track) return null;
+
+    // Ne pas s'arrêter à canDecode(): sur certains Chromium Android, la sonde
+    // peut être trop pessimiste alors que le décodeur fonctionne effectivement.
+    const first = await track.getFirstTimestamp();
+    let end = await track.getDurationFromMetadata({ skipLiveWait: true });
+    if (!Number.isFinite(end) || end == null || end <= first) {
+      end = await track.computeDuration({ skipLiveWait: true });
+    }
+
+    const safeEnd = Number.isFinite(end) && end > first ? end : first + 0.5;
+    const span = Math.max(0.001, safeEnd - first);
+    const timestamps = [
+      first,
+      first + span * 0.33,
+      first + span * 0.66,
+      Math.max(first, safeEnd - Math.min(0.05, span * 0.02)),
+    ];
+
+    const sink = new CanvasSink(track, {
+      width: 384,
+      poolSize: 2,
+      decoderOptions: {
+        hardwareAcceleration: "no-preference",
+      },
+    });
+
+    const metrics: VisualMetrics[] = [];
+    for await (const wrapped of sink.canvasesAtTimestamps(timestamps)) {
+      if (!wrapped) continue;
+      metrics.push(measureCanvas(wrapped.canvas));
+    }
+
+    return averageMetrics(metrics);
+  } finally {
+    input.dispose();
+  }
+}
+
 async function videoMetricsWithSamples(file: File): Promise<VisualMetrics | null> {
   if (!webCodecsAvailable()) return null;
 
   const { ALL_FORMATS, BlobSource, Input, VideoSampleSink } = await import("mediabunny");
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
-  if (!(await input.canRead())) return null;
 
-  const track = await input.getPrimaryVideoTrack();
-  if (!track || !(await track.canDecode())) return null;
+  try {
+    if (!(await input.canRead())) return null;
 
-  const first = await track.getFirstTimestamp();
-  const metadataEnd = await track.getDurationFromMetadata({ skipLiveWait: true });
-  const end =
-    metadataEnd && Number.isFinite(metadataEnd) && metadataEnd > first
-      ? metadataEnd
-      : await track.computeDuration({ skipLiveWait: true });
+    const track = await input.getPrimaryVideoTrack();
+    if (!track) return null;
 
-  const safeEnd = Number.isFinite(end) && end > first ? end : first + 0.001;
-  const span = Math.max(0.001, safeEnd - first);
-  const timestamps = [0.08, 0.5, 0.9].map((ratio) => first + span * ratio);
-  const sink = new VideoSampleSink(track, { hardwareAcceleration: "no-preference" });
-  const metrics: VisualMetrics[] = [];
-
-  for (const timestamp of timestamps) {
-    const sample = await sink.getSample(timestamp);
-    if (!sample) continue;
-
-    try {
-      const maxSide = 384;
-      const scale = Math.min(1, maxSide / Math.max(sample.displayWidth, sample.displayHeight));
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.max(8, Math.round(sample.displayWidth * scale));
-      canvas.height = Math.max(8, Math.round(sample.displayHeight * scale));
-      const ctx = canvas.getContext("2d");
-      if (!ctx) continue;
-      sample.draw(ctx, 0, 0, canvas.width, canvas.height);
-      metrics.push(measureCanvas(canvas));
-    } finally {
-      sample.close();
+    const first = await track.getFirstTimestamp();
+    let end = await track.getDurationFromMetadata({ skipLiveWait: true });
+    if (!Number.isFinite(end) || end == null || end <= first) {
+      end = await track.computeDuration({ skipLiveWait: true });
     }
-  }
 
-  return averageMetrics(metrics);
+    const safeEnd = Number.isFinite(end) && end > first ? end : first + 0.5;
+    const span = Math.max(0.001, safeEnd - first);
+    const timestamps = [first, first + span * 0.5, Math.max(first, safeEnd - 0.04)];
+    const sink = new VideoSampleSink(track, { hardwareAcceleration: "no-preference" });
+    const metrics: VisualMetrics[] = [];
+
+    for (const timestamp of timestamps) {
+      const sample = await sink.getSample(timestamp);
+      if (!sample) continue;
+
+      try {
+        const maxSide = 384;
+        const scale = Math.min(1, maxSide / Math.max(sample.displayWidth, sample.displayHeight));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(8, Math.round(sample.displayWidth * scale));
+        canvas.height = Math.max(8, Math.round(sample.displayHeight * scale));
+        const ctx = canvas.getContext("2d");
+        if (!ctx) continue;
+        sample.draw(ctx, 0, 0, canvas.width, canvas.height);
+        metrics.push(measureCanvas(canvas));
+      } finally {
+        sample.close();
+      }
+    }
+
+    return averageMetrics(metrics);
+  } finally {
+    input.dispose();
+  }
+}
+
+function waitForVideoEvent(
+  video: HTMLVideoElement,
+  event: "loadedmetadata" | "loadeddata" | "seeked",
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timeout ${event} pendant l'analyse vidéo.`));
+    }, timeoutMs);
+
+    const onEvent = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("Décodage vidéo HTML impossible."));
+    };
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      video.removeEventListener(event, onEvent);
+      video.removeEventListener("error", onError);
+    };
+
+    video.addEventListener(event, onEvent, { once: true });
+    video.addEventListener("error", onError, { once: true });
+  });
 }
 
 async function videoMetricsWithElement(file: File): Promise<VisualMetrics | null> {
   const url = URL.createObjectURL(file);
   const video = document.createElement("video");
-  video.preload = "metadata";
+  video.preload = "auto";
   video.muted = true;
   video.playsInline = true;
+  video.controls = false;
+  video.style.position = "fixed";
+  video.style.left = "-10000px";
+  video.style.top = "0";
+  video.style.width = "2px";
+  video.style.height = "2px";
+  video.style.opacity = "0";
+  video.style.pointerEvents = "none";
+
+  document.body.appendChild(video);
 
   try {
     video.src = url;
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(() => reject(new Error("Timeout analyse vidéo.")), 2500);
-      const finish = () => {
-        window.clearTimeout(timer);
-        resolve();
-      };
-      video.addEventListener("loadeddata", finish, { once: true });
-      video.addEventListener(
-        "error",
-        () => {
-          window.clearTimeout(timer);
-          reject(new Error("Échantillon vidéo illisible."));
-        },
-        { once: true },
-      );
-    });
+    video.load();
+
+    if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+      await waitForVideoEvent(video, "loadedmetadata", 10_000);
+    }
+
+    // Force le navigateur à préparer une vraie image décodable.
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      await waitForVideoEvent(video, "loadeddata", 10_000);
+    }
+
+    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    if (duration > 0.2) {
+      const targetTime = Math.min(Math.max(0.05, duration * 0.25), Math.max(0.05, duration - 0.05));
+      if (Math.abs(video.currentTime - targetTime) > 0.01) {
+        video.currentTime = targetTime;
+        await waitForVideoEvent(video, "seeked", 10_000);
+      }
+    }
 
     const maxSide = 384;
     const scale = Math.min(1, maxSide / Math.max(video.videoWidth, video.videoHeight));
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(8, Math.round(video.videoWidth * scale));
     canvas.height = Math.max(8, Math.round(video.videoHeight * scale));
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return null;
+
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     return measureCanvas(canvas);
   } catch {
     return null;
   } finally {
+    video.pause();
     video.removeAttribute("src");
     video.load();
+    video.remove();
     URL.revokeObjectURL(url);
   }
 }
 
 async function videoMetrics(file: File): Promise<VisualMetrics | null> {
   try {
-    const direct = await videoMetricsWithSamples(file);
-    if (direct) return direct;
+    const canvasMetrics = await videoMetricsWithCanvasSink(file);
+    if (canvasMetrics) return canvasMetrics;
   } catch {
-    // Le chemin direct est prioritaire mais l'analyse ne doit jamais bloquer.
+    // Continuer avec le deuxième décodeur.
   }
+
+  try {
+    const sampleMetrics = await videoMetricsWithSamples(file);
+    if (sampleMetrics) return sampleMetrics;
+  } catch {
+    // Continuer avec le repli HTML.
+  }
+
   return videoMetricsWithElement(file);
 }
 
