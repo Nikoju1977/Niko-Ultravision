@@ -51,6 +51,11 @@ export interface AiModelInfo {
   fixedWidth: number | null;
   fixedHeight: number | null;
   inputType: "float32" | "float16";
+  inputLayout: "NCHW" | "NHWC";
+  outputLayout: "NCHW" | "NHWC";
+  /** Le modèle a réellement exécuté une tuile RGBA avant d'être déclaré prêt. */
+  qualified: true;
+  smokeTestMs: number;
 }
 
 export type ModelSource =
@@ -380,6 +385,85 @@ interface EnginePlan {
   make: () => Engine;
 }
 
+function smokeDimension(fixed: number | null): number {
+  if (!fixed) return 32;
+  return Math.max(4, Math.min(32, fixed));
+}
+
+async function qualifyEngine(
+  candidate: Engine,
+  meta: ModelMeta,
+): Promise<number> {
+  const width = smokeDimension(meta.fixedWidth);
+  const height = smokeDimension(meta.fixedHeight);
+  const rgba = new Uint8ClampedArray(width * height * 4);
+
+  // Mire synthétique RGB + luminance : elle vérifie le chemin complet
+  // RGBA → tenseur → ONNX → pixels, pas seulement la création de session.
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const i = (y * width + x) * 4;
+      rgba[i] = Math.round((x / Math.max(1, width - 1)) * 220 + 20);
+      rgba[i + 1] = Math.round((y / Math.max(1, height - 1)) * 210 + 25);
+      rgba[i + 2] = ((x >> 2) + (y >> 2)) % 2 ? 210 : 45;
+      rgba[i + 3] = 255;
+    }
+  }
+
+  const started = performance.now();
+  const result = await candidate.tile(
+    rgba,
+    width,
+    height,
+    { x: 0, y: 0, width, height },
+  );
+  const elapsed = performance.now() - started;
+
+  const expectedWidth = Math.max(1, Math.round(width * meta.scale));
+  const expectedHeight = Math.max(1, Math.round(height * meta.scale));
+  if (
+    Math.abs(result.width - expectedWidth) > 1 ||
+    Math.abs(result.height - expectedHeight) > 1
+  ) {
+    throw new Error(
+      `Auto-test pixels : sortie ${result.width}×${result.height}, attendue ~${expectedWidth}×${expectedHeight}.`,
+    );
+  }
+  if (result.data.length !== result.width * result.height * 4) {
+    throw new Error("Auto-test pixels : taille du buffer RGBA incohérente.");
+  }
+
+  let sum = 0;
+  let sumSq = 0;
+  let samples = 0;
+  let channelDifference = 0;
+  for (let i = 0; i < result.data.length; i += 4) {
+    const r = result.data[i];
+    const g = result.data[i + 1];
+    const b = result.data[i + 2];
+    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    sum += y;
+    sumSq += y * y;
+    channelDifference += Math.abs(r - g) + Math.abs(g - b);
+    samples += 1;
+  }
+  const mean = sum / Math.max(1, samples);
+  const variance = Math.max(0, sumSq / Math.max(1, samples) - mean * mean);
+  const meanChannelDifference =
+    channelDifference / Math.max(1, samples * 2);
+
+  if (!Number.isFinite(mean) || !Number.isFinite(variance)) {
+    throw new Error("Auto-test pixels : valeurs de sortie invalides.");
+  }
+  if (variance < 2 || meanChannelDifference < 0.5) {
+    throw new Error(
+      "Auto-test pixels : le modèle produit une sortie quasi constante ou sans réponse couleur.",
+    );
+  }
+
+  return elapsed;
+}
+
 function enginePlans(): EnginePlan[] {
   const plans: EnginePlan[] = [];
   const workers = typeof Worker !== "undefined";
@@ -430,6 +514,8 @@ export async function loadAiModel(
     try {
       candidate = plan.make();
       const loaded = await candidate.load(weights, tileSide, true);
+      onProgress?.(0.86, `Qualification pixels · ${plan.label}`);
+      const smokeTestMs = await qualifyEngine(candidate, loaded.meta);
       engine = candidate;
       preferredPlan = plan.key;
       info = {
@@ -439,6 +525,8 @@ export async function loadAiModel(
         fromCache,
         execution: candidate.execution,
         threads: loaded.threads,
+        qualified: true,
+        smokeTestMs,
       };
       break;
     } catch (reason) {
@@ -459,6 +547,8 @@ export async function loadAiModel(
     `x${info.scale}`,
     info.provider.toUpperCase(),
     info.execution === "worker" ? `worker${info.threads > 1 ? ` ${info.threads} threads` : ""}` : "thread principal",
+    `${info.inputLayout}→${info.outputLayout}`,
+    `auto-test ${Math.round(info.smokeTestMs)} ms`,
     ...(fromCache ? ["cache local"] : []),
   ];
   onProgress?.(1, "Modèle prêt · " + details.join(" · "));
