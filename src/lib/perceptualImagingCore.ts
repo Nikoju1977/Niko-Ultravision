@@ -1,3 +1,5 @@
+import { throwIfCancelled } from "./cancellation";
+
 export interface PerceptualImagingSettings {
   /** Renforcement structurel 0..1. */
   detailStrength: number;
@@ -19,7 +21,54 @@ export interface PerceptualImagingReport {
 }
 
 export const PERCEPTUAL_CORE_MAX_PIXELS = 14_000_000;
-const STRIP_ROWS = 192;
+const DESKTOP_STRIP_ROWS = 160;
+
+function runtimeSafetyBudget(width: number): {
+  maxPixels: number;
+  stripRows: number;
+  label: string;
+} {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const memory =
+    typeof nav.deviceMemory === "number"
+      ? nav.deviceMemory
+      : null;
+  const mobile = /Android|iPhone|iPad|iPod/i.test(
+    navigator.userAgent,
+  );
+
+  const maxPixels = mobile
+    ? memory !== null && memory <= 4
+      ? 3_200_000
+      : 5_500_000
+    : memory !== null && memory <= 4
+      ? 8_000_000
+      : PERCEPTUAL_CORE_MAX_PIXELS;
+
+  // Une bande nécessite environ trois buffers RGBA simultanés
+  // (ImageData + copie source + zone de sortie). On borne donc la hauteur
+  // en fonction de la largeur afin de garder le pic temporaire raisonnable.
+  const maxStripBytes = mobile ? 14 * 1024 * 1024 : 36 * 1024 * 1024;
+  const memoryBoundRows = Math.max(
+    24,
+    Math.floor(maxStripBytes / Math.max(1, width * 4 * 3)),
+  );
+  const stripRows = Math.max(
+    24,
+    Math.min(
+      mobile ? 72 : DESKTOP_STRIP_ROWS,
+      memoryBoundRows,
+    ),
+  );
+
+  return {
+    maxPixels,
+    stripRows,
+    label: mobile
+      ? `mobile ${memory ?? "RAM ?"} Go`
+      : `desktop ${memory ?? "RAM ?"} Go`,
+  };
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -59,7 +108,8 @@ export async function applyPerceptualImagingCore(
   onProgress?: (ratio: number, label: string) => void,
 ): Promise<PerceptualImagingReport> {
   const pixels = canvas.width * canvas.height;
-  if (pixels > PERCEPTUAL_CORE_MAX_PIXELS) {
+  const safety = runtimeSafetyBudget(canvas.width);
+  if (pixels > safety.maxPixels) {
     return {
       applied: false,
       processedCoverage: 0,
@@ -67,7 +117,7 @@ export async function applyPerceptualImagingCore(
       denoiseContribution: 0,
       detailContribution: 0,
       skippedReason:
-        `Perceptual Imaging Core ignoré au-delà de ${(PERCEPTUAL_CORE_MAX_PIXELS / 1_000_000).toFixed(0)} MP pour préserver la mémoire locale.`,
+        `Perceptual Imaging Core ignoré à ${(pixels / 1_000_000).toFixed(1)} MP : budget sûr ${(safety.maxPixels / 1_000_000).toFixed(1)} MP (${safety.label}).`,
     };
   }
 
@@ -107,11 +157,22 @@ export async function applyPerceptualImagingCore(
   let denoiseSum = 0;
   let detailSum = 0;
 
-  onProgress?.(0.02, "Perceptual Imaging Core · analyse locale");
+  onProgress?.(
+    0.02,
+    `Perceptual Imaging Core · ${safety.label} · bandes ${safety.stripRows}px`,
+  );
 
-  for (let startY = 0; startY < height; startY += STRIP_ROWS) {
+  for (
+    let startY = 0;
+    startY < height;
+    startY += safety.stripRows
+  ) {
+    throwIfCancelled();
     const writeStart = startY;
-    const writeEnd = Math.min(height, startY + STRIP_ROWS);
+    const writeEnd = Math.min(
+      height,
+      startY + safety.stripRows,
+    );
     const readStart = Math.max(0, writeStart - 1);
     const readEnd = Math.min(height, writeEnd + 1);
     const readHeight = readEnd - readStart;
@@ -129,6 +190,9 @@ export async function applyPerceptualImagingCore(
     const localWriteEnd = writeEnd - readStart;
 
     for (let y = localWriteStart; y < localWriteEnd; y += 1) {
+      if ((y - localWriteStart) % 24 === 0) {
+        throwIfCancelled();
+      }
       if (readStart + y <= 0 || readStart + y >= height - 1) {
         continue;
       }
