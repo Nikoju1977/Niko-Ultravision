@@ -1350,12 +1350,12 @@ export default function App() {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <div className="eyebrow">NIKO STUDIO · LOCAL MASTERING</div>
-          <h1>Niko UltraVision Pro</h1>
+          <div className="eyebrow">NIKO ULTRAVISION</div>
+          <h1>Un média. Un bouton. Un master.</h1>
           <p className="subtitle">
             {mistralCloudActive
-              ? "Traitement vidéo local + analyse sémantique optionnelle de 4 keyframes par Mistral Vision."
-              : "Amélioration locale d’images et de vidéos. Aucun fichier n’est envoyé vers un service externe."}
+              ? "AutoPilot choisit le traitement ; Mistral Vision reste optionnel pour la vidéo."
+              : "Dépose une image ou une vidéo. AutoPilot choisit automatiquement la qualité, les moteurs et les replis sûrs."}
           </p>
         </div>
         <div className="privacy-badge"><span /> {mistralCloudActive ? "Local + Mistral Vision" : "100 % local"}</div>
@@ -1365,8 +1365,8 @@ export default function App() {
         <article className="panel source-panel">
           <div className="panel-title-row">
             <div>
-              <span className="kicker">01 · SOURCE</span>
-              <h2>Importer un master</h2>
+              <span className="kicker">01 · MÉDIA</span>
+              <h2>Choisir le fichier</h2>
             </div>
             <span className="lock">Fidelity Lock</span>
           </div>
@@ -1387,8 +1387,8 @@ export default function App() {
             ) : (
               <div className="dropzone-empty">
                 <div className="upload-glyph">＋</div>
-                <strong>Choisir une image ou une vidéo</strong>
-                <span>Traitement effectué sur cet appareil</span>
+                <strong>Déposer ou choisir un média</strong>
+                <span>Image, vidéo ou fichier AVX · traitement local par défaut</span>
               </div>
             )}
           </label>
@@ -1402,8 +1402,60 @@ export default function App() {
         </article>
 
         <aside className="panel controls-panel">
-          <span className="kicker">02 · MASTERING</span>
-          <h2>Paramètres</h2>
+          <span className="kicker">02 · AUTOPILOT</span>
+          <h2>Créer le meilleur master</h2>
+
+          <div className="autopilot-card">
+            <div className="autopilot-head">
+              <div>
+                <strong>Tout automatique</strong>
+                <span>
+                  {file
+                    ? `${mode === "image" ? "Image" : "Vidéo"} prête · AutoPilot choisira cible, qualité, moteur et replis.`
+                    : "Importe d’abord un média. Aucun réglage n’est nécessaire."}
+                </span>
+              </div>
+              <span className="badge ok">AUTO</span>
+            </div>
+
+            <div className="auto-chips">
+              <span>Qualité auto</span>
+              <span>Mémoire protégée</span>
+              <span>Validation finale</span>
+              <span>Local par défaut</span>
+            </div>
+
+            <button
+              className="run-button primary-master"
+              type="button"
+              onClick={() =>
+                mode === "image"
+                  ? void runStudio()
+                  : void runVideoAuto()
+              }
+              disabled={!file || busy || auraBusy}
+            >
+              {busy
+                ? `${status} · ${Math.round(progress * 100)} %`
+                : mode === "image"
+                  ? "Créer le master automatiquement"
+                  : "Créer la vidéo automatiquement"}
+            </button>
+
+            {file && (
+              <p className="auto-caption">
+                La géométrie reste verrouillée. Si une IA échoue ou dépasse le budget mémoire,
+                UltraVision passe automatiquement au moteur sûr suivant.
+              </p>
+            )}
+          </div>
+
+          <details className="expert-panel">
+            <summary>
+              <span>Réglages avancés</span>
+              <small>Pour reprendre la main manuellement</small>
+            </summary>
+            <div className="expert-panel-body">
 
           <div className="control-block">
             <label>Profil</label>
@@ -2018,32 +2070,54 @@ export default function App() {
             </div>
           )}
 
-          <div className="agent-box">
-            <div className="agent-head">
-              <div>
-                <strong>AutoPilot agents Image + Vidéo</strong>
-                <span>Chaîne autonome : superviseur, vision, qualité, mémoire, moteurs IA, Evidence Gate, Recovery et validation du master final.</span>
-              </div>
-              <span className="badge ok">ACTIF</span>
+            <button
+              className="secondary-button expert-run"
+              type="button"
+              onClick={() => void runEnhancement()}
+              disabled={!file || busy || auraBusy}
+            >
+              Lancer avec ces réglages
+            </button>
             </div>
+          </details>
 
-            {agentDecisions.length > 0 ? (
-              <div className="agent-list">
-                {agentDecisions.map((entry, index) => (
-                  <div className={`agent-row ${entry.status}`} key={`${entry.agent}-${index}`}>
-                    <strong>{entry.label}</strong>
-                    <span>{entry.message}</span>
-                  </div>
-                ))}
+          <details className="audit-details">
+            <summary>
+              <span>Décisions AutoPilot</span>
+              <small>
+                {agentDecisions.length > 0
+                  ? `${agentDecisions.length} décision(s) enregistrée(s)`
+                  : "Visible après le traitement"}
+              </small>
+            </summary>
+            <div className="agent-box compact">
+              <div className="agent-head">
+                <div>
+                  <strong>Journal des agents</strong>
+                  <span>Superviseur, qualité, mémoire, moteurs, Recovery et validation.</span>
+                </div>
+                <span className="badge ok">ACTIF</span>
               </div>
-            ) : (
-              <p className="model-note">Les agents analyseront automatiquement le média au lancement du master.</p>
-            )}
-          </div>
 
-          <div className="fidelity-card">
-            <strong>Géométrie verrouillée</strong>
-            <span>Pas de crop automatique. Pas d’étirement. Le ratio source est recalculé mathématiquement à chaque cible.</span>
+              {agentDecisions.length > 0 ? (
+                <div className="agent-list">
+                  {agentDecisions.map((entry, index) => (
+                    <div className={`agent-row ${entry.status}`} key={`${entry.agent}-${index}`}>
+                      <strong>{entry.label}</strong>
+                      <span>{entry.message}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="model-note">Les décisions apparaîtront ici une fois le master lancé.</p>
+              )}
+            </div>
+          </details>
+
+          <div className="safety-line">
+            <span>✓ Géométrie verrouillée</span>
+            <span>✓ Replis automatiques</span>
+            <span>✓ Master validé avant export</span>
           </div>
 
           {imageAssessment && !imageAssessment.supported && (
@@ -2054,37 +2128,6 @@ export default function App() {
             <div className="warning-card">
               Cette cible représente {megapixels(predicted).toFixed(1)} MP. Le traitement est autorisé, mais restera exigeant pour la mémoire locale.
             </div>
-          )}
-
-          {mode === "image" && (
-            <button
-              className="run-button studio-button"
-              type="button"
-              onClick={() => void runStudio()}
-              disabled={!file || busy || auraBusy}
-            >
-              {busy ? "Traitement en cours…" : "MASTER AUTO v3 · tout automatique"}
-            </button>
-          )}
-
-          {mode === "image" ? (
-            <button
-              className="run-button"
-              type="button"
-              onClick={() => void runEnhancement()}
-              disabled={!file || busy}
-            >
-              {busy ? "Traitement en cours…" : "Mode Expert · lancer les réglages courants"}
-            </button>
-          ) : (
-            <button
-              className="run-button studio-button"
-              type="button"
-              onClick={() => void runVideoAuto()}
-              disabled={!file || busy || auraBusy}
-            >
-              {busy ? "Traitement en cours…" : "MASTER AUTO v3 · vidéo automatique"}
-            </button>
           )}
 
           {(busy || auraBusy) && (
@@ -2112,8 +2155,8 @@ export default function App() {
       <section className="panel result-panel">
         <div className="panel-title-row">
           <div>
-            <span className="kicker">03 · RESULTAT</span>
-            <h2>Master exportable</h2>
+            <span className="kicker">03 · MASTER</span>
+            <h2>Résultat final</h2>
           </div>
           {output && <button className="secondary-button" type="button" onClick={downloadOutput}>Télécharger</button>}
         </div>
@@ -2125,8 +2168,30 @@ export default function App() {
             </div>
             <div className="result-copy">
               <div className="success-mark">✓</div>
-              <h3>Master terminé</h3>
+              <h3>Master prêt</h3>
               <p>{output.note}</p>
+
+              <div className="result-summary">
+                <div>
+                  <span>Résolution</span>
+                  <strong>{formatDimensions(output.size)}</strong>
+                </div>
+                <div>
+                  <span>Taille</span>
+                  <strong>{(output.blob.size / 1024 / 1024).toFixed(1)} Mo</strong>
+                </div>
+                <div>
+                  <span>Traitement</span>
+                  <strong>{output.engineUsed === "ai" ? "IA locale" : "Local sécurisé"}</strong>
+                </div>
+              </div>
+
+              <details className="result-details">
+                <summary>
+                  <span>Détails techniques</span>
+                  <small>Scores, moteurs et journal complet</small>
+                </summary>
+                <div className="result-details-body">
               {output.studio && output.studio.candidates.length > 0 && (
                 <div className="studio-table-wrap">
                   <table className="studio-table">
@@ -2239,22 +2304,33 @@ export default function App() {
                   <div><dt>Cadence</dt><dd>{Math.round(output.frameRate)} i/s{output.frameRateDetected ? " détectée" : " compatibilité"}</dd></div>
                 )}
               </dl>
+                </div>
+              </details>
             </div>
           </div>
         ) : (
           <div className="empty-result">
-            <strong>Aucun master créé</strong>
-            <span>Importe un fichier, choisis une cible puis lance le traitement.</span>
+            <strong>Le master apparaîtra ici</strong>
+            <span>Importe un média puis touche « Créer le master automatiquement ».</span>
           </div>
         )}
       </section>
 
       {mode === "image" && file && output && (
-        <ComparisonPanel source={file} output={output.blob} />
+        <details className="quality-details">
+          <summary>
+            <span>Comparer avant / après</span>
+            <small>Ouvrir le Quality Lab</small>
+          </summary>
+          <ComparisonPanel source={file} output={output.blob} />
+        </details>
       )}
 
-      <section className="truth-panel">
-        <h2>Ce que fait réellement cette version</h2>
+      <details className="truth-panel">
+        <summary>
+          <span>À propos du traitement</span>
+          <small>Transparence technique et limites</small>
+        </summary>
         <p>
           Deux moteurs, deux comportements distincts. Le moteur <strong>Canvas</strong> rééchantillonne sans jamais fabriquer
           de détail : c’est de l’agrandissement honnête. Le moteur <strong>IA locale</strong> exécute un vrai modèle de
@@ -2285,9 +2361,9 @@ export default function App() {
           tel. Le 32K a été retiré : aucun navigateur actuel n’alloue un
           canvas de cette surface. Le 16K n’est proposé que si la dimension maximale mesurée sur cet appareil le permet.
         </p>
-      </section>
+      </details>
 
-      <footer>UltraVision Pro · moteurs locaux Canvas + ONNX Runtime Web · aucune dépendance Higgsfield</footer>
+      <footer>UltraVision Pro · AutoPilot local · Canvas + ONNX Runtime Web</footer>
     </main>
   );
 }
