@@ -53,9 +53,12 @@ export interface AiModelInfo {
   inputType: "float32" | "float16";
   inputLayout: "NCHW" | "NHWC";
   outputLayout: "NCHW" | "NHWC";
-  /** Le modèle a réellement exécuté une tuile RGBA avant d'être déclaré prêt. */
+  /** Le modèle a réellement exécuté plusieurs tuiles RGBA avant d'être déclaré prêt. */
   qualified: true;
   smokeTestMs: number;
+  stressTestMs: number;
+  benchmarkTileMs: number;
+  estimatedTilesPerSecond: number;
 }
 
 export type ModelSource =
@@ -119,6 +122,73 @@ export const AI_MAX_SOURCE_PIXELS = 8_000_000;
 /** Au-delà, on prévient l'utilisateur du temps de calcul. */
 export const AI_WARN_SOURCE_PIXELS = 2_000_000;
 
+export interface AiPerformanceBudget {
+  mobile: boolean;
+  deviceMemoryGb: number | null;
+  maxInputPixels: number;
+  maxOutputPixels: number;
+  maxEstimatedWorkingMb: number;
+}
+
+export interface UpscaleAiOptions {
+  /** Évite de créer une surface IA native plus grande que la cible utile. */
+  targetWidth?: number;
+  targetHeight?: number;
+  /** Limite supplémentaire de la surface intermédiaire IA. */
+  maxOutputPixels?: number;
+  /** Repli WebGPU → WASM si le device GPU tombe pendant une tuile. */
+  allowRuntimeFallback?: boolean;
+}
+
+function runtimeDeviceMemory(): number | null {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  return typeof nav.deviceMemory === "number" ? nav.deviceMemory : null;
+}
+
+function isMobileRuntime(): boolean {
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
+/**
+ * Budget de sécurité calculé avant toute grosse allocation.
+ * Le but est de préserver le navigateur : les sorties finales restent libres,
+ * mais les surfaces neuronales intermédiaires sont bornées.
+ */
+export function aiPerformanceBudget(
+  model: Pick<AiModelInfo, "scale" | "bytes" | "fixedWidth" | "fixedHeight"> | null = loadedModel(),
+): AiPerformanceBudget {
+  const memory = runtimeDeviceMemory();
+  const mobile = isMobileRuntime();
+  const lowMemory = memory !== null && memory <= 4;
+  const heavyModel = Boolean(model && model.bytes >= 24 * 1024 * 1024);
+  const x4 = Boolean(model && model.scale >= 3);
+
+  if (mobile) {
+    return {
+      mobile,
+      deviceMemoryGb: memory,
+      maxInputPixels: x4
+        ? heavyModel ? 700_000 : 1_050_000
+        : lowMemory ? 1_600_000 : 2_500_000,
+      maxOutputPixels: lowMemory ? 8_000_000 : 12_000_000,
+      maxEstimatedWorkingMb: lowMemory ? 220 : 320,
+    };
+  }
+
+  return {
+    mobile,
+    deviceMemoryGb: memory,
+    maxInputPixels: x4
+      ? heavyModel ? 2_000_000 : 3_000_000
+      : lowMemory ? 3_000_000 : 6_000_000,
+    maxOutputPixels: lowMemory ? 18_000_000 : 40_000_000,
+    maxEstimatedWorkingMb: lowMemory ? 420 : 900,
+  };
+}
+
+export function recommendedAiInputPixels(model: AiModelInfo | null = loadedModel()): number {
+  return aiPerformanceBudget(model).maxInputPixels;
+}
 
 const DESKTOP_TILE_CORE = 192;
 const MOBILE_TILE_CORE = 128;
@@ -203,16 +273,19 @@ class WorkerEngine implements Engine {
   }
 
   async load(weights: ArrayBuffer, tileSide: number, preferGpu: boolean): Promise<LoadResult> {
-    // Copie volontaire (pas de transfert) : les poids restent disponibles
-    // pour un éventuel repli sur une autre configuration.
-    const reply = await this.call({
-      id: this.nextId++,
-      type: "load",
-      weights,
-      threads: this.threads,
-      tileSide,
-      preferGpu,
-    });
+    // Transfert de propriété : pas de seconde copie de 55–70 Mo dans le
+    // thread principal pendant toute la vie du worker.
+    const reply = await this.call(
+      {
+        id: this.nextId++,
+        type: "load",
+        weights,
+        threads: this.threads,
+        tileSide,
+        preferGpu,
+      },
+      [weights],
+    );
     if (!reply.ok || reply.type !== "load") throw new Error("Réponse inattendue du worker IA.");
     return { meta: reply.meta, threads: reply.threads };
   }
@@ -246,7 +319,7 @@ class MainThreadEngine implements Engine {
     const ort = await getOrt(1);
     await releaseSession(this.session);
     this.session = null;
-    this.weights = new Uint8Array(weights.slice(0));
+    this.weights = new Uint8Array(weights);
     const created = await createSession(ort, this.weights, preferGpu);
     try {
       this.meta = await probeModel(ort, created.session, created.provider, tileSide);
@@ -366,6 +439,7 @@ function downloadWeights(url: string, onProgress?: (ratio: number) => void): Pro
 
 let engine: Engine | null = null;
 let info: AiModelInfo | null = null;
+let activeSource: ModelSource | null = null;
 /** Dernière configuration qui a fonctionné : essayée en premier ensuite. */
 let preferredPlan: string | null = null;
 
@@ -377,6 +451,13 @@ export function disposeModel(): void {
   engine?.dispose();
   engine = null;
   info = null;
+  activeSource = null;
+}
+
+function disposeEngineOnly(): void {
+  engine?.dispose();
+  engine = null;
+  info = null;
 }
 
 interface EnginePlan {
@@ -385,21 +466,8 @@ interface EnginePlan {
   make: () => Engine;
 }
 
-function smokeDimension(fixed: number | null): number {
-  if (!fixed) return 32;
-  return Math.max(4, Math.min(32, fixed));
-}
-
-async function qualifyEngine(
-  candidate: Engine,
-  meta: ModelMeta,
-): Promise<number> {
-  const width = smokeDimension(meta.fixedWidth);
-  const height = smokeDimension(meta.fixedHeight);
+function makeQualificationPattern(width: number, height: number): Uint8ClampedArray {
   const rgba = new Uint8ClampedArray(width * height * 4);
-
-  // Mire synthétique RGB + luminance : elle vérifie le chemin complet
-  // RGBA → tenseur → ONNX → pixels, pas seulement la création de session.
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const i = (y * width + x) * 4;
@@ -409,18 +477,17 @@ async function qualifyEngine(
       rgba[i + 3] = 255;
     }
   }
+  return rgba;
+}
 
-  const started = performance.now();
-  const result = await candidate.tile(
-    rgba,
-    width,
-    height,
-    { x: 0, y: 0, width, height },
-  );
-  const elapsed = performance.now() - started;
-
-  const expectedWidth = Math.max(1, Math.round(width * meta.scale));
-  const expectedHeight = Math.max(1, Math.round(height * meta.scale));
+function validateQualificationResult(
+  result: TileResult,
+  width: number,
+  height: number,
+  scale: number,
+): void {
+  const expectedWidth = Math.max(1, Math.round(width * scale));
+  const expectedHeight = Math.max(1, Math.round(height * scale));
   if (
     Math.abs(result.width - expectedWidth) > 1 ||
     Math.abs(result.height - expectedHeight) > 1
@@ -449,8 +516,7 @@ async function qualifyEngine(
   }
   const mean = sum / Math.max(1, samples);
   const variance = Math.max(0, sumSq / Math.max(1, samples) - mean * mean);
-  const meanChannelDifference =
-    channelDifference / Math.max(1, samples * 2);
+  const meanChannelDifference = channelDifference / Math.max(1, samples * 2);
 
   if (!Number.isFinite(mean) || !Number.isFinite(variance)) {
     throw new Error("Auto-test pixels : valeurs de sortie invalides.");
@@ -460,8 +526,47 @@ async function qualifyEngine(
       "Auto-test pixels : le modèle produit une sortie quasi constante ou sans réponse couleur.",
     );
   }
+}
 
-  return elapsed;
+async function qualifyEngine(
+  candidate: Engine,
+  meta: ModelMeta,
+  tileSide: number,
+): Promise<{
+  smokeTestMs: number;
+  stressTestMs: number;
+  benchmarkTileMs: number;
+  estimatedTilesPerSecond: number;
+}> {
+  const width = meta.fixedWidth ?? Math.min(96, tileSide);
+  const height = meta.fixedHeight ?? Math.min(96, tileSide);
+  const iterations = isMobileRuntime() ? 3 : 5;
+  const timings: number[] = [];
+  const stressStarted = performance.now();
+
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const rgba = makeQualificationPattern(width, height);
+    const started = performance.now();
+    const result = await candidate.tile(
+      rgba,
+      width,
+      height,
+      { x: 0, y: 0, width, height },
+    );
+    const elapsed = performance.now() - started;
+    validateQualificationResult(result, width, height, meta.scale);
+    timings.push(elapsed);
+  }
+
+  const ordered = [...timings].sort((a, b) => a - b);
+  const benchmarkTileMs = ordered[Math.floor(ordered.length / 2)] ?? timings[0] ?? 0;
+  const stressTestMs = performance.now() - stressStarted;
+  return {
+    smokeTestMs: timings[0] ?? stressTestMs,
+    stressTestMs,
+    benchmarkTileMs,
+    estimatedTilesPerSecond: benchmarkTileMs > 0 ? 1000 / benchmarkTileMs : 0,
+  };
 }
 
 function enginePlans(): EnginePlan[] {
@@ -481,52 +586,82 @@ function enginePlans(): EnginePlan[] {
   return plans;
 }
 
-export async function loadAiModel(
+async function getSourceWeights(
   source: ModelSource,
   onProgress?: (ratio: number, label: string) => void,
+): Promise<{ weights: ArrayBuffer; fromCache: boolean }> {
+  if (source.kind === "file") {
+    const weights = await source.file.arrayBuffer();
+    return { weights, fromCache: false };
+  }
+
+  const cached = await readCachedWeights(source.url);
+  if (cached) {
+    onProgress?.(0.60, "Modèle chargé depuis le cache local");
+    return { weights: cached, fromCache: true };
+  }
+
+  const weights = await downloadWeights(source.url, (ratio) =>
+    onProgress?.(
+      0.04 + ratio * 0.50,
+      `Téléchargement du modèle · ${Math.round(ratio * 100)} %`,
+    ),
+  );
+  // Stockage provisoire avant les essais : les fallbacks peuvent relire les
+  // poids depuis Cache Storage sans conserver une deuxième copie JS en RAM.
+  await storeCachedWeights(source.url, weights);
+  return { weights, fromCache: false };
+}
+
+async function loadAiModelInternal(
+  source: ModelSource,
+  onProgress: ((ratio: number, label: string) => void) | undefined,
+  preferGpu: boolean,
 ): Promise<AiModelInfo> {
   onProgress?.(0.04, "Récupération des poids du modèle");
-  let fromCache = false;
-  let weights: ArrayBuffer;
-  if (source.kind === "file") {
-    weights = await source.file.arrayBuffer();
-  } else {
-    const cached = await readCachedWeights(source.url);
-    if (cached) {
-      weights = cached;
-      fromCache = true;
-      onProgress?.(0.6, "Modèle chargé depuis le cache local");
-    } else {
-      weights = await downloadWeights(source.url, (ratio) =>
-        onProgress?.(0.04 + ratio * 0.56, `Téléchargement du modèle · ${Math.round(ratio * 100)} %`),
-      );
-    }
-  }
-  if (weights.byteLength === 0) throw new Error("Fichier de modèle vide.");
+  disposeEngineOnly();
 
-  disposeModel();
   const failures: string[] = [];
   const tileSide = runtimeTileCore();
+  let modelBytes = 0;
+  let initialFromCache = false;
 
   for (const plan of enginePlans()) {
-    onProgress?.(0.66, `Initialisation IA · ${plan.label}`);
+    onProgress?.(
+      0.60,
+      `Initialisation IA · ${plan.label} · ${preferGpu ? "WebGPU/WASM" : "WASM sécurisé"}`,
+    );
     let candidate: Engine | null = null;
     try {
+      const acquired = await getSourceWeights(source, onProgress);
+      modelBytes = acquired.weights.byteLength;
+      initialFromCache = initialFromCache || acquired.fromCache;
+      if (modelBytes === 0) throw new Error("Fichier de modèle vide.");
+
       candidate = plan.make();
-      const loaded = await candidate.load(weights, tileSide, true);
-      onProgress?.(0.86, `Qualification pixels · ${plan.label}`);
-      const smokeTestMs = await qualifyEngine(candidate, loaded.meta);
+      const loaded = await candidate.load(
+        acquired.weights,
+        tileSide,
+        preferGpu,
+      );
+      onProgress?.(0.82, `Stress-test pixels · ${plan.label}`);
+      const qualified = await qualifyEngine(candidate, loaded.meta, tileSide);
+
       engine = candidate;
       preferredPlan = plan.key;
+      activeSource = source;
       info = {
         ...loaded.meta,
-        bytes: weights.byteLength,
-        source: source.kind === "file" ? source.file.name : (source.label ?? source.url),
-        fromCache,
+        bytes: modelBytes,
+        source:
+          source.kind === "file"
+            ? source.file.name
+            : source.label ?? source.url,
+        fromCache: initialFromCache,
         execution: candidate.execution,
         threads: loaded.threads,
         qualified: true,
-        smokeTestMs,
+        ...qualified,
       };
       break;
     } catch (reason) {
@@ -536,23 +671,50 @@ export async function loadAiModel(
   }
 
   if (!engine || !info) {
-    if (fromCache && source.kind === "url") await removeCachedWeights(source.url);
-    throw new Error("Le modèle n'a pas pu être initialisé. " + failures.join(" | "));
+    if (source.kind === "url") await removeCachedWeights(source.url);
+    throw new Error(
+      "Le modèle n'a pas pu être initialisé. " + failures.join(" | "),
+    );
   }
-
-  // Mise en cache seulement après validation complète.
-  if (source.kind === "url" && !fromCache) await storeCachedWeights(source.url, weights);
 
   const details = [
     `x${info.scale}`,
     info.provider.toUpperCase(),
-    info.execution === "worker" ? `worker${info.threads > 1 ? ` ${info.threads} threads` : ""}` : "thread principal",
+    info.execution === "worker"
+      ? `worker${info.threads > 1 ? ` ${info.threads} threads` : ""}`
+      : "thread principal",
     `${info.inputLayout}→${info.outputLayout}`,
-    `auto-test ${Math.round(info.smokeTestMs)} ms`,
-    ...(fromCache ? ["cache local"] : []),
+    `stress ${Math.round(info.stressTestMs)} ms`,
+    `~${info.estimatedTilesPerSecond.toFixed(1)} tuiles/s`,
+    ...(info.fromCache ? ["cache local"] : []),
   ];
   onProgress?.(1, "Modèle prêt · " + details.join(" · "));
   return info;
+}
+
+export async function loadAiModel(
+  source: ModelSource,
+  onProgress?: (ratio: number, label: string) => void,
+): Promise<AiModelInfo> {
+  return loadAiModelInternal(source, onProgress, true);
+}
+
+async function recoverActiveModelToWasm(
+  onProgress?: (label: string) => void,
+): Promise<boolean> {
+  const source = activeSource;
+  if (!source) return false;
+  try {
+    onProgress?.("WebGPU interrompu · reconstruction du moteur en WASM");
+    await loadAiModelInternal(
+      source,
+      (_ratio, label) => onProgress?.(label),
+      false,
+    );
+    return Boolean(engine && info);
+  } catch {
+    return false;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -566,13 +728,15 @@ export async function loadAiModel(
 export async function upscaleWithAi(
   source: HTMLCanvasElement,
   onProgress?: (ratio: number, label: string) => void,
+  options: UpscaleAiOptions = {},
 ): Promise<HTMLCanvasElement> {
-  const active = engine;
-  const model = info;
+  let active = engine;
+  let model = info;
   if (!active || !model) throw new Error("Aucun modèle IA chargé.");
 
   const width = source.width;
   const height = source.height;
+  const budget = aiPerformanceBudget(model);
   if (width * height > AI_MAX_SOURCE_PIXELS) {
     throw new Error(
       `Source trop grande pour l'inférence locale (${(width * height / 1_000_000).toFixed(1)} MP, limite ${(AI_MAX_SOURCE_PIXELS / 1_000_000).toFixed(0)} MP).`,
@@ -582,34 +746,77 @@ export async function upscaleWithAi(
   const sourceCtx = source.getContext("2d", { willReadFrequently: true });
   if (!sourceCtx) throw new Error("Canvas 2D indisponible pour l'inférence.");
 
-  const scale = model.scale;
+  const nativeWidth = Math.max(1, Math.round(width * model.scale));
+  const nativeHeight = Math.max(1, Math.round(height * model.scale));
+  let destinationWidth = nativeWidth;
+  let destinationHeight = nativeHeight;
+
+  if (options.targetWidth && options.targetHeight) {
+    const targetFactor = Math.min(
+      1,
+      options.targetWidth / nativeWidth,
+      options.targetHeight / nativeHeight,
+    );
+    destinationWidth = Math.max(1, Math.round(nativeWidth * targetFactor));
+    destinationHeight = Math.max(1, Math.round(nativeHeight * targetFactor));
+  }
+
+  const outputBudget = Math.min(
+    options.maxOutputPixels ?? budget.maxOutputPixels,
+    budget.maxOutputPixels,
+  );
+  const projectedPixels = destinationWidth * destinationHeight;
+  if (projectedPixels > outputBudget) {
+    const shrink = Math.sqrt(outputBudget / projectedPixels);
+    destinationWidth = Math.max(1, Math.round(destinationWidth * shrink));
+    destinationHeight = Math.max(1, Math.round(destinationHeight * shrink));
+  }
+
   const destination = document.createElement("canvas");
-  destination.width = Math.round(width * scale);
-  destination.height = Math.round(height * scale);
+  destination.width = destinationWidth;
+  destination.height = destinationHeight;
   const destinationCtx = destination.getContext("2d");
   if (!destinationCtx) throw new Error("Canvas 2D indisponible pour la sortie IA.");
+  destinationCtx.imageSmoothingEnabled = true;
+  destinationCtx.imageSmoothingQuality = "high";
 
-  // Modèle à entrée fixe : la tuile (cœur + marges) doit tenir dans l'entrée.
   const fixedSide =
-    model.fixedWidth && model.fixedHeight ? Math.min(model.fixedWidth, model.fixedHeight) : null;
+    model.fixedWidth && model.fixedHeight
+      ? Math.min(model.fixedWidth, model.fixedHeight)
+      : null;
+  const tilePad = fixedSide
+    ? Math.max(4, Math.min(TILE_PAD, Math.floor(fixedSide * 0.08)))
+    : TILE_PAD;
   const tileCore = fixedSide
-    ? Math.max(16, Math.min(runtimeTileCore(), fixedSide - 2 * TILE_PAD))
+    ? Math.max(16, Math.min(runtimeTileCore(), fixedSide - 2 * tilePad))
     : runtimeTileCore();
+
   const columns = Math.ceil(width / tileCore);
   const rows = Math.ceil(height / tileCore);
   const total = columns * rows;
-  const unit = model.execution === "worker" ? "worker" : "main";
+  const renderScaleX = destinationWidth / width;
+  const renderScaleY = destinationHeight / height;
+  const directNativeWrite =
+    Math.abs(renderScaleX - model.scale) < 0.001 &&
+    Math.abs(renderScaleY - model.scale) < 0.001;
+  const patchCanvas = document.createElement("canvas");
+  let runtimeRecovered = false;
   let done = 0;
+
+  onProgress?.(
+    0,
+    `IA · ${total} tuiles · sortie intermédiaire ${destinationWidth}×${destinationHeight} · budget ${(outputBudget / 1_000_000).toFixed(1)} MP`,
+  );
 
   for (let ty = 0; ty < rows; ty += 1) {
     for (let tx = 0; tx < columns; tx += 1) {
       throwIfCancelled();
       const coreX = tx * tileCore;
       const coreY = ty * tileCore;
-      const startX = Math.max(0, coreX - TILE_PAD);
-      const startY = Math.max(0, coreY - TILE_PAD);
-      const endX = Math.min(width, coreX + tileCore + TILE_PAD);
-      const endY = Math.min(height, coreY + tileCore + TILE_PAD);
+      const startX = Math.max(0, coreX - tilePad);
+      const startY = Math.max(0, coreY - tilePad);
+      const endX = Math.min(width, coreX + tileCore + tilePad);
+      const endY = Math.min(height, coreY + tileCore + tilePad);
       const tileWidth = endX - startX;
       const tileHeight = endY - startY;
       const keep: KeepRect = {
@@ -619,31 +826,117 @@ export async function upscaleWithAi(
         height: Math.min(tileCore, height - coreY),
       };
 
-      const tile = sourceCtx.getImageData(startX, startY, tileWidth, tileHeight);
       let patch: TileResult;
       try {
+        const tile = sourceCtx.getImageData(
+          startX,
+          startY,
+          tileWidth,
+          tileHeight,
+        );
         patch = await active.tile(tile.data, tileWidth, tileHeight, keep);
       } catch (reason) {
-        const detail = errorText(reason);
-        throw new Error(
-          done === 0
-            ? `Ce modèle a refusé la première tuile (${tileWidth}×${tileHeight}) : ${detail}.`
-            : `Inférence interrompue à la tuile ${done + 1}/${total} : ${detail}`,
+        const canRecover =
+          options.allowRuntimeFallback !== false &&
+          !runtimeRecovered &&
+          model.provider === "webgpu";
+
+        if (canRecover) {
+          runtimeRecovered = await recoverActiveModelToWasm((label) =>
+            onProgress?.(done / total, label),
+          );
+          active = engine;
+          model = info;
+        }
+
+        if (!runtimeRecovered || !active || !model) {
+          const detail = errorText(reason);
+          throw new Error(
+            done === 0
+              ? `Ce modèle a refusé la première tuile (${tileWidth}×${tileHeight}) : ${detail}.`
+              : `Inférence interrompue à la tuile ${done + 1}/${total} : ${detail}`,
+          );
+        }
+
+        const retryTile = sourceCtx.getImageData(
+          startX,
+          startY,
+          tileWidth,
+          tileHeight,
+        );
+        patch = await active.tile(
+          retryTile.data,
+          tileWidth,
+          tileHeight,
+          keep,
         );
       }
 
       if (patch.width > 0 && patch.height > 0) {
-        destinationCtx.putImageData(
-          new ImageData(patch.data as Uint8ClampedArray<ArrayBuffer>, patch.width, patch.height),
-          Math.round(coreX * scale),
-          Math.round(coreY * scale),
-        );
+        const dx0 = Math.round(coreX * renderScaleX);
+        const dy0 = Math.round(coreY * renderScaleY);
+        const dx1 = Math.round((coreX + keep.width) * renderScaleX);
+        const dy1 = Math.round((coreY + keep.height) * renderScaleY);
+        const dw = Math.max(1, dx1 - dx0);
+        const dh = Math.max(1, dy1 - dy0);
+
+        if (
+          directNativeWrite &&
+          dw === patch.width &&
+          dh === patch.height
+        ) {
+          destinationCtx.putImageData(
+            new ImageData(
+              patch.data as Uint8ClampedArray<ArrayBuffer>,
+              patch.width,
+              patch.height,
+            ),
+            dx0,
+            dy0,
+          );
+        } else {
+          if (
+            patchCanvas.width !== patch.width ||
+            patchCanvas.height !== patch.height
+          ) {
+            patchCanvas.width = patch.width;
+            patchCanvas.height = patch.height;
+          }
+          const patchCtx = patchCanvas.getContext("2d");
+          if (!patchCtx) throw new Error("Canvas de tuile IA indisponible.");
+          patchCtx.putImageData(
+            new ImageData(
+              patch.data as Uint8ClampedArray<ArrayBuffer>,
+              patch.width,
+              patch.height,
+            ),
+            0,
+            0,
+          );
+          destinationCtx.drawImage(
+            patchCanvas,
+            0,
+            0,
+            patch.width,
+            patch.height,
+            dx0,
+            dy0,
+            dw,
+            dh,
+          );
+        }
       }
 
       done += 1;
-      onProgress?.(done / total, `Inférence IA · tuile ${done}/${total} · ${model.provider.toUpperCase()} · ${unit}`);
+      const unit = model.execution === "worker" ? "worker" : "main";
+      onProgress?.(
+        done / total,
+        `Inférence IA · tuile ${done}/${total} · ${model.provider.toUpperCase()} · ${unit}${runtimeRecovered ? " · repli runtime" : ""}`,
+      );
     }
   }
 
+  patchCanvas.width = 1;
+  patchCanvas.height = 1;
   return destination;
 }
