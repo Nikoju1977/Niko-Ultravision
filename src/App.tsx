@@ -81,6 +81,8 @@ type OutputState = {
   roiApplied?: boolean;
   roiConfidence?: number;
   studio?: StudioReport;
+  /** Archive AV-1X de la source, produite automatiquement après le master image. */
+  avx?: { state: "pending" | "ready" | "failed"; blob?: Blob; detail: string };
 } | null;
 
 const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -416,11 +418,14 @@ export default function App() {
     setDepthFocusPrecision({ ...preset.depthFocusPrecision });
   }, [mode, sceneMode, sceneAnalysis]);
 
+  // Révoquer l'URL du master uniquement quand elle change réellement : une
+  // mise à jour du résultat (archive AV-1X, scores…) garde la même URL.
+  const outputUrl = output?.url;
   useEffect(() => {
     return () => {
-      if (output?.url) URL.revokeObjectURL(output.url);
+      if (outputUrl) URL.revokeObjectURL(outputUrl);
     };
-  }, [output]);
+  }, [outputUrl]);
 
   async function handleFile(next: File | null) {
     if (!next) return;
@@ -1057,6 +1062,8 @@ export default function App() {
           ? "Master final validé · repli sécurisé"
           : "Master final validé · agents autonomes",
       );
+      // Encodage AV-1X automatique de la source, en arrière-plan.
+      void autoEncodeArchive(file, url);
     } catch (reason) {
       if (isCancelledError(reason)) {
         setStatus("Traitement annulé");
@@ -1150,6 +1157,43 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  /**
+   * Archive AV-1X automatique : après chaque master image, la source est
+   * encodée en .avx sans action de l'utilisateur. Le master reste
+   * téléchargeable immédiatement ; l'archive arrive quelques secondes après.
+   */
+  async function autoEncodeArchive(source: File, masterUrl: string) {
+    const patch = (avx: NonNullable<NonNullable<OutputState>["avx"]>) =>
+      setOutput((previous) => (previous && previous.url === masterUrl ? { ...previous, avx } : previous));
+    if (sourceSize && sourceSize.width * sourceSize.height > 12_000_000) {
+      patch({ state: "failed", detail: "Archive AV-1X non créée : source au-delà de 12 MP." });
+      return;
+    }
+    patch({ state: "pending", detail: "Encodage AV-1X automatique…" });
+    try {
+      // Laisse l'interface afficher le master avant de lancer le calcul.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const encoded = await encodeAuraVision(source);
+      const ratio = encoded.blob.size > 0 ? source.size / encoded.blob.size : 0;
+      patch({
+        state: "ready",
+        blob: encoded.blob,
+        detail: `${(encoded.blob.size / 1024).toFixed(0)} Ko${ratio > 1 ? ` · ${ratio.toFixed(1)}× plus léger que l'original` : ""}`,
+      });
+    } catch (reason) {
+      patch({
+        state: "failed",
+        detail: reason instanceof Error ? `Archive AV-1X non créée : ${reason.message}` : "Archive AV-1X non créée.",
+      });
+    }
+  }
+
+  function downloadArchive() {
+    if (!output?.avx?.blob || !file) return;
+    const base = file.name.replace(/\.[^.]+$/, "") || "ultravision";
+    downloadNamedBlob(output.avx.blob, `${base}.avx`);
   }
 
   async function runAuraEncode() {
@@ -1334,6 +1378,27 @@ export default function App() {
       setAuraBusy(false);
     }
   }
+
+  // Dépôt n'importe où dans la page : image, vidéo ou .avx (décodé automatiquement).
+  const handleFileRef = useRef(handleFile);
+  handleFileRef.current = handleFile;
+  useEffect(() => {
+    const onDragOver = (event: DragEvent) => {
+      if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
+    };
+    const onDrop = (event: DragEvent) => {
+      const dropped = event.dataTransfer?.files?.[0];
+      if (!dropped) return;
+      event.preventDefault();
+      void handleFileRef.current(dropped);
+    };
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
 
   function downloadOutput() {
     if (!output || !file) return;
@@ -2158,7 +2223,6 @@ export default function App() {
             <span className="kicker">03 · MASTER</span>
             <h2>Résultat final</h2>
           </div>
-          {output && <button className="secondary-button" type="button" onClick={downloadOutput}>Télécharger</button>}
         </div>
 
         {output ? (
@@ -2169,7 +2233,34 @@ export default function App() {
             <div className="result-copy">
               <div className="success-mark">✓</div>
               <h3>Master prêt</h3>
-              <p>{output.note}</p>
+              <div className="download-bar">
+                <button className="run-button download-primary" type="button" onClick={downloadOutput}>
+                  Télécharger le master
+                </button>
+                {output.avx && (
+                  <button
+                    className="secondary-button download-archive"
+                    type="button"
+                    onClick={downloadArchive}
+                    disabled={output.avx.state !== "ready"}
+                    title={output.avx.detail}
+                  >
+                    {output.avx.state === "ready"
+                      ? "Archive AV-1X (.avx)"
+                      : output.avx.state === "pending"
+                        ? "Archive AV-1X en cours…"
+                        : "Archive AV-1X indisponible"}
+                  </button>
+                )}
+                {output.avx && <small className="download-note">{output.avx.detail}</small>}
+              </div>
+              <p className="result-verdict">
+                {output.studio
+                  ? output.studio.winner === "classic"
+                    ? `Traitement retenu : ${output.studio.winnerLabel}. Aucune IA n'a fait mieux sans risque d'invention de détails.`
+                    : `Traitement retenu : ${output.studio.winnerLabel}, validé par le contrôle qualité.`
+                  : output.note}
+              </p>
 
               <div className="result-summary">
                 <div>
@@ -2192,6 +2283,7 @@ export default function App() {
                   <small>Scores, moteurs et journal complet</small>
                 </summary>
                 <div className="result-details-body">
+              {output.studio && <p className="result-full-note">{output.note}</p>}
               {output.studio && output.studio.candidates.length > 0 && (
                 <div className="studio-table-wrap">
                   <table className="studio-table">

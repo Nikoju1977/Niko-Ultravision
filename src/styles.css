@@ -1264,3 +1264,12 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
     gap: 5px;
   }
 }
+
+/* Téléchargements du master et de l'archive AV-1X automatique */
+.download-bar { display: grid; gap: 8px; margin: 12px 0 14px; }
+.download-bar .download-primary { width: 100%; margin: 0; }
+.download-bar .download-archive { width: 100%; min-height: 44px; }
+.download-bar .download-archive:disabled { opacity: .6; cursor: progress; }
+.download-note { color: #8a9bb3; font-size: .74rem; }
+.result-verdict { color: #c9d6e6; }
+.result-full-note { color: #8a9bb3; font-size: .78rem; margin: 0 0 10px; }
