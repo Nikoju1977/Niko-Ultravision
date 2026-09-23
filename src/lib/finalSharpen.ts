@@ -97,6 +97,38 @@ export function measureCanvasSharpness(
  * - réduit la correction sur les transitions extrêmes pour limiter les halos ;
  * - évite les aplats grâce au seuil de contour.
  */
+function sharpenRuntimeBudget(width: number): {
+  maxPixels: number;
+  stripRows: number;
+} {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const memory =
+    typeof nav.deviceMemory === "number"
+      ? nav.deviceMemory
+      : null;
+  const mobile = /Android|iPhone|iPad|iPod/i.test(
+    navigator.userAgent,
+  );
+
+  const maxPixels = mobile
+    ? memory !== null && memory <= 4
+      ? 3_500_000
+      : 6_000_000
+    : memory !== null && memory <= 4
+      ? 10_000_000
+      : 16_000_000;
+
+  const maxStripBytes = mobile ? 12 * 1024 * 1024 : 30 * 1024 * 1024;
+  const stripRows = Math.max(
+    24,
+    Math.min(
+      mobile ? 72 : 160,
+      Math.floor(maxStripBytes / Math.max(1, width * 4 * 3)),
+    ),
+  );
+  return { maxPixels, stripRows };
+}
+
 export function applyFinalAdaptiveSharpen(
   canvas: HTMLCanvasElement,
   options: FinalSharpenOptions,
@@ -104,69 +136,155 @@ export function applyFinalAdaptiveSharpen(
   const amount = clamp(options.amount, 0, 1);
   if (amount <= 0.001) return false;
 
-  const pixels = canvas.width * canvas.height;
-  if (pixels > 16_000_000) return false;
+  const width = canvas.width;
+  const height = canvas.height;
+  const pixels = width * height;
+  const budget = sharpenRuntimeBudget(width);
+  if (pixels > budget.maxPixels) return false;
 
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) return false;
 
-  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const src = new Uint8ClampedArray(image.data);
-  const dst = image.data;
-  const width = canvas.width;
-  const height = canvas.height;
   const edgeThreshold = Math.max(0, options.edgeThreshold ?? 5);
   const haloGuard = clamp(options.haloGuard ?? 0.78, 0, 1);
   const maxCorrection = Math.max(1, options.maxCorrection ?? 14);
 
-  const lumas = new Float32Array(width * height);
-  for (let i = 0, p = 0; i < src.length; i += 4, p += 1) {
-    lumas[p] = luma(src[i], src[i + 1], src[i + 2]);
-  }
+  for (
+    let startY = 0;
+    startY < height;
+    startY += budget.stripRows
+  ) {
+    const writeStart = startY;
+    const writeEnd = Math.min(
+      height,
+      startY + budget.stripRows,
+    );
+    const readStart = Math.max(0, writeStart - 1);
+    const readEnd = Math.min(height, writeEnd + 1);
+    const readHeight = readEnd - readStart;
 
-  for (let y = 1; y < height - 1; y += 1) {
-    const row = y * width;
-    for (let x = 1; x < width - 1; x += 1) {
-      const p = row + x;
-      const i = p * 4;
+    const image = ctx.getImageData(
+      0,
+      readStart,
+      width,
+      readHeight,
+    );
+    const src = new Uint8ClampedArray(image.data);
+    const dst = image.data;
 
-      const centerY = lumas[p];
-      const leftY = lumas[p - 1];
-      const rightY = lumas[p + 1];
-      const upY = lumas[p - width];
-      const downY = lumas[p + width];
+    const localWriteStart = writeStart - readStart;
+    const localWriteEnd = writeEnd - readStart;
 
-      const edge =
-        (Math.abs(rightY - leftY) + Math.abs(downY - upY)) * 0.5;
-      if (edge < edgeThreshold) continue;
+    for (
+      let y = localWriteStart;
+      y < localWriteEnd;
+      y += 1
+    ) {
+      const globalY = readStart + y;
+      if (globalY <= 0 || globalY >= height - 1) continue;
+      const row = y * width;
 
-      const lapY = centerY * 4 - leftY - rightY - upY - downY;
-      const structure = clamp((edge - edgeThreshold) / 42, 0, 1);
-      const haloProtection = 1 - clamp(Math.abs(lapY) / 120, 0, 1) * haloGuard;
-      const localAmount = amount * (0.18 + structure * 0.82) * clamp(haloProtection, 0.18, 1);
+      for (let x = 1; x < width - 1; x += 1) {
+        const p = row + x;
+        const i = p * 4;
 
-      const left = i - 4;
-      const right = i + 4;
-      const up = i - width * 4;
-      const down = i + width * 4;
+        const centerY = luma(
+          src[i],
+          src[i + 1],
+          src[i + 2],
+        );
 
-      for (let channel = 0; channel < 3; channel += 1) {
-        const center = src[i + channel];
-        const lap =
-          center * 4 -
-          src[left + channel] -
-          src[right + channel] -
-          src[up + channel] -
-          src[down + channel];
+        const li = i - 4;
+        const ri = i + 4;
+        const ui = i - width * 4;
+        const di = i + width * 4;
 
-        const correction = clamp(lap * localAmount * 0.24, -maxCorrection, maxCorrection);
-        dst[i + channel] = clamp255(center + correction);
+        const leftY = luma(
+          src[li],
+          src[li + 1],
+          src[li + 2],
+        );
+        const rightY = luma(
+          src[ri],
+          src[ri + 1],
+          src[ri + 2],
+        );
+        const upY = luma(
+          src[ui],
+          src[ui + 1],
+          src[ui + 2],
+        );
+        const downY = luma(
+          src[di],
+          src[di + 1],
+          src[di + 2],
+        );
+
+        const edge =
+          (
+            Math.abs(rightY - leftY) +
+            Math.abs(downY - upY)
+          ) *
+          0.5;
+        if (edge < edgeThreshold) continue;
+
+        const lapY =
+          centerY * 4 -
+          leftY -
+          rightY -
+          upY -
+          downY;
+        const structure = clamp(
+          (edge - edgeThreshold) / 42,
+          0,
+          1,
+        );
+        const haloProtection =
+          1 -
+          clamp(Math.abs(lapY) / 120, 0, 1) *
+            haloGuard;
+        const localAmount =
+          amount *
+          (0.18 + structure * 0.82) *
+          clamp(haloProtection, 0.18, 1);
+
+        for (let channel = 0; channel < 3; channel += 1) {
+          const center = src[i + channel];
+          const lap =
+            center * 4 -
+            src[li + channel] -
+            src[ri + channel] -
+            src[ui + channel] -
+            src[di + channel];
+
+          const correction = clamp(
+            lap * localAmount * 0.24,
+            -maxCorrection,
+            maxCorrection,
+          );
+          dst[i + channel] = clamp255(
+            center + correction,
+          );
+        }
+        dst[i + 3] = src[i + 3];
       }
-      dst[i + 3] = src[i + 3];
+    }
+
+    const offset = localWriteStart * width * 4;
+    const length =
+      (localWriteEnd - localWriteStart) * width * 4;
+    if (length > 0) {
+      const output = new ImageData(
+        new Uint8ClampedArray(
+          dst.buffer.slice(offset, offset + length),
+        ),
+        width,
+        localWriteEnd - localWriteStart,
+      );
+      ctx.putImageData(output, 0, writeStart);
     }
   }
 
-  ctx.putImageData(image, 0, 0);
   return true;
 }
 
