@@ -32,6 +32,10 @@ import {
   measureCanvasSharpness,
 } from "./finalSharpen";
 import { detectSmallSubjectRoi, enhanceRoiLocally } from "./roiSubject";
+import {
+  applyPerceptualImagingCore,
+  type PerceptualImagingReport,
+} from "./perceptualImagingCore";
 
 export type ImageFormat = "image/png" | "image/jpeg" | "image/webp";
 export type EngineId = "canvas" | "ai";
@@ -73,6 +77,12 @@ export interface ImageEnhanceResult {
   roiApplied: boolean;
   roiConfidence: number;
   roiBox: { x: number; y: number; width: number; height: number } | null;
+  perceptualCoreApplied: boolean;
+  perceptualCoreCoverage: number;
+  perceptualCoreMeanCorrection: number;
+  perceptualCoreDenoiseContribution: number;
+  perceptualCoreDetailContribution: number;
+  perceptualCoreReason?: string;
 }
 
 export interface ImageTargetAssessment {
@@ -197,7 +207,9 @@ function resampleTo(
 
     nextCtx.imageSmoothingEnabled = true;
     nextCtx.imageSmoothingQuality = "high";
-    nextCtx.filter = filter;
+    const finalPass =
+      nextWidth === output.width && nextHeight === output.height;
+    nextCtx.filter = finalPass ? filter : "none";
     nextCtx.drawImage(canvas, 0, 0, nextWidth, nextHeight);
 
     release(canvas);
@@ -484,6 +496,65 @@ export async function enhanceImage(
     const restoredBeforeFinal =
       deepFocusApplied || precisionRestoreApplied || depthFocusApplied;
 
+    // Perceptual Imaging Core : finition déterministe créée pour UltraVision.
+    // Elle travaille avant le sharpen final afin de débruiter les aplats,
+    // restaurer les contours existants et réduire le risque de halos.
+    onProgress?.(0.925, "Perceptual Imaging Core · restauration");
+    const perceptualSettings =
+      profile === "detail"
+        ? {
+            detailStrength: engineUsed === "ai" ? 0.22 : 0.34,
+            denoiseStrength: 0.16,
+            haloProtection: 0.88,
+            maxCorrection: 11,
+          }
+        : profile === "archive"
+          ? {
+              detailStrength: 0.12,
+              denoiseStrength: 0.34,
+              haloProtection: 0.94,
+              maxCorrection: 9,
+            }
+          : profile === "cinema"
+            ? {
+                detailStrength: 0.15,
+                denoiseStrength: 0.25,
+                haloProtection: 0.92,
+                maxCorrection: 9,
+              }
+            : {
+                detailStrength: engineUsed === "ai" ? 0.13 : 0.19,
+                denoiseStrength: 0.22,
+                haloProtection: 0.93,
+                maxCorrection: 8,
+              };
+
+    if (restoredBeforeFinal) {
+      perceptualSettings.detailStrength *= 0.72;
+    }
+
+    let perceptualReport: PerceptualImagingReport;
+    try {
+      perceptualReport = await applyPerceptualImagingCore(
+        current,
+        perceptualSettings,
+        (ratio, label) =>
+          onProgress?.(0.925 + ratio * 0.018, label),
+      );
+    } catch (reason) {
+      perceptualReport = {
+        applied: false,
+        processedCoverage: 0,
+        meanAbsCorrection: 0,
+        denoiseContribution: 0,
+        detailContribution: 0,
+        skippedReason:
+          reason instanceof Error
+            ? reason.message
+            : "Perceptual Imaging Core indisponible.",
+      };
+    }
+
     // Netteté Pro v2 : on ne coupe plus la finition finale quand une
     // restauration amont a travaillé. On réduit simplement son intensité.
     // La passe finale est calculée sur la résolution de sortie afin que le
@@ -514,7 +585,7 @@ export async function enhanceImage(
         ? (sharpnessAfter - sharpnessBefore) / sharpnessBefore
         : 0;
 
-    onProgress?.(0.96, "Encodage du master");
+    onProgress?.(0.965, "Encodage du master");
     const blob = await toBlob(current, format, format === "image/png" ? 1 : 0.96);
     if (blob.size === 0) throw new Error("L'encodeur image a produit un fichier vide.");
 
@@ -555,6 +626,15 @@ export async function enhanceImage(
       roiApplied,
       roiConfidence,
       roiBox,
+      perceptualCoreApplied: perceptualReport.applied,
+      perceptualCoreCoverage: perceptualReport.processedCoverage,
+      perceptualCoreMeanCorrection:
+        perceptualReport.meanAbsCorrection,
+      perceptualCoreDenoiseContribution:
+        perceptualReport.denoiseContribution,
+      perceptualCoreDetailContribution:
+        perceptualReport.detailContribution,
+      perceptualCoreReason: perceptualReport.skippedReason,
     };
   } finally {
     decoded.close();
