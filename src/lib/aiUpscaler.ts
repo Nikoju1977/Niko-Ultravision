@@ -15,6 +15,10 @@
 
 import { throwIfCancelled } from "./cancellation";
 import {
+  recordModelPerformanceFailure,
+  recordModelPerformanceSuccess,
+} from "./devicePerformanceProfile";
+import {
   createSession,
   errorText,
   getOrt,
@@ -663,6 +667,13 @@ async function loadAiModelInternal(
         qualified: true,
         ...qualified,
       };
+      recordModelPerformanceSuccess(info.source, {
+        provider: info.provider,
+        execution: info.execution,
+        scale: info.scale,
+        benchmarkTileMs: info.benchmarkTileMs,
+        estimatedTilesPerSecond: info.estimatedTilesPerSecond,
+      });
       break;
     } catch (reason) {
       candidate?.dispose();
@@ -672,6 +683,14 @@ async function loadAiModelInternal(
 
   if (!engine || !info) {
     if (source.kind === "url") await removeCachedWeights(source.url);
+    const label =
+      source.kind === "file"
+        ? source.file.name
+        : source.label ?? source.url;
+    recordModelPerformanceFailure(
+      label,
+      failures.join(" | ") || "initialisation impossible",
+    );
     throw new Error(
       "Le modèle n'a pas pu être initialisé. " + failures.join(" | "),
     );

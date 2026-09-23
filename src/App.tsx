@@ -36,6 +36,7 @@ import { PROFILES, type ProfileId } from "./lib/profiles";
 import { beginJob, isCancelled, isCancelledError, requestCancel, throwIfCancelled } from "./lib/cancellation";
 import type { StudioReport } from "./lib/restoration/autoStudio";
 import { runAgenticImageMaster } from "./lib/agenticMaster";
+import { runAgenticVideoMaster } from "./lib/agenticVideoMaster";
 import {
   qualifyAllRestorationModels,
   type ModelHealthReport,
@@ -967,7 +968,15 @@ export default function App() {
       setAgentDecisions(master.decisions);
       if (master.plan.target !== target) setTarget(master.plan.target);
       if (master.plan.profile !== profile) setProfile(master.plan.profile);
+      if (master.plan.format !== format) setFormat(master.plan.format);
       if (master.plan.engine !== engine) setEngine(master.plan.engine);
+      setSceneMode("auto");
+      setSceneAnalysis(master.autopilot.scene);
+      setDeepFocus({ ...master.autopilot.scenePreset.deepFocus });
+      setPrecisionRestore({ ...master.autopilot.scenePreset.precisionRestore });
+      setDepthFocusPrecision({
+        ...master.autopilot.scenePreset.depthFocusPrecision,
+      });
       const active = loadedModel();
       if (active) setModel(active);
 
@@ -975,9 +984,18 @@ export default function App() {
       const report = master.studio;
       const url = URL.createObjectURL(result.blob);
       const notes: string[] = [
+        ...master.autopilot.rationale.map(
+          (entry) => `AutoPilot v3 : ${entry}`,
+        ),
         ...master.decisions.map(
           (entry) => `${entry.label} : ${entry.message}`,
         ),
+        ...(master.duel
+          ? [
+              `Duel final : ${master.duel.rationale}`,
+              `Duel SSIM : IA ${master.duel.primary.ssimToSource.toFixed(4)} · classique ${master.duel.classic.ssimToSource.toFixed(4)} · marge ${master.duel.margin.toFixed(2)}.`,
+            ]
+          : []),
         `Validation finale : ${master.validation.message}`,
         `Master : ${master.validation.width}×${master.validation.height} · ${(master.validation.bytes / 1024 / 1024).toFixed(2)} Mo.`,
       ];
@@ -1031,6 +1049,84 @@ export default function App() {
           reason instanceof Error
             ? reason.message
             : "Le master agentique a échoué.",
+        );
+        setStatus("Erreur");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runVideoAuto() {
+    if (!file || !sourceSize || mode !== "video" || busy || auraBusy) return;
+    beginJob();
+    setBusy(true);
+    setError(null);
+    setProgress(0);
+    setAgentDecisions([]);
+    setOutput((previous) => {
+      if (previous?.url) URL.revokeObjectURL(previous.url);
+      return null;
+    });
+
+    try {
+      const master = await runAgenticVideoMaster({
+        file,
+        sourceSize,
+        mistralEnabled,
+        mistralApiKey,
+        mistralModel,
+        onProgress: (value, label) => {
+          setProgress(value);
+          setStatus(label);
+        },
+      });
+
+      setAgentDecisions(master.decisions);
+      if (master.plan.target !== target) setTarget(master.plan.target);
+      if (master.plan.profile !== profile) setProfile(master.plan.profile);
+      setIntent(master.plan.intent);
+      setVideoNeuralAi(master.neuralRequested && master.neuralReady);
+      const active = loadedModel();
+      if (active) setModel(active);
+
+      const result = master.result;
+      const url = URL.createObjectURL(result.blob);
+      setOutput({
+        url,
+        blob: result.blob,
+        size: result.size,
+        codecLabel: result.streamCopied
+          ? "Copie directe (aucun réencodage)"
+          : result.plan
+            ? `${result.plan.codec.toUpperCase()} · ${result.plan.container.toUpperCase()} · ${result.plan.keyFrameInterval === 0 ? "tout intra" : `clé/${result.plan.keyFrameInterval}s`}`
+            : "MediaRecorder",
+        notes: [
+          ...master.decisions.map(
+            (entry) => `${entry.label} : ${entry.message}`,
+          ),
+          ...result.notes,
+          `Validation finale : ${master.validation.message}`,
+        ],
+        note:
+          `Master Auto Agentique vidéo · ${master.plan.target} · ${master.plan.profile}. ` +
+          (master.neuralRequested && master.neuralReady
+            ? "Neural Video SR autorisé avec replis automatiques."
+            : "Temporal/codec automatique avec replis de sécurité."),
+        frameRate: result.frameRate,
+        frameRateDetected: result.frameRateDetected,
+      });
+      setProgress(1);
+      setStatus("Master vidéo final validé · AutoPilot v3");
+    } catch (reason) {
+      if (isCancelledError(reason)) {
+        setStatus("Traitement annulé");
+        setProgress(0);
+      } else {
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : "Le master vidéo automatique a échoué.",
         );
         setStatus("Erreur");
       }
@@ -1950,13 +2046,29 @@ export default function App() {
               onClick={() => void runStudio()}
               disabled={!file || busy || auraBusy}
             >
-              {busy ? "Traitement en cours…" : "MASTER AUTO · agents + meilleur résultat"}
+              {busy ? "Traitement en cours…" : "MASTER AUTO v3 · tout automatique"}
             </button>
           )}
 
-          <button className="run-button" type="button" onClick={() => void runEnhancement()} disabled={!file || busy}>
-            {busy ? "Traitement en cours…" : mode === "image" ? "Master rapide" : "Créer le master local"}
-          </button>
+          {mode === "image" ? (
+            <button
+              className="run-button"
+              type="button"
+              onClick={() => void runEnhancement()}
+              disabled={!file || busy}
+            >
+              {busy ? "Traitement en cours…" : "Mode Expert · lancer les réglages courants"}
+            </button>
+          ) : (
+            <button
+              className="run-button studio-button"
+              type="button"
+              onClick={() => void runVideoAuto()}
+              disabled={!file || busy || auraBusy}
+            >
+              {busy ? "Traitement en cours…" : "MASTER AUTO v3 · vidéo automatique"}
+            </button>
+          )}
 
           {(busy || auraBusy) && (
             <button

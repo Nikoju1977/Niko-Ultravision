@@ -1,4 +1,12 @@
 import { aiEngineAvailable, loadedModel, webGpuAvailable } from "./aiUpscaler";
+import {
+  buildAutopilotImagePlan,
+  type AutopilotImagePlan,
+} from "./autopilotPolicy";
+import {
+  duelFinalMasters,
+  type FinalMasterDuel,
+} from "./finalMasterDuel";
 import { isCancelledError, throwIfCancelled } from "./cancellation";
 import type { DepthFocusSettings } from "./depth/depthTypes";
 import type { DeepFocusSettings } from "./deepFocus";
@@ -38,6 +46,8 @@ export interface AgenticImageMasterResult {
   validation: MasterValidationReport;
   decisions: AgentDecision[];
   usedEmergencyFallback: boolean;
+  autopilot: AutopilotImagePlan;
+  duel: FinalMasterDuel | null;
 }
 
 function decision(
@@ -63,25 +73,26 @@ export async function runAgenticImageMaster(
   const {
     file,
     sourceSize,
-    target,
-    profile,
-    format,
     intent,
-    deepFocus,
-    precisionRestore,
-    depthFocusPrecision,
     onProgress,
   } = options;
 
-  onProgress?.(0.02, "Agent Superviseur · mission master");
+  onProgress?.(0.01, "AutoPilot v3 · politique automatique");
+  const autopilot = await buildAutopilotImagePlan(file, sourceSize);
+  const deepFocus = autopilot.scenePreset.deepFocus;
+  const precisionRestore = autopilot.scenePreset.precisionRestore;
+  const depthFocusPrecision =
+    autopilot.scenePreset.depthFocusPrecision;
+
+  onProgress?.(0.04, "Agent Superviseur · mission master");
   const plan = await orchestrateMediaAgents({
     file,
     mode: "image",
     sourceSize,
-    target,
-    profile,
+    target: autopilot.target,
+    profile: autopilot.profile,
     engine: loadedModel() ? "ai" : "canvas",
-    format,
+    format: autopilot.format,
     intent,
     aiModelLoaded: Boolean(loadedModel()),
     aiAvailable: aiEngineAvailable(),
@@ -95,13 +106,14 @@ export async function runAgenticImageMaster(
       "supervisor",
       "Agent Master",
       "ok",
-      "Pipeline autonome engagé : diagnostic, candidats, Evidence Gate, traitement pleine résolution, validation finale.",
+      "AutoPilot v3 engagé : cible, format et réglages de restauration automatiques, Evidence Gate, traitement pleine résolution, duel final et validation.",
     ),
   ];
 
   let result: ImageEnhanceResult | null = null;
   let studio: StudioReport | null = null;
   let usedEmergencyFallback = false;
+  let duel: FinalMasterDuel | null = null;
 
   try {
     onProgress?.(0.10, "Agents experts · benchmark des moteurs");
@@ -134,6 +146,56 @@ export async function runAgenticImageMaster(
         `${studio.winnerLabel} a produit le master pleine résolution après ${studio.finalAttempts.length} tentative(s) finale(s).`,
       ),
     );
+
+    // Duel final : un gagnant IA n'est conservé que s'il bat réellement une
+    // baseline déterministe produite avec les mêmes réglages de restauration.
+    if (result.engineUsed === "ai") {
+      onProgress?.(0.89, "Agent Vérité · baseline déterministe finale");
+      const classic = await enhanceImage(
+        file,
+        plan.target,
+        plan.profile,
+        plan.format,
+        {
+          engine: "canvas",
+          deepFocus,
+          precisionRestore,
+          depthFocusPrecision,
+          smallSubjectRoi: {
+            enabled: true,
+            strength: plan.profile === "detail" ? 0.86 : 0.76,
+          },
+          onProgress: (value, label) =>
+            onProgress?.(0.89 + value * 0.045, label),
+        },
+      );
+
+      onProgress?.(0.936, "Agent Vérité · duel final");
+      duel = await duelFinalMasters(
+        file,
+        result.blob,
+        classic.blob,
+      );
+
+      if (duel.winner === "classic") {
+        result = classic;
+        studio.winner = "classic";
+        studio.winnerLabel = "Baseline déterministe";
+        studio.decision += " " + duel.rationale;
+      } else {
+        studio.decision += " " + duel.rationale;
+      }
+
+      decisions.push(
+        decision(
+          "quality",
+          "Agent Vérité",
+          "ok",
+          duel.rationale +
+            ` SSIM IA ${duel.primary.ssimToSource.toFixed(4)} vs classique ${duel.classic.ssimToSource.toFixed(4)}.`,
+        ),
+      );
+    }
   } catch (reason) {
     if (isCancelledError(reason)) throw reason;
     usedEmergencyFallback = true;
@@ -167,7 +229,7 @@ export async function runAgenticImageMaster(
   }
 
   throwIfCancelled();
-  onProgress?.(0.91, "Agent Validation · contrôle du master final");
+  onProgress?.(0.95, "Agent Validation · contrôle du master final");
   let validation = await validateImageMaster(result.blob, result.size);
 
   if (!validation.valid && result.engineUsed === "ai") {
@@ -192,7 +254,7 @@ export async function runAgenticImageMaster(
         depthFocusPrecision,
         smallSubjectRoi: { enabled: true, strength: 0.76 },
         onProgress: (value, label) =>
-          onProgress?.(0.91 + value * 0.07, label),
+          onProgress?.(0.95 + value * 0.04, label),
       },
     );
     result = deterministic;
@@ -223,5 +285,7 @@ export async function runAgenticImageMaster(
     validation,
     decisions,
     usedEmergencyFallback,
+    autopilot,
+    duel,
   };
 }

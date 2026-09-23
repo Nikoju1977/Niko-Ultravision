@@ -1,4 +1,4 @@
-import { AI_MAX_SOURCE_PIXELS } from "./aiUpscaler";
+
 import { decodeImageFile } from "./imageDecode";
 import { assessImageTarget, type EngineId, type ImageFormat } from "./imageEnhancer";
 import { calculateOutputSize, megapixels, type Size, type TargetId } from "./geometry";
@@ -627,8 +627,6 @@ export async function orchestrateMediaAgents(context: AgentContext): Promise<Age
 
     const output = calculateOutputSize(context.sourceSize.width, context.sourceSize.height, target);
     const scale = Math.max(output.width / context.sourceSize.width, output.height / context.sourceSize.height);
-    const sourcePixels = context.sourceSize.width * context.sourceSize.height;
-
     if ((context.aiModelLoaded || context.aiAvailable) && scale >= 1.35) {
       engine = "ai";
       decisions.push(
@@ -642,11 +640,10 @@ export async function orchestrateMediaAgents(context: AgentContext): Promise<Age
       );
     } else {
       engine = "canvas";
-      const reason = !context.aiModelLoaded
-        ? "modèle ONNX non chargé"
-        : sourcePixels > AI_MAX_SOURCE_PIXELS
-          ? "source trop grande pour l'IA locale"
-          : "agrandissement trop faible pour justifier l'IA";
+      const reason =
+        scale < 1.35
+          ? "agrandissement trop faible pour justifier l'IA"
+          : "runtime IA local indisponible";
       decisions.push(d("upscale", "Agent Upscale", "ok", "Canvas haute qualité retenu : " + reason + "."));
     }
 
