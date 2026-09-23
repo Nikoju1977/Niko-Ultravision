@@ -855,6 +855,9 @@ export default function App() {
             (result.roiApplied
               ? `Petit sujet ROI renforcé localement (confiance ${Math.round(result.roiConfidence * 100)} %). `
               : "") +
+            (result.perceptualCoreApplied
+              ? `Perceptual Imaging Core appliqué sur ${Math.round(result.perceptualCoreCoverage * 100)} % des pixels utiles. `
+              : "") +
             (result.engineUsed === "ai"
               ? `Super-résolution IA x${result.aiScale} (${result.aiProvider?.toUpperCase()}) puis normalisation géométrique vers la cible.`
               : result.sharpenApplied
@@ -876,6 +879,13 @@ export default function App() {
             ...(result.deepFocusReason ? [`Deep Focus : ${result.deepFocusReason}`] : []),
             ...(result.precisionRestoreReason ? [`Precision Restore : ${result.precisionRestoreReason}`] : []),
             ...(result.depthFocusReason ? [`Depth Focus Precision : ${result.depthFocusReason}`] : []),
+            ...(result.perceptualCoreApplied
+              ? [
+                  `Perceptual Imaging Core : couverture ${Math.round(result.perceptualCoreCoverage * 100)} % · correction moyenne ${result.perceptualCoreMeanCorrection.toFixed(2)} niveaux · contribution détail ${result.perceptualCoreDetailContribution.toFixed(2)} · débruitage ${result.perceptualCoreDenoiseContribution.toFixed(2)}.`,
+                ]
+              : result.perceptualCoreReason
+                ? [`Perceptual Imaging Core : ${result.perceptualCoreReason}`]
+                : []),
           ],
         });
       } else {
@@ -1020,6 +1030,13 @@ export default function App() {
       notes.push(
         `Validation netteté finale : ${(result.sharpnessBefore * 100).toFixed(2)} % → ${(result.sharpnessAfter * 100).toFixed(2)} %.`,
       );
+      if (result.perceptualCoreApplied) {
+        notes.push(
+          `Perceptual Imaging Core : couverture ${Math.round(result.perceptualCoreCoverage * 100)} % · correction moyenne ${result.perceptualCoreMeanCorrection.toFixed(2)} niveaux · détail ${result.perceptualCoreDetailContribution.toFixed(2)} · débruitage ${result.perceptualCoreDenoiseContribution.toFixed(2)}.`,
+        );
+      } else if (result.perceptualCoreReason) {
+        notes.push(`Perceptual Imaging Core : ${result.perceptualCoreReason}`);
+      }
 
       setOutput({
         url,
