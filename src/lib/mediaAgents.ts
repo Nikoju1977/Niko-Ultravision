@@ -50,6 +50,8 @@ export interface AgentContext {
   format: ImageFormat;
   intent: CodecIntent;
   aiModelLoaded: boolean;
+  /** Le runtime IA local est disponible même si aucun modèle n'est encore chargé. */
+  aiAvailable?: boolean;
   webGpu: boolean;
   mistralEnabled?: boolean;
   mistralApiKey?: string;
@@ -627,7 +629,7 @@ export async function orchestrateMediaAgents(context: AgentContext): Promise<Age
     const scale = Math.max(output.width / context.sourceSize.width, output.height / context.sourceSize.height);
     const sourcePixels = context.sourceSize.width * context.sourceSize.height;
 
-    if (context.aiModelLoaded && sourcePixels <= AI_MAX_SOURCE_PIXELS && scale >= 1.35) {
+    if ((context.aiModelLoaded || context.aiAvailable) && scale >= 1.35) {
       engine = "ai";
       decisions.push(
         d(

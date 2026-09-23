@@ -961,9 +961,17 @@ export async function decodeAuraVision(
       try {
         const runInference = async () => {
           const started = performance.now();
-          const output = await upscaleWithAi(baseCanvas, (ratio, label) => {
-            onProgress?.(0.30 + ratio * 0.32, label);
-          });
+          const output = await upscaleWithAi(
+            baseCanvas,
+            (ratio, label) => {
+              onProgress?.(0.30 + ratio * 0.32, label);
+            },
+            {
+              targetWidth: width,
+              targetHeight: height,
+              allowRuntimeFallback: true,
+            },
+          );
           return { output, elapsed: performance.now() - started };
         };
 

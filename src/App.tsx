@@ -34,7 +34,8 @@ import {
 } from "./lib/aiUpscaler";
 import { PROFILES, type ProfileId } from "./lib/profiles";
 import { beginJob, isCancelled, isCancelledError, requestCancel, throwIfCancelled } from "./lib/cancellation";
-import { runAutoStudio, type StudioReport } from "./lib/restoration/autoStudio";
+import type { StudioReport } from "./lib/restoration/autoStudio";
+import { runAgenticImageMaster } from "./lib/agenticMaster";
 import {
   qualifyAllRestorationModels,
   type ModelHealthReport,
@@ -476,7 +477,8 @@ export default function App() {
       setModelStatus(
         `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ` +
           `${loaded.execution === "worker" ? `worker${loaded.threads > 1 ? ` ${loaded.threads} threads` : ""}` : "thread principal"} · ` +
-          `${loaded.inputLayout}→${loaded.outputLayout} · auto-test pixels ${Math.round(loaded.smokeTestMs)} ms · ` +
+          `${loaded.inputLayout}→${loaded.outputLayout} · stress ${Math.round(loaded.stressTestMs)} ms · ` +
+          `~${loaded.estimatedTilesPerSecond.toFixed(1)} tuiles/s · ` +
           `${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo${loaded.fromCache ? " · cache local" : ""}`,
       );
       return loaded;
@@ -939,34 +941,50 @@ export default function App() {
     setBusy(true);
     setError(null);
     setProgress(0);
+    setAgentDecisions([]);
     setOutput((previous) => {
       if (previous?.url) URL.revokeObjectURL(previous.url);
       return null;
     });
+
     try {
-      const { result, report } = await runAutoStudio(file, target, profile, format, {
+      const master = await runAgenticImageMaster({
+        file,
+        sourceSize,
+        target,
+        profile,
+        format,
+        intent,
         deepFocus,
         precisionRestore,
         depthFocusPrecision,
-        smallSubjectRoi: { enabled: smallSubjectMode, strength: profile === "detail" ? 0.92 : 0.82 },
         onProgress: (value, label) => {
           setProgress(value);
           setStatus(label);
         },
       });
+
+      setAgentDecisions(master.decisions);
+      if (master.plan.target !== target) setTarget(master.plan.target);
+      if (master.plan.profile !== profile) setProfile(master.plan.profile);
+      if (master.plan.engine !== engine) setEngine(master.plan.engine);
       const active = loadedModel();
       if (active) setModel(active);
-      const d = report.diagnosis;
+
+      const result = master.result;
+      const report = master.studio;
       const url = URL.createObjectURL(result.blob);
-      setOutput({
-        url,
-        blob: result.blob,
-        size: result.size,
-        engineUsed: result.engineUsed,
-        aiPasses: result.aiPasses,
-        studio: report,
-        note: `Studio Auto · ${report.plan.label} → ${report.winnerLabel}. ${report.decision}`,
-        notes: [
+      const notes: string[] = [
+        ...master.decisions.map(
+          (entry) => `${entry.label} : ${entry.message}`,
+        ),
+        `Validation finale : ${master.validation.message}`,
+        `Master : ${master.validation.width}×${master.validation.height} · ${(master.validation.bytes / 1024 / 1024).toFixed(2)} Mo.`,
+      ];
+
+      if (report) {
+        const d = report.diagnosis;
+        notes.push(
           `Diagnostic : bruit σ ${d.noise.toFixed(1)} · netteté ${d.sharpness.toFixed(0)} · blocs JPEG ${d.blockiness.toFixed(2)} · contraste ${d.contrast} · couleur ${d.colorfulness.toFixed(1)} (variation ${d.colorVariation.toFixed(1)}).`,
           ...d.reasons.map((reason) => `Analyse : ${reason}.`),
           `Evidence Gate : ${report.probeCount} zones témoins · confiance source moyenne ${Math.round(report.meanSourceConfidence * 100)} % · ${report.resourceProfile}.`,
@@ -974,17 +992,46 @@ export default function App() {
             ? [`Consensus IA : désaccord moyen ${(report.meanAiDisagreement * 100).toFixed(1)} % entre modèles valides.`]
             : []),
           ...report.regionalEvidence.map((entry) => `Région : ${entry}.`),
-          `Validation netteté finale : ${(result.sharpnessBefore * 100).toFixed(2)} % → ${(result.sharpnessAfter * 100).toFixed(2)} %.`,
-        ],
+          ...report.finalAttempts.map(
+            (attempt) =>
+              `Master final · ${attempt.label} : ${attempt.status === "ok" ? "OK" : "échec" + (attempt.error ? " · " + attempt.error : "")}.`,
+          ),
+        );
+      }
+
+      notes.push(
+        `Validation netteté finale : ${(result.sharpnessBefore * 100).toFixed(2)} % → ${(result.sharpnessAfter * 100).toFixed(2)} %.`,
+      );
+
+      setOutput({
+        url,
+        blob: result.blob,
+        size: result.size,
+        engineUsed: result.engineUsed,
+        aiPasses: result.aiPasses,
+        studio: report ?? undefined,
+        note: report
+          ? `Master Auto Agentique · ${report.plan.label} → ${report.winnerLabel}. ${report.decision}`
+          : `Master Auto Agentique · repli déterministe sécurisé. ${master.validation.message}`,
+        notes,
       });
+
       setProgress(1);
-      setStatus("Master prêt · Studio Auto");
+      setStatus(
+        master.usedEmergencyFallback
+          ? "Master final validé · repli sécurisé"
+          : "Master final validé · agents autonomes",
+      );
     } catch (reason) {
       if (isCancelledError(reason)) {
         setStatus("Traitement annulé");
         setProgress(0);
       } else {
-        setError(reason instanceof Error ? reason.message : "Studio Auto a échoué.");
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : "Le master agentique a échoué.",
+        );
         setStatus("Erreur");
       }
     } finally {
@@ -1445,7 +1492,8 @@ export default function App() {
                           <th>Backend</th>
                           <th>Échelle</th>
                           <th>Layout</th>
-                          <th>Auto-test</th>
+                          <th>Stress</th>
+                          <th>Débit</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1465,17 +1513,23 @@ export default function App() {
                                 : "—"}
                             </td>
                             <td title={entry.error ?? ""}>
-                              {entry.smokeTestMs !== null
-                                ? `${Math.round(entry.smokeTestMs)} ms`
+                              {entry.stressTestMs !== null
+                                ? `${Math.round(entry.stressTestMs)} ms`
                                 : entry.error ?? "—"}
+                            </td>
+                            <td>
+                              {entry.estimatedTilesPerSecond !== null
+                                ? `${entry.estimatedTilesPerSecond.toFixed(1)} t/s`
+                                : "—"}
                             </td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                     <p className="model-note">
-                      Ce test charge chaque modèle du registre et lui impose une vraie inférence RGBA. Le premier passage
-                      peut télécharger plus de 200 Mo ; les poids validés sont ensuite conservés dans le cache local.
+                      Ce test charge chaque modèle du registre et exécute plusieurs vraies inférences RGBA. Il mesure
+                      aussi le débit de tuiles. Le premier passage peut télécharger plus de 200 Mo ; les poids validés
+                      sont ensuite conservés dans le cache local.
                     </p>
                   </div>
                 )}
@@ -1483,9 +1537,9 @@ export default function App() {
                 {modelStatus && <div className="model-status">{modelStatus}</div>}
                 {aiNeedsPreparation && (
                   <div className="warning-card">
-                    Source de {(sourcePixels / 1_000_000).toFixed(1)} MP : UltraVision ne coupe plus l'IA. Une surface
-                    neuronale sûre sera préparée automatiquement, puis traitée par tuiles avant normalisation vers la
-                    cible. Le master final conserve la définition demandée.
+                    Source de {(sourcePixels / 1_000_000).toFixed(1)} MP : le Performance Governor adapte automatiquement
+                    la surface d'entrée et borne la surface neuronale intermédiaire selon le modèle, la mémoire et la cible.
+                    Le master final conserve la définition demandée.
                   </div>
                 )}
                 {aiSlow && engine === "ai" && (
@@ -1855,7 +1909,7 @@ export default function App() {
             <div className="agent-head">
               <div>
                 <strong>AutoPilot agents Image + Vidéo</strong>
-                <span>7 agents image · 8 agents vidéo locaux · +1 agent Mistral Vision optionnel. Audit de présence à chaque traitement.</span>
+                <span>Chaîne autonome : superviseur, vision, qualité, mémoire, moteurs IA, Evidence Gate, Recovery et validation du master final.</span>
               </div>
               <span className="badge ok">ACTIF</span>
             </div>
@@ -1896,7 +1950,7 @@ export default function App() {
               onClick={() => void runStudio()}
               disabled={!file || busy || auraBusy}
             >
-              {busy ? "Traitement en cours…" : "Studio Auto · meilleur résultat"}
+              {busy ? "Traitement en cours…" : "MASTER AUTO · agents + meilleur résultat"}
             </button>
           )}
 

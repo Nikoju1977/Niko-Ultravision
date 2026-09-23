@@ -370,7 +370,15 @@ function createFrameProcessor(profile: ProfileId, output: Size, neuralAi = false
         aiInputCtx.restore();
 
         try {
-          const neural = await upscaleWithAi(aiInputCanvas);
+          const neural = await upscaleWithAi(
+            aiInputCanvas,
+            undefined,
+            {
+              targetWidth: workWidth,
+              targetHeight: workHeight,
+              allowRuntimeFallback: true,
+            },
+          );
           const guideAlpha =
             profile === "detail"
               ? 0.62
