@@ -127,6 +127,15 @@ async function bitmapIsTrustworthy(file: Blob, bitmap: DecodedImage): Promise<bo
 }
 
 export async function decodeImageFile(file: Blob): Promise<DecodedImage> {
+  // Android : décodage logiciel standard du navigateur en priorité
+  // (createImageBitmap peut rester sur le GPU et se relire corrompu).
+  if (/android/i.test(navigator.userAgent)) {
+    try {
+      return await decodeHtmlImage(file);
+    } catch {
+      // Continue avec les autres stratégies.
+    }
+  }
   const directBitmap = await decodeBitmap(file);
   if (directBitmap) {
     if (await bitmapIsTrustworthy(file, directBitmap)) return directBitmap;

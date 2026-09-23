@@ -1,3 +1,6 @@
+import { installAndroidPixelSafety } from "./lib/androidSafety";
+// Doit précéder toute création de canvas.
+installAndroidPixelSafety();
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";

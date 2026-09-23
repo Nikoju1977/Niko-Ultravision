@@ -715,7 +715,9 @@ export async function loadAiModel(
   source: ModelSource,
   onProgress?: (ratio: number, label: string) => void,
 ): Promise<AiModelInfo> {
-  return loadAiModelInternal(source, onProgress, true);
+  // Android : WASM uniquement. WebGPU mobile produit des sorties corrompues
+  // sur certains pilotes ; la précision prime sur la vitesse.
+  return loadAiModelInternal(source, onProgress, !/android/i.test(navigator.userAgent));
 }
 
 async function recoverActiveModelToWasm(
@@ -853,7 +855,9 @@ export async function upscaleWithAi(
           tileWidth,
           tileHeight,
         );
+        const expected = gridMeans(tile.data, tileWidth, keep.x, keep.y, keep.width, keep.height);
         patch = await active.tile(tile.data, tileWidth, tileHeight, keep);
+        assertTileCoherent(patch, expected, done + 1, total);
       } catch (reason) {
         const canRecover =
           options.allowRuntimeFallback !== false &&
@@ -883,12 +887,14 @@ export async function upscaleWithAi(
           tileWidth,
           tileHeight,
         );
+        const retryExpected = gridMeans(retryTile.data, tileWidth, keep.x, keep.y, keep.width, keep.height);
         patch = await active.tile(
           retryTile.data,
           tileWidth,
           tileHeight,
           keep,
         );
+        assertTileCoherent(patch, retryExpected, done + 1, total);
       }
 
       if (patch.width > 0 && patch.height > 0) {
@@ -958,4 +964,68 @@ export async function upscaleWithAi(
   patchCanvas.width = 1;
   patchCanvas.height = 1;
   return destination;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Contrôle de cohérence de chaque tuile IA                             */
+/* ------------------------------------------------------------------ */
+
+const TILE_GRID = 4;
+
+/** Moyennes RVB sur une grille 4×4 d'une zone d'image RGBA. */
+function gridMeans(
+  data: Uint8ClampedArray,
+  stride: number,
+  x0: number,
+  y0: number,
+  width: number,
+  height: number,
+): Float32Array {
+  const out = new Float32Array(TILE_GRID * TILE_GRID * 3);
+  const counts = new Float32Array(TILE_GRID * TILE_GRID);
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 32));
+  for (let y = 0; y < height; y += step) {
+    const gy = Math.min(TILE_GRID - 1, Math.floor((y / height) * TILE_GRID));
+    for (let x = 0; x < width; x += step) {
+      const gx = Math.min(TILE_GRID - 1, Math.floor((x / width) * TILE_GRID));
+      const cell = gy * TILE_GRID + gx;
+      const o = ((y0 + y) * stride + (x0 + x)) * 4;
+      out[cell * 3] += data[o];
+      out[cell * 3 + 1] += data[o + 1];
+      out[cell * 3 + 2] += data[o + 2];
+      counts[cell] += 1;
+    }
+  }
+  for (let cell = 0; cell < counts.length; cell += 1) {
+    const n = Math.max(1, counts[cell]);
+    out[cell * 3] /= n;
+    out[cell * 3 + 1] /= n;
+    out[cell * 3 + 2] /= n;
+  }
+  return out;
+}
+
+/**
+ * Une super-résolution ou une restauration conserve les couleurs moyennes
+ * locales de la source. Une tuile qui s'en écarte fortement est corrompue
+ * (pilote GPU, relecture brouillée) : l'IA est arrêtée et le repli prend le
+ * relais, au lieu de livrer une image rayée.
+ */
+function assertTileCoherent(patch: TileResult, expected: Float32Array, index: number, total: number): void {
+  if (patch.width < TILE_GRID || patch.height < TILE_GRID) return;
+  const actual = gridMeans(patch.data, patch.width, 0, 0, patch.width, patch.height);
+  let diff = 0;
+  let worst = 0;
+  for (let i = 0; i < actual.length; i += 1) {
+    const d = Math.abs(actual[i] - expected[i]);
+    diff += d;
+    if (d > worst) worst = d;
+  }
+  const mean = diff / actual.length;
+  if (mean > 14 || worst > 60) {
+    throw new Error(
+      `Tuile IA ${index}/${total} incohérente avec la source (écart moyen ${mean.toFixed(1)}, max ${worst.toFixed(0)}) : sortie corrompue, IA arrêtée.`,
+    );
+  }
 }
