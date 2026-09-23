@@ -2,8 +2,8 @@ export interface PersistedModelPerformance {
   label: string;
   successCount: number;
   failureCount: number;
-  lastProvider: "webgpu" | "wasm" | null;
-  lastExecution: "worker" | "main" | null;
+  lastProvider: string | null;
+  lastExecution: string | null;
   lastScale: number | null;
   benchmarkTileMs: number | null;
   estimatedTilesPerSecond: number | null;
@@ -74,8 +74,8 @@ function writeProfile(profile: DevicePerformanceProfile): void {
 export function recordModelPerformanceSuccess(
   label: string,
   details: {
-    provider: "webgpu" | "wasm";
-    execution: "worker" | "main";
+    provider: string;
+    execution: string;
     scale: number;
     benchmarkTileMs: number;
     estimatedTilesPerSecond: number;
