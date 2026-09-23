@@ -4,6 +4,8 @@ import { compareImageQuality, type QualityComparison, type ZoneComparison } from
 interface Props {
   source: Blob;
   output: Blob;
+  /** Comparaison déjà calculée par le verrou final : aucun recalcul. */
+  report?: QualityComparison;
 }
 
 type ViewMode = "compare" | "difference" | "text" | "edge" | "flat" | "central";
@@ -31,7 +33,7 @@ function ZoneCard({ label, zone }: { label: string; zone: ZoneComparison }) {
   );
 }
 
-export default function ComparisonPanel({ source, output }: Props) {
+export default function ComparisonPanel({ source, output, report: precomputed }: Props) {
   const [report, setReport] = useState<QualityComparison | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [position, setPosition] = useState(50);
@@ -42,6 +44,13 @@ export default function ComparisonPanel({ source, output }: Props) {
     setReport(null);
     setError(null);
     setView("compare");
+
+    if (precomputed) {
+      setReport(precomputed);
+      return () => {
+        alive = false;
+      };
+    }
 
     void compareImageQuality(source, output)
       .then((next) => {
@@ -54,7 +63,7 @@ export default function ComparisonPanel({ source, output }: Props) {
     return () => {
       alive = false;
     };
-  }, [source, output]);
+  }, [source, output, precomputed]);
 
   const summary = useMemo(() => {
     if (!report) return null;

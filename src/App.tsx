@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import DeepFocusControl, { type DeepFocusSettings } from "./DeepFocusControl";
 import ComparisonPanel from "./ComparisonPanel";
+import type { QualityComparison } from "./lib/qualityComparator";
 import PrecisionRestoreControl, { type PrecisionRestoreSettings } from "./PrecisionRestoreControl";
 import ScenePrecisionControl from "./ScenePrecisionControl";
 import DepthFocusControl, { type DepthFocusSettings } from "./DepthFocusControl";
@@ -83,6 +84,8 @@ type OutputState = {
   studio?: StudioReport;
   /** Archive AV-1X de la source, produite automatiquement après le master image. */
   avx?: { state: "pending" | "ready" | "failed"; blob?: Blob; detail: string };
+  /** Comparaison master ↔ original calculée avant la livraison. */
+  comparison?: QualityComparison;
 } | null;
 
 const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -997,6 +1000,31 @@ export default function App() {
 
       const result = master.result;
       const report = master.studio;
+
+      // Archive AV-1X produite AVANT la livraison : quand le master s'affiche,
+      // tout est terminé.
+      let avx: NonNullable<NonNullable<OutputState>["avx"]>;
+      if (sourceSize.width * sourceSize.height > 12_000_000) {
+        avx = { state: "failed", detail: "Archive AV-1X non créée : source au-delà de 12 MP." };
+      } else {
+        try {
+          setStatus("Archive AV-1X · encodage");
+          setProgress(0.995);
+          const encoded = await encodeAuraVision(file);
+          const ratio = encoded.blob.size > 0 ? file.size / encoded.blob.size : 0;
+          avx = {
+            state: "ready",
+            blob: encoded.blob,
+            detail: `${(encoded.blob.size / 1024).toFixed(0)} Ko${ratio > 1 ? ` · ${ratio.toFixed(1)}× plus léger que l'original` : ""}`,
+          };
+        } catch (reason) {
+          avx = {
+            state: "failed",
+            detail: reason instanceof Error ? `Archive AV-1X non créée : ${reason.message}` : "Archive AV-1X non créée.",
+          };
+        }
+      }
+      throwIfCancelled();
       const url = URL.createObjectURL(result.blob);
       const notes: string[] = [
         ...master.autopilot.rationale.map(
@@ -1050,6 +1078,8 @@ export default function App() {
         engineUsed: result.engineUsed,
         aiPasses: result.aiPasses,
         studio: report ?? undefined,
+        comparison: master.comparison,
+        avx,
         note: report
           ? `Master Auto Agentique · ${report.plan.label} → ${report.winnerLabel}. ${report.decision}`
           : `Master Auto Agentique · repli déterministe sécurisé. ${master.validation.message}`,
@@ -1062,8 +1092,7 @@ export default function App() {
           ? "Master final validé · repli sécurisé"
           : "Master final validé · agents autonomes",
       );
-      // Encodage AV-1X automatique de la source, en arrière-plan.
-      void autoEncodeArchive(file, url);
+
     } catch (reason) {
       if (isCancelledError(reason)) {
         setStatus("Traitement annulé");
@@ -1156,37 +1185,6 @@ export default function App() {
       }
     } finally {
       setBusy(false);
-    }
-  }
-
-  /**
-   * Archive AV-1X automatique : après chaque master image, la source est
-   * encodée en .avx sans action de l'utilisateur. Le master reste
-   * téléchargeable immédiatement ; l'archive arrive quelques secondes après.
-   */
-  async function autoEncodeArchive(source: File, masterUrl: string) {
-    const patch = (avx: NonNullable<NonNullable<OutputState>["avx"]>) =>
-      setOutput((previous) => (previous && previous.url === masterUrl ? { ...previous, avx } : previous));
-    if (sourceSize && sourceSize.width * sourceSize.height > 12_000_000) {
-      patch({ state: "failed", detail: "Archive AV-1X non créée : source au-delà de 12 MP." });
-      return;
-    }
-    patch({ state: "pending", detail: "Encodage AV-1X automatique…" });
-    try {
-      // Laisse l'interface afficher le master avant de lancer le calcul.
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      const encoded = await encodeAuraVision(source);
-      const ratio = encoded.blob.size > 0 ? source.size / encoded.blob.size : 0;
-      patch({
-        state: "ready",
-        blob: encoded.blob,
-        detail: `${(encoded.blob.size / 1024).toFixed(0)} Ko${ratio > 1 ? ` · ${ratio.toFixed(1)}× plus léger que l'original` : ""}`,
-      });
-    } catch (reason) {
-      patch({
-        state: "failed",
-        detail: reason instanceof Error ? `Archive AV-1X non créée : ${reason.message}` : "Archive AV-1X non créée.",
-      });
     }
   }
 
@@ -2414,7 +2412,7 @@ export default function App() {
             <span>Comparer avant / après</span>
             <small>Ouvrir le Quality Lab</small>
           </summary>
-          <ComparisonPanel source={file} output={output.blob} />
+          <ComparisonPanel source={file} output={output.blob} report={output.comparison} />
         </details>
       )}
 

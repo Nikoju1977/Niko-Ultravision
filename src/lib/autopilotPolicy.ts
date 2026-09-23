@@ -1,3 +1,4 @@
+import { calculateOutputSize } from "./geometry";
 import { assessImageTarget, type ImageFormat } from "./imageEnhancer";
 import type { Size, TargetId } from "./geometry";
 import type { ProfileId } from "./profiles";
@@ -45,9 +46,8 @@ function targetCandidates(
   if (longSide >= 3840) return ["original"];
 
   if (longSide >= 1900) {
-    return hasStableAi
-      ? ["4k", "2k", "original"]
-      : ["2k", "4k", "original"];
+    // Entre 1900 et 3840 px, seule la 4K agrandit réellement.
+    return ["4k", "original"];
   }
 
   if (longSide >= 1100) {
@@ -85,7 +85,14 @@ export async function buildAutopilotImagePlan(
       entry.lastError === null,
   );
 
-  const candidates = targetCandidates(source, hasStableAi);
+  // Règle absolue : une cible n'est jamais plus petite que la source.
+  // (Une source 1080×2400 en « 2K » donnait 922×2048 : une réduction.)
+  const sourceLong = Math.max(source.width, source.height);
+  const candidates = targetCandidates(source, hasStableAi).filter((candidate) => {
+    if (candidate === "original") return true;
+    const size = calculateOutputSize(source.width, source.height, candidate);
+    return Math.max(size.width, size.height) >= sourceLong * 1.1;
+  });
   let target: TargetId = "original";
   for (const candidate of candidates) {
     if (assessImageTarget(source, candidate).supported) {

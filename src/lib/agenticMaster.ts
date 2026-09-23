@@ -1,3 +1,6 @@
+import { compareImageQuality, type QualityComparison } from "./qualityComparator";
+import { decodeImageFile } from "./imageDecode";
+import { canvas2d, unsharpMask } from "./restoration/imageMath";
 import { aiEngineAvailable, loadedModel, webGpuAvailable } from "./aiUpscaler";
 import {
   buildAutopilotImagePlan,
@@ -46,6 +49,8 @@ export interface AgenticImageMasterResult {
   validation: MasterValidationReport;
   decisions: AgentDecision[];
   usedEmergencyFallback: boolean;
+  /** Comparaison finale master ↔ original, calculée avant la livraison. */
+  comparison: QualityComparison;
   autopilot: AutopilotImagePlan;
   duel: FinalMasterDuel | null;
 }
@@ -276,9 +281,63 @@ export async function runAgenticImageMaster(
       `Master validé : ${validation.width}×${validation.height} · ${(validation.bytes / 1024 / 1024).toFixed(2)} Mo · fichier décodable et dimensions conformes.`,
     ),
   );
-  onProgress?.(1, "Master final validé");
+  // Verrou final ORIGINAL : le master doit être au moins aussi net que la
+  // source. Sinon un candidat « Original fidèle » (agrandissement haute
+  // qualité seul, sans lissage) est produit et le meilleur des deux gagne.
+  throwIfCancelled();
+  onProgress?.(0.965, "Verrou final · comparaison avec l'original");
+  let comparison = await compareImageQuality(file, result.blob);
+  const losesDetail = (c: QualityComparison) =>
+    c.sharpnessGainPercent < -2 || c.edgeGainPercent < -2;
+  const smallerThanSource =
+    result.size.width < sourceSize.width || result.size.height < sourceSize.height;
+  if (smallerThanSource || losesDetail(comparison)) {
+    onProgress?.(0.975, "Verrou final · candidat Original fidèle");
+    const faithful = await faithfulMaster(file, result.size, plan.format);
+    const faithfulComparison = await compareImageQuality(file, faithful.blob);
+    const score = (c: QualityComparison) => c.sharpnessGainPercent + c.edgeGainPercent;
+    const before = comparison;
+    if (smallerThanSource || score(faithfulComparison) > score(before)) {
+      result = { ...result, blob: faithful.blob, size: faithful.size, engineUsed: "canvas", aiPasses: 0 };
+      comparison = faithfulComparison;
+      if (studio) {
+        studio.winner = "classic";
+        studio.winnerLabel = "Original fidèle";
+      }
+      decisions.push(
+        decision(
+          "quality",
+          "Verrou Original",
+          "warning",
+          `Master refusé : ${smallerThanSource ? "plus petit que la source, " : ""}moins net que l'original (micro-détail ${before.sharpnessGainPercent.toFixed(1)} %, contours ${before.edgeGainPercent.toFixed(1)} %). ` +
+            `Remplacé par l'Original fidèle (micro-détail ${faithfulComparison.sharpnessGainPercent.toFixed(1)} %, contours ${faithfulComparison.edgeGainPercent.toFixed(1)} %).`,
+        ),
+      );
+    } else {
+      decisions.push(
+        decision(
+          "quality",
+          "Verrou Original",
+          "warning",
+          `Master conservé : l'Original fidèle n'a pas fait mieux (micro-détail ${faithfulComparison.sharpnessGainPercent.toFixed(1)} %).`,
+        ),
+      );
+    }
+  } else {
+    decisions.push(
+      decision(
+        "quality",
+        "Verrou Original",
+        "ok",
+        `Master au moins aussi net que l'original : micro-détail ${comparison.sharpnessGainPercent >= 0 ? "+" : ""}${comparison.sharpnessGainPercent.toFixed(1)} %, contours ${comparison.edgeGainPercent >= 0 ? "+" : ""}${comparison.edgeGainPercent.toFixed(1)} %.`,
+      ),
+    );
+  }
+
+  onProgress?.(0.99, "Master final validé");
 
   return {
+    comparison,
     result,
     studio,
     plan,
@@ -288,4 +347,40 @@ export async function runAgenticImageMaster(
     autopilot,
     duel,
   };
+}
+
+
+/**
+ * Candidat « Original fidèle » : l'original agrandi à la taille du master par
+ * le rééchantillonnage haute qualité du navigateur, puis une accentuation
+ * légère. Aucun débruitage, aucun lissage : rien ne peut effacer du détail.
+ */
+async function faithfulMaster(
+  file: Blob,
+  size: { width: number; height: number },
+  format: string,
+): Promise<{ blob: Blob; size: { width: number; height: number } }> {
+  const decoded = await decodeImageFile(file);
+  try {
+    const width = Math.max(size.width, decoded.width);
+    const height = Math.max(size.height, decoded.height);
+    const { canvas, ctx } = canvas2d(width, height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(decoded.source, 0, 0, width, height);
+    const upscale = width / decoded.width;
+    if (upscale > 1.05) unsharpMask(canvas, Math.min(0.6, 0.25 + 0.2 * (upscale - 1)));
+    const blob = await new Promise<Blob>((resolve, reject) =>
+      canvas.toBlob(
+        (value) => (value ? resolve(value) : reject(new Error("Encodage de l'Original fidèle impossible."))),
+        format === "image/jpeg" || format === "image/webp" ? format : "image/png",
+        0.95,
+      ),
+    );
+    canvas.width = 1;
+    canvas.height = 1;
+    return { blob, size: { width, height } };
+  } finally {
+    decoded.close();
+  }
 }
