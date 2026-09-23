@@ -9,9 +9,10 @@
  *                   ↓
  *        le gagnant traite l'image entière
  *
- * Les candidats sont départagés sur deux zones témoins (la plus détaillée et
- * une zone plate) : on obtient la décision en quelques secondes au lieu de
- * faire tourner chaque modèle sur toute l'image.
+ * Studio Auto v2 utilise plusieurs zones témoins, un Evidence Gate et un
+ * superviseur de repli. Les candidats ne traitent l'image entière qu'après
+ * validation locale ; si le gagnant plante à pleine résolution, le candidat
+ * sûr suivant est essayé automatiquement jusqu'au master final.
  */
 import { decodeImageFile } from "../imageDecode";
 import { calculateOutputSize, type TargetId } from "../geometry";
@@ -74,6 +75,12 @@ export interface StudioReport {
   meanAiDisagreement: number | null;
   resourceProfile: string;
   regionalEvidence: string[];
+  finalAttempts: Array<{
+    id: CandidateId;
+    label: string;
+    status: "ok" | "failed";
+    error: string | null;
+  }>;
 }
 
 export interface StudioResult {
@@ -640,37 +647,128 @@ export async function runAutoStudio(
     decision = "Aucun candidat IA valide après les contraintes QC : référence classique conservée.";
   }
 
-  const winnerId: CandidateId = winner?.id ?? "classic";
+  const selectedWinnerId: CandidateId = winner?.id ?? "classic";
   throwIfCancelled();
 
-  // Traitement complet avec le seul gagnant.
-  let result: ImageEnhanceResult;
-  if (winnerId === "classic") {
-    onProgress?.(0.55, "Studio Auto · traitement final classique");
-    result = await enhanceImage(file, target, profile, format, {
-      ...enhanceOptions,
-      engine: "canvas",
-      onProgress: (value, label) => onProgress?.(0.55 + value * 0.45, label),
-    });
-  } else {
-    const model = RESTORATION_MODELS[winnerId];
-    if (loadedModel()?.source !== model.label) {
-      onProgress?.(0.52, `Studio Auto · rechargement ${model.label}`);
-      await loadAiModel({ kind: "url", url: model.url, label: model.label });
-    }
-    onProgress?.(0.55, `Studio Auto · traitement final ${model.label}`);
-    result = await enhanceImage(file, target, profile, format, {
-      ...enhanceOptions,
-      engine: "ai",
-      onProgress: (value, label) => onProgress?.(0.55 + value * 0.45, label),
-    });
-  }
-
+  // Les probes ne sont plus utiles : on libère leur mémoire AVANT le master
+  // pleine résolution, afin de ne pas cumuler canvases de benchmark + ONNX.
   for (const outputs of zoneOutputs.values()) {
     for (const canvas of outputs) {
       canvas.width = 1;
       canvas.height = 1;
     }
+  }
+  zoneOutputs.clear();
+
+  const finalAttempts: StudioReport["finalAttempts"] = [];
+  const aiFallbacks = validAi
+    .filter((candidate) => candidate.id !== selectedWinnerId)
+    .sort((a, b) => evidenceScore(b) - evidenceScore(a));
+
+  const finalOrder: CandidateReport[] = [];
+  const selectedCandidate =
+    candidates.find((candidate) => candidate.id === selectedWinnerId) ??
+    classic;
+  if (selectedCandidate) finalOrder.push(selectedCandidate);
+
+  // Si le gagnant IA tombe à pleine résolution, le superviseur tente les
+  // autres IA déjà validées sur probes, puis la référence classique.
+  if (selectedWinnerId !== "classic") {
+    finalOrder.push(...aiFallbacks);
+    if (classic && !finalOrder.some((entry) => entry.id === "classic")) {
+      finalOrder.push(classic);
+    }
+  }
+
+  if (!finalOrder.length && classic) finalOrder.push(classic);
+
+  let result: ImageEnhanceResult | null = null;
+  let actualWinner: CandidateReport | undefined;
+  let lastFailure: unknown = null;
+
+  for (let index = 0; index < finalOrder.length; index += 1) {
+    throwIfCancelled();
+    const candidate = finalOrder[index];
+    const stageBase = 0.55;
+    const stageSpan = 0.45;
+    try {
+      if (candidate.id === "classic") {
+        onProgress?.(
+          stageBase,
+          index === 0
+            ? "Studio Auto · master déterministe"
+            : "Agent Recovery · repli déterministe final",
+        );
+        result = await enhanceImage(file, target, profile, format, {
+          ...enhanceOptions,
+          engine: "canvas",
+          onProgress: (value, label) =>
+            onProgress?.(stageBase + value * stageSpan, label),
+        });
+      } else {
+        const model = RESTORATION_MODELS[candidate.id];
+        if (loadedModel()?.source !== model.label) {
+          onProgress?.(
+            0.52,
+            `Agent Runtime · chargement final ${model.label}`,
+          );
+          await loadAiModel({
+            kind: "url",
+            url: model.url,
+            label: model.label,
+          });
+        }
+        onProgress?.(
+          stageBase,
+          index === 0
+            ? `Studio Auto · master final ${model.label}`
+            : `Agent Recovery · essai ${model.label}`,
+        );
+        result = await enhanceImage(file, target, profile, format, {
+          ...enhanceOptions,
+          engine: "ai",
+          onProgress: (value, label) =>
+            onProgress?.(stageBase + value * stageSpan, label),
+        });
+      }
+
+      finalAttempts.push({
+        id: candidate.id,
+        label: candidate.label,
+        status: "ok",
+        error: null,
+      });
+      actualWinner = candidate;
+      break;
+    } catch (reason) {
+      if (isCancelledError(reason)) throw reason;
+      lastFailure = reason;
+      const message = errorText(reason);
+      finalAttempts.push({
+        id: candidate.id,
+        label: candidate.label,
+        status: "failed",
+        error: message,
+      });
+      candidate.error = message;
+      onProgress?.(
+        0.54,
+        `Agent Recovery · ${candidate.label} indisponible, repli automatique`,
+      );
+    }
+  }
+
+  if (!result || !actualWinner) {
+    throw new Error(
+      "Aucun moteur n'a pu produire le master final. " +
+        errorText(lastFailure),
+    );
+  }
+
+  if (actualWinner.id !== selectedWinnerId) {
+    decision +=
+      ` Le gagnant initial ${winner?.label ?? selectedWinnerId} a échoué à pleine résolution ; ` +
+      `Agent Recovery a finalisé avec ${actualWinner.label}.`;
   }
 
   return {
@@ -679,8 +777,8 @@ export async function runAutoStudio(
       diagnosis,
       plan,
       candidates,
-      winner: winnerId,
-      winnerLabel: winner?.label ?? classicLabel,
+      winner: actualWinner.id,
+      winnerLabel: actualWinner.label,
       decision,
       evaluationScale,
       qcMode,
@@ -695,6 +793,7 @@ export async function runAutoStudio(
       meanAiDisagreement,
       resourceProfile: resources.label,
       regionalEvidence,
+      finalAttempts,
     },
   };
 }
