@@ -1,7 +1,12 @@
 import { calculateOutputSize, megapixels, type Size, type TargetId } from "./geometry";
 import { PROFILES, type ProfileId } from "./profiles";
 import { canAllocateCanvas, canvasLimits } from "./capability";
-import { AI_MAX_SOURCE_PIXELS, loadedModel, upscaleWithAi } from "./aiUpscaler";
+import {
+  AI_MAX_SOURCE_PIXELS,
+  loadedModel,
+  recommendedAiInputPixels,
+  upscaleWithAi,
+} from "./aiUpscaler";
 import { decodeImageFile } from "./imageDecode";
 import {
   applyDeepFocus,
@@ -331,63 +336,50 @@ export async function enhanceImage(
     if (engine === "ai") {
       const model = loadedModel();
       if (!model) throw new Error("Moteur IA sélectionné mais aucun modèle n'est chargé.");
-      // Les grandes photos de smartphone ne sont plus exclues de l'IA.
-      // On construit une surface neuronale maîtrisée puis l'inférence reste
-      // tuilée dans aiUpscaler. Cela évite de créer directement une sortie
-      // x2/x4 de dizaines de mégapixels en RAM sur Android.
-      if (source.width * source.height > AI_MAX_SOURCE_PIXELS) {
-        const android =
-          typeof navigator !== "undefined" &&
-          /Android/i.test(navigator.userAgent);
-        const deviceSafePixels = android ? 2_200_000 : 4_000_000;
-        const targetDrivenPixels = Math.max(
-          1_000_000,
-          Math.floor(
-            output.width * output.height /
-            Math.max(1, model.scale * model.scale),
-          ),
-        );
-        const workingPixelBudget = Math.min(
-          deviceSafePixels,
-          targetDrivenPixels,
-        );
-        const currentPixels = current.width * current.height;
-        const scale = Math.min(
-          1,
-          Math.sqrt(workingPixelBudget / Math.max(1, currentPixels)),
-        );
+      // Performance Governor : la limite dépend désormais du modèle chargé,
+      // de son facteur x2/x4, de sa taille et de la mémoire déclarée par le
+      // navigateur. Elle s'applique même sous 8 MP afin d'éviter qu'un x4
+      // transforme silencieusement 2 MP en une surface intermédiaire >30 MP.
+      const workingPixelBudget = Math.min(
+        AI_MAX_SOURCE_PIXELS,
+        recommendedAiInputPixels(model),
+      );
+      const currentPixels = current.width * current.height;
+      const scale = Math.min(
+        1,
+        Math.sqrt(workingPixelBudget / Math.max(1, currentPixels)),
+      );
 
-        if (scale < 0.999) {
-          const preparedWidth = Math.max(64, Math.round(current.width * scale));
-          const preparedHeight = Math.max(64, Math.round(current.height * scale));
-          const prepared = canvasFor(preparedWidth, preparedHeight);
-          const preparedCtx = prepared.getContext("2d");
-          if (!preparedCtx) {
-            throw new Error("Canvas de préparation IA indisponible.");
-          }
-          preparedCtx.imageSmoothingEnabled = true;
-          preparedCtx.imageSmoothingQuality = "high";
-          preparedCtx.drawImage(
-            current,
-            0,
-            0,
-            current.width,
-            current.height,
-            0,
-            0,
-            preparedWidth,
-            preparedHeight,
-          );
-          release(current);
-          current = prepared;
-          aiPreparedInput = true;
-          aiPreparedWorkingMegapixels =
-            preparedWidth * preparedHeight / 1_000_000;
-          onProgress?.(
-            0.56,
-            `Préparation IA mobile · ${aiPreparedSourceMegapixels.toFixed(1)} MP → ${aiPreparedWorkingMegapixels.toFixed(1)} MP`,
-          );
+      if (scale < 0.999) {
+        const preparedWidth = Math.max(64, Math.round(current.width * scale));
+        const preparedHeight = Math.max(64, Math.round(current.height * scale));
+        const prepared = canvasFor(preparedWidth, preparedHeight);
+        const preparedCtx = prepared.getContext("2d");
+        if (!preparedCtx) {
+          throw new Error("Canvas de préparation IA indisponible.");
         }
+        preparedCtx.imageSmoothingEnabled = true;
+        preparedCtx.imageSmoothingQuality = "high";
+        preparedCtx.drawImage(
+          current,
+          0,
+          0,
+          current.width,
+          current.height,
+          0,
+          0,
+          preparedWidth,
+          preparedHeight,
+        );
+        release(current);
+        current = prepared;
+        aiPreparedInput = true;
+        aiPreparedWorkingMegapixels =
+          preparedWidth * preparedHeight / 1_000_000;
+        onProgress?.(
+          0.56,
+          `Performance Governor · ${aiPreparedSourceMegapixels.toFixed(1)} MP → ${aiPreparedWorkingMegapixels.toFixed(1)} MP avant IA x${model.scale}`,
+        );
       }
 
       // Pro Max : un léger pré-traitement de la ROI avant la super-résolution
@@ -407,9 +399,17 @@ export async function enhanceImage(
       );
 
       onProgress?.(0.58, "Inférence IA · passe 1");
-      let inferred = await upscaleWithAi(current, (ratio, label) => {
-        onProgress?.(0.58 + ratio * 0.16, label);
-      });
+      let inferred = await upscaleWithAi(
+        current,
+        (ratio, label) => {
+          onProgress?.(0.58 + ratio * 0.16, label);
+        },
+        {
+          targetWidth: output.width,
+          targetHeight: output.height,
+          allowRuntimeFallback: true,
+        },
+      );
       release(current);
       current = inferred;
       aiPasses = 1;
@@ -432,17 +432,26 @@ export async function enhanceImage(
 
       if (secondPassSafe) {
         onProgress?.(0.75, "Inférence IA · passe 2");
-        inferred = await upscaleWithAi(current, (ratio, label) => {
-          onProgress?.(0.75 + ratio * 0.10, label);
-        });
+        inferred = await upscaleWithAi(
+          current,
+          (ratio, label) => {
+            onProgress?.(0.75 + ratio * 0.10, label);
+          },
+          {
+            targetWidth: output.width,
+            targetHeight: output.height,
+            allowRuntimeFallback: true,
+          },
+        );
         release(current);
         current = inferred;
         aiPasses = 2;
       }
 
       engineUsed = "ai";
-      aiScale = model.scale;
-      aiProvider = model.provider;
+      const effectiveModel = loadedModel() ?? model;
+      aiScale = effectiveModel.scale;
+      aiProvider = effectiveModel.provider;
     }
 
     onProgress?.(engineUsed === "ai" ? 0.81 : 0.58, "Normalisation géométrique");
