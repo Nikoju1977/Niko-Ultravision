@@ -476,7 +476,8 @@ export default function App() {
       setModelStatus(
         `${loaded.source} · x${loaded.scale} · ${loaded.provider.toUpperCase()} · ` +
           `${loaded.execution === "worker" ? `worker${loaded.threads > 1 ? ` ${loaded.threads} threads` : ""}` : "thread principal"} · ` +
-          `${loaded.inputLayout}→${loaded.outputLayout} · auto-test pixels ${Math.round(loaded.smokeTestMs)} ms · ` +
+          `${loaded.inputLayout}→${loaded.outputLayout} · stress ${Math.round(loaded.stressTestMs)} ms · ` +
+          `~${loaded.estimatedTilesPerSecond.toFixed(1)} tuiles/s · ` +
           `${(loaded.bytes / 1024 / 1024).toFixed(1)} Mo${loaded.fromCache ? " · cache local" : ""}`,
       );
       return loaded;
@@ -1445,7 +1446,8 @@ export default function App() {
                           <th>Backend</th>
                           <th>Échelle</th>
                           <th>Layout</th>
-                          <th>Auto-test</th>
+                          <th>Stress</th>
+                          <th>Débit</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1465,17 +1467,23 @@ export default function App() {
                                 : "—"}
                             </td>
                             <td title={entry.error ?? ""}>
-                              {entry.smokeTestMs !== null
-                                ? `${Math.round(entry.smokeTestMs)} ms`
+                              {entry.stressTestMs !== null
+                                ? `${Math.round(entry.stressTestMs)} ms`
                                 : entry.error ?? "—"}
+                            </td>
+                            <td>
+                              {entry.estimatedTilesPerSecond !== null
+                                ? `${entry.estimatedTilesPerSecond.toFixed(1)} t/s`
+                                : "—"}
                             </td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                     <p className="model-note">
-                      Ce test charge chaque modèle du registre et lui impose une vraie inférence RGBA. Le premier passage
-                      peut télécharger plus de 200 Mo ; les poids validés sont ensuite conservés dans le cache local.
+                      Ce test charge chaque modèle du registre et exécute plusieurs vraies inférences RGBA. Il mesure
+                      aussi le débit de tuiles. Le premier passage peut télécharger plus de 200 Mo ; les poids validés
+                      sont ensuite conservés dans le cache local.
                     </p>
                   </div>
                 )}
@@ -1483,9 +1491,9 @@ export default function App() {
                 {modelStatus && <div className="model-status">{modelStatus}</div>}
                 {aiNeedsPreparation && (
                   <div className="warning-card">
-                    Source de {(sourcePixels / 1_000_000).toFixed(1)} MP : UltraVision ne coupe plus l'IA. Une surface
-                    neuronale sûre sera préparée automatiquement, puis traitée par tuiles avant normalisation vers la
-                    cible. Le master final conserve la définition demandée.
+                    Source de {(sourcePixels / 1_000_000).toFixed(1)} MP : le Performance Governor adapte automatiquement
+                    la surface d'entrée et borne la surface neuronale intermédiaire selon le modèle, la mémoire et la cible.
+                    Le master final conserve la définition demandée.
                   </div>
                 )}
                 {aiSlow && engine === "ai" && (
