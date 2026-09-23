@@ -26,6 +26,9 @@ export interface ModelHealthReport {
   fixedWidth: number | null;
   fixedHeight: number | null;
   smokeTestMs: number | null;
+  stressTestMs: number | null;
+  benchmarkTileMs: number | null;
+  estimatedTilesPerSecond: number | null;
   fromCache: boolean | null;
   error: string | null;
 }
@@ -64,6 +67,9 @@ function successReport(
     fixedWidth: info.fixedWidth,
     fixedHeight: info.fixedHeight,
     smokeTestMs: info.smokeTestMs,
+    stressTestMs: info.stressTestMs,
+    benchmarkTileMs: info.benchmarkTileMs,
+    estimatedTilesPerSecond: info.estimatedTilesPerSecond,
     fromCache: info.fromCache,
     error: null,
   };
@@ -120,7 +126,7 @@ export async function qualifyAllRestorationModels(
       reports.push(report);
       onProgress?.(
         (index + 1) / ids.length,
-        `✓ ${model.label} · ${info.provider.toUpperCase()} · x${info.scale}`,
+        `✓ ${model.label} · ${info.provider.toUpperCase()} · x${info.scale} · ~${info.estimatedTilesPerSecond.toFixed(1)} tuiles/s`,
         reports,
       );
     } catch (reason) {
@@ -141,6 +147,9 @@ export async function qualifyAllRestorationModels(
         fixedWidth: null,
         fixedHeight: null,
         smokeTestMs: null,
+        stressTestMs: null,
+        benchmarkTileMs: null,
+        estimatedTilesPerSecond: null,
         fromCache: null,
         error: errorText(reason),
       });
