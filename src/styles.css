@@ -1273,3 +1273,14 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
 .download-note { color: #8a9bb3; font-size: .74rem; }
 .result-verdict { color: #c9d6e6; }
 .result-full-note { color: #8a9bb3; font-size: .78rem; margin: 0 0 10px; }
+
+/* Exports pro (codecs WebAssembly) */
+.pro-export { margin: 4px 0 14px; border: 1px solid rgba(255,255,255,.08); border-radius: 14px; padding: 10px 12px; background: rgba(255,255,255,.02); }
+.pro-export summary { cursor: pointer; display: grid; gap: 2px; list-style: none; }
+.pro-export summary span { font-weight: 700; color: #e8f0fb; }
+.pro-export summary small { color: #8a9bb3; font-size: .72rem; }
+.pro-export-list { display: grid; gap: 8px; margin-top: 10px; }
+.pro-export-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pro-export-row div { display: grid; min-width: 0; }
+.pro-export-row small { color: #8a9bb3; font-size: .72rem; overflow-wrap: anywhere; }
+.pro-export-row button { flex: none; min-width: 104px; min-height: 40px; }

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import DeepFocusControl, { type DeepFocusSettings } from "./DeepFocusControl";
 import ComparisonPanel from "./ComparisonPanel";
+import ProExportPanel from "./ProExportPanel";
 import type { QualityComparison } from "./lib/qualityComparator";
 import PrecisionRestoreControl, { type PrecisionRestoreSettings } from "./PrecisionRestoreControl";
 import ScenePrecisionControl from "./ScenePrecisionControl";
@@ -2230,6 +2231,13 @@ export default function App() {
                 )}
                 {output.avx && <small className="download-note">{output.avx.detail}</small>}
               </div>
+              {mode === "image" && file && (
+                <ProExportPanel
+                  key={output.url}
+                  master={output.blob}
+                  baseName={`${file.name.replace(/\.[^.]+$/, "") || "ultravision"}-ultravision`}
+                />
+              )}
               <p className="result-verdict">
                 {output.studio
                   ? output.studio.winner === "classic"
