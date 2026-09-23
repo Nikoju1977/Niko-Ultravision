@@ -1,6 +1,8 @@
+import { applyNaturalFinish } from "./restoration/naturalFinish";
 import { compareImageQuality, type QualityComparison, type ZoneComparison } from "./qualityComparator";
 import { decodeImageFile } from "./imageDecode";
 import { canvas2d, unsharpMask } from "./restoration/imageMath";
+import { adaptiveBlend } from "./adaptiveBlend";
 import { aiEngineAvailable, loadedModel, webGpuAvailable } from "./aiUpscaler";
 import {
   buildAutopilotImagePlan,
@@ -234,6 +236,34 @@ export async function runAgenticImageMaster(
     );
   }
 
+  // Finition pro : mélange adaptatif IA / original (peau et aplats naturels,
+  // structure nette, contours sans escalier).
+  if (result.engineUsed === "ai" && result.size.width * result.size.height <= 16_000_000) {
+    throwIfCancelled();
+    onProgress?.(0.935, "Finition · mélange adaptatif IA / original");
+    try {
+      const finished = await adaptiveFinish(file, result.blob, result.size, plan.format);
+      result = { ...result, blob: finished.blob };
+      decisions.push(
+        decision(
+          "quality",
+          "Agent Finition",
+          "ok",
+          `Mélange adaptatif appliqué : IA à pleine force sur la structure (texte, objets, reflets), grain naturel de l'original conservé sur peau et aplats (poids IA moyen ${Math.round(finished.meanAiWeight * 100)} %), contours anti-escalier.`,
+        ),
+      );
+    } catch (reason) {
+      decisions.push(
+        decision(
+          "quality",
+          "Agent Finition",
+          "warning",
+          `Mélange adaptatif non appliqué : ${reason instanceof Error ? reason.message : "raison inconnue"}.`,
+        ),
+      );
+    }
+  }
+
   throwIfCancelled();
   onProgress?.(0.95, "Agent Validation · contrôle du master final");
   let validation = await validateImageMaster(result.blob, result.size);
@@ -369,6 +399,35 @@ export async function runAgenticImageMaster(
     );
   }
 
+  // Finition naturelle (après le verrou, pour que le grain ne fausse pas les
+  // mesures) : uniquement sur un master IA, dont la peau et les aplats sont
+  // lissés par la super-résolution.
+  if (result.engineUsed === "ai") {
+    throwIfCancelled();
+    onProgress?.(0.98, "Finition naturelle · grain photographique");
+    try {
+      const finished = await applyNaturalFinish(result.blob, plan.format);
+      result = { ...result, blob: finished };
+      decisions.push(
+        decision(
+          "quality",
+          "Finition naturelle",
+          "ok",
+          "Grain photographique fin réintroduit dans les zones lisses (peau, aplats) : supprime l'effet « plastique » de l'IA sans ajouter de détail.",
+        ),
+      );
+    } catch (reason) {
+      decisions.push(
+        decision(
+          "quality",
+          "Finition naturelle",
+          "warning",
+          `Finition non appliquée : ${reason instanceof Error ? reason.message : "raison inconnue"}.`,
+        ),
+      );
+    }
+  }
+
   onProgress?.(0.99, "Master final validé");
 
   return {
@@ -418,4 +477,47 @@ async function faithfulMaster(
   } finally {
     decoded.close();
   }
+}
+
+
+/** Applique le mélange adaptatif au master IA, à sa taille exacte. */
+async function adaptiveFinish(
+  file: Blob,
+  master: Blob,
+  size: { width: number; height: number },
+  format: string,
+): Promise<{ blob: Blob; meanAiWeight: number }> {
+  const { width, height } = size;
+  const read = async (blob: Blob): Promise<Uint8ClampedArray> => {
+    const decoded = await decodeImageFile(blob);
+    try {
+      const { canvas, ctx } = canvas2d(width, height);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(decoded.source, 0, 0, width, height);
+      const data = ctx.getImageData(0, 0, width, height).data;
+      canvas.width = 1;
+      canvas.height = 1;
+      return data;
+    } finally {
+      decoded.close();
+    }
+  };
+  const ai = await read(master);
+  const faithful = await read(file);
+  // Laisse respirer l'interface avant le calcul.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const blended = adaptiveBlend(ai, faithful, width, height);
+  const { canvas, ctx } = canvas2d(width, height);
+  ctx.putImageData(new ImageData(blended.data as Uint8ClampedArray<ArrayBuffer>, width, height), 0, 0);
+  const blob = await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob(
+      (value) => (value ? resolve(value) : reject(new Error("encodage du master fini impossible"))),
+      format === "image/jpeg" || format === "image/webp" ? format : "image/png",
+      0.95,
+    ),
+  );
+  canvas.width = 1;
+  canvas.height = 1;
+  return { blob, meanAiWeight: blended.meanAiWeight };
 }
