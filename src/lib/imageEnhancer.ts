@@ -133,9 +133,33 @@ export function assessImageTarget(source: Size, target: TargetId): ImageTargetAs
   return { supported: true, size, pixelBudget: limits.estimatedPixelBudget, measured: limits.measured };
 }
 
+function legacySharpenPixelLimit(): number {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const memory =
+    typeof nav.deviceMemory === "number"
+      ? nav.deviceMemory
+      : null;
+  const mobile = /Android|iPhone|iPad|iPod/i.test(
+    navigator.userAgent,
+  );
+  if (mobile) {
+    return memory !== null && memory <= 4
+      ? 3_200_000
+      : 5_000_000;
+  }
+  return memory !== null && memory <= 4
+    ? 8_000_000
+    : 12_000_000;
+}
+
 function sharpen(canvas: HTMLCanvasElement, amount: number): boolean {
   const pixels = canvas.width * canvas.height;
-  if (amount <= 0 || pixels > 12_000_000) return false;
+  if (
+    amount <= 0 ||
+    pixels > legacySharpenPixelLimit()
+  ) {
+    return false;
+  }
 
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) return false;
