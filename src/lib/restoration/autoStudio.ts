@@ -39,6 +39,7 @@ import {
   type EvaluationZoneKind,
 } from "./qualityController";
 import { RESTORATION_MODELS, type RestorationModelId } from "./modelRegistry";
+import { modelPerformanceScore } from "../devicePerformanceProfile";
 
 export type CandidateId = "classic" | RestorationModelId;
 
@@ -157,9 +158,17 @@ function routeModelsForResources(
     }
   }
 
+  const ranked = [...selected].sort((a, b) => {
+    const byEvidence =
+      modelPerformanceScore(RESTORATION_MODELS[b].label) -
+      modelPerformanceScore(RESTORATION_MODELS[a].label);
+    if (Math.abs(byEvidence) > 0.01) return byEvidence;
+    return 0;
+  });
+
   return {
     ...plan,
-    models: selected.slice(0, resources.modelBudget),
+    models: ranked.slice(0, resources.modelBudget),
   };
 }
 
