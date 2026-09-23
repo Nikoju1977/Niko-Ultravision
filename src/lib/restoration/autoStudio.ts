@@ -459,8 +459,26 @@ export async function runAutoStudio(
       for (const zone of zones) {
         throwIfCancelled();
         onProgress?.(base + 0.3 / plan.models.length, `Studio Auto · essai ${model.label} (${zone.kind === "detail" ? "zone détaillée" : "zone plate"})`);
-        const raw = await upscaleWithAi(zone.source);
-        outputs.push(resample(raw, 0, 0, raw.width, raw.height, outputSide(zone), outputSide(zone)));
+        const raw = await upscaleWithAi(
+          zone.source,
+          undefined,
+          {
+            targetWidth: outputSide(zone),
+            targetHeight: outputSide(zone),
+            allowRuntimeFallback: true,
+          },
+        );
+        outputs.push(
+          resample(
+            raw,
+            0,
+            0,
+            raw.width,
+            raw.height,
+            outputSide(zone),
+            outputSide(zone),
+          ),
+        );
         raw.width = 1;
         raw.height = 1;
       }
