@@ -128,52 +128,30 @@ function looksLikeVideo(file: File): boolean {
   return file.type.startsWith("video/") || VIDEO_EXTENSIONS.has(fileExtension(file));
 }
 
-async function stabilizeAndroidImage(
-  file: File,
-  source: CanvasImageSource,
-  width: number,
-  height: number,
-): Promise<File> {
+/**
+ * Android : certains sélecteurs Samsung fournissent un File lisible une seule
+ * fois. On en matérialise les OCTETS D'ORIGINE dans un Blob local, sans jamais
+ * redessiner ni réencoder les pixels (le réencodage via canvas GPU corrompait
+ * certaines photos : bandes verticales, dominante verte/magenta).
+ */
+async function stabilizeAndroidImage(file: File): Promise<File> {
   if (!/android/i.test(navigator.userAgent)) return file;
-
-  // Les très grands capteurs peuvent dépasser la mémoire disponible pendant
-  // une normalisation PNG. Dans ce cas, le décodeur multi-stratégies garde
-  // le fichier original et prendra le relais.
-  if (width * height > 40_000_000) return file;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-
   try {
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return file;
-    ctx.drawImage(source, 0, 0, width, height);
-
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, "image/png");
-    });
-    if (!blob || blob.size === 0) return file;
-
-    // Le nom d'origine est conservé pour que le nom du master exporté reste
-    // celui choisi par l'utilisateur ; seul le contenu interne devient un PNG
-    // local stable, décodable autant de fois que nécessaire.
-    return new File([blob], file.name, {
-      type: "image/png",
+    const buffer = await file.arrayBuffer();
+    if (buffer.byteLength === 0) return file;
+    return new File([buffer], file.name, {
+      type: file.type || "application/octet-stream",
       lastModified: file.lastModified,
     });
   } catch {
     return file;
-  } finally {
-    canvas.width = 1;
-    canvas.height = 1;
   }
 }
 
 async function inspectImage(file: File): Promise<{ size: Size; file: File }> {
   const decoded = await decodeImageFile(file);
   try {
-    const stableFile = await stabilizeAndroidImage(file, decoded.source, decoded.width, decoded.height);
+    const stableFile = await stabilizeAndroidImage(file);
     return {
       size: { width: decoded.width, height: decoded.height },
       file: stableFile,

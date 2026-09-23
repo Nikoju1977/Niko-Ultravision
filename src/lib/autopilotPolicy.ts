@@ -91,7 +91,8 @@ export async function buildAutopilotImagePlan(
   const candidates = targetCandidates(source, hasStableAi).filter((candidate) => {
     if (candidate === "original") return true;
     const size = calculateOutputSize(source.width, source.height, candidate);
-    return Math.max(size.width, size.height) >= sourceLong * 1.1;
+    // Un agrandissement de moins de ×1,5 n'apporte rien de visible.
+    return Math.max(size.width, size.height) >= sourceLong * 1.5;
   });
   let target: TargetId = "original";
   for (const candidate of candidates) {

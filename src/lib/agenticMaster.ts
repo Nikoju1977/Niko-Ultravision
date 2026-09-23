@@ -1,4 +1,4 @@
-import { compareImageQuality, type QualityComparison } from "./qualityComparator";
+import { compareImageQuality, type QualityComparison, type ZoneComparison } from "./qualityComparator";
 import { decodeImageFile } from "./imageDecode";
 import { canvas2d, unsharpMask } from "./restoration/imageMath";
 import { aiEngineAvailable, loadedModel, webGpuAvailable } from "./aiUpscaler";
@@ -204,12 +204,13 @@ export async function runAgenticImageMaster(
   } catch (reason) {
     if (isCancelledError(reason)) throw reason;
     usedEmergencyFallback = true;
+    const detail = reason instanceof Error ? reason.message : String(reason);
     decisions.push(
       decision(
         "memory",
         "Agent Recovery",
         "warning",
-        "La chaîne multi-modèles n'a pas terminé : repli automatique vers le moteur déterministe sécurisé.",
+        `La chaîne multi-modèles n'a pas terminé (${detail.slice(0, 220)}) : repli automatique vers le moteur déterministe sécurisé.`,
       ),
     );
     onProgress?.(0.22, "Agent Recovery · master déterministe");
@@ -287,8 +288,34 @@ export async function runAgenticImageMaster(
   throwIfCancelled();
   onProgress?.(0.965, "Verrou final · comparaison avec l'original");
   let comparison = await compareImageQuality(file, result.blob);
-  const losesDetail = (c: QualityComparison) =>
-    c.sharpnessGainPercent < -2 || c.edgeGainPercent < -2;
+  /**
+   * Un master n'est livrable que s'il est FIDÈLE et PLUS NET : une netteté
+   * globale en hausse ne suffit pas (du bruit injecté dans les aplats la fait
+   * monter pendant que texte et contours sont détruits).
+   */
+  const gateFailures = (c: QualityComparison): string[] => {
+    const failures: string[] = [];
+    if (c.ssim < 0.8) failures.push(`fidélité SSIM ${c.ssim.toFixed(3)} < 0,80`);
+    if (c.psnr < 24) failures.push(`PSNR ${c.psnr.toFixed(1)} dB < 24`);
+    if (Math.abs(c.contrastChangePercent) > 20) failures.push(`contraste modifié de ${c.contrastChangePercent.toFixed(0)} %`);
+    if (c.sharpnessGainPercent < -2) failures.push(`micro-détail ${c.sharpnessGainPercent.toFixed(1)} %`);
+    if (c.edgeGainPercent < -2) failures.push(`contours ${c.edgeGainPercent.toFixed(1)} %`);
+    const structured: [string, ZoneComparison][] = [
+      ["texte", c.textZone],
+      ["contours structurés", c.edgeZone],
+      ["structure centrale", c.centralZone],
+    ];
+    for (const [name, zone] of structured) {
+      if (zone.coveragePercent >= 2 && zone.sharpnessGainPercent < -10) {
+        failures.push(`${name} ${zone.sharpnessGainPercent.toFixed(0)} %`);
+      }
+    }
+    if (c.flatZone.coveragePercent >= 10 && c.flatZone.sharpnessGainPercent > 200) {
+      failures.push(`bruit injecté dans les aplats (+${c.flatZone.sharpnessGainPercent.toFixed(0)} %)`);
+    }
+    return failures;
+  };
+  const losesDetail = (c: QualityComparison) => gateFailures(c).length > 0;
   const smallerThanSource =
     result.size.width < sourceSize.width || result.size.height < sourceSize.height;
   if (smallerThanSource || losesDetail(comparison)) {
@@ -297,7 +324,15 @@ export async function runAgenticImageMaster(
     const faithfulComparison = await compareImageQuality(file, faithful.blob);
     const score = (c: QualityComparison) => c.sharpnessGainPercent + c.edgeGainPercent;
     const before = comparison;
-    if (smallerThanSource || score(faithfulComparison) > score(before)) {
+    const masterFailures = gateFailures(before);
+    const faithfulFailures = gateFailures(faithfulComparison);
+    // L'Original fidèle gagne dès que le master échoue au verrou et que lui
+    // le passe ; sinon, le meilleur score l'emporte.
+    if (
+      smallerThanSource ||
+      (masterFailures.length > 0 && faithfulFailures.length === 0) ||
+      score(faithfulComparison) > score(before)
+    ) {
       result = { ...result, blob: faithful.blob, size: faithful.size, engineUsed: "canvas", aiPasses: 0 };
       comparison = faithfulComparison;
       if (studio) {
@@ -309,7 +344,7 @@ export async function runAgenticImageMaster(
           "quality",
           "Verrou Original",
           "warning",
-          `Master refusé : ${smallerThanSource ? "plus petit que la source, " : ""}moins net que l'original (micro-détail ${before.sharpnessGainPercent.toFixed(1)} %, contours ${before.edgeGainPercent.toFixed(1)} %). ` +
+          `Master refusé (${masterFailures.join(" · ") || "plus petit que la source"}) : ${smallerThanSource ? "plus petit que la source, " : ""}comparé à l'original (micro-détail ${before.sharpnessGainPercent.toFixed(1)} %, contours ${before.edgeGainPercent.toFixed(1)} %). ` +
             `Remplacé par l'Original fidèle (micro-détail ${faithfulComparison.sharpnessGainPercent.toFixed(1)} %, contours ${faithfulComparison.edgeGainPercent.toFixed(1)} %).`,
         ),
       );

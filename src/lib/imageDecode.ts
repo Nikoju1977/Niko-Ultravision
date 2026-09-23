@@ -81,9 +81,58 @@ async function decodeHtmlImage(blob: Blob): Promise<DecodedImage> {
   }
 }
 
+/**
+ * Sur certains Android, createImageBitmap produit des pixels corrompus pour
+ * des JPEG valides (bandes, couleurs inversées). Une fois par fichier, on
+ * compare une vignette décodée par les deux voies ; en cas d'écart, la voie
+ * <img> du navigateur (la plus éprouvée) est utilisée pour ce fichier.
+ */
+const bitmapTrust = new WeakMap<Blob, boolean>();
+
+function thumbnail(source: CanvasImageSource, width: number, height: number): Uint8ClampedArray | null {
+  const canvas = document.createElement("canvas");
+  canvas.width = 48;
+  canvas.height = Math.max(1, Math.round((48 * height) / width));
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  return ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+}
+
+async function bitmapIsTrustworthy(file: Blob, bitmap: DecodedImage): Promise<boolean> {
+  if (!/android/i.test(navigator.userAgent)) return true;
+  const known = bitmapTrust.get(file);
+  if (known !== undefined) return known;
+  let trusted = true;
+  try {
+    const html = await decodeHtmlImage(file);
+    try {
+      const a = thumbnail(bitmap.source, bitmap.width, bitmap.height);
+      const b = thumbnail(html.source, html.width, html.height);
+      if (a && b && a.length === b.length && html.width === bitmap.width && html.height === bitmap.height) {
+        let diff = 0;
+        for (let i = 0; i < a.length; i += 4) {
+          diff += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+        }
+        trusted = diff / ((a.length / 4) * 3) < 6;
+      }
+    } finally {
+      html.close();
+    }
+  } catch {
+    trusted = true;
+  }
+  bitmapTrust.set(file, trusted);
+  return trusted;
+}
+
 export async function decodeImageFile(file: Blob): Promise<DecodedImage> {
   const directBitmap = await decodeBitmap(file);
-  if (directBitmap) return directBitmap;
+  if (directBitmap) {
+    if (await bitmapIsTrustworthy(file, directBitmap)) return directBitmap;
+    directBitmap.close();
+    return decodeHtmlImage(file);
+  }
 
   try {
     return await decodeHtmlImage(file);
