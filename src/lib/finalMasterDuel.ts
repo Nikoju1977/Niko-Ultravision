@@ -14,6 +14,8 @@ export interface FinalMasterMetrics {
   localErrorP99: number;
   detailRatio: number;
   noiseRatio: number;
+  /** Erreur chromatique moyenne YCbCr en niveaux 0..255. */
+  chromaError: number;
   score: number;
 }
 
@@ -57,6 +59,64 @@ function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
+function meanChromaError(
+  sourceCanvas: HTMLCanvasElement,
+  candidateCanvas: HTMLCanvasElement,
+): number {
+  const sourceCtx = sourceCanvas.getContext(
+    "2d",
+    { willReadFrequently: true },
+  );
+  const candidateCtx = candidateCanvas.getContext(
+    "2d",
+    { willReadFrequently: true },
+  );
+  if (!sourceCtx || !candidateCtx) return 0;
+
+  const a = sourceCtx.getImageData(
+    0,
+    0,
+    sourceCanvas.width,
+    sourceCanvas.height,
+  ).data;
+  const b = candidateCtx.getImageData(
+    0,
+    0,
+    candidateCanvas.width,
+    candidateCanvas.height,
+  ).data;
+  const pixels = Math.max(
+    1,
+    Math.min(a.length, b.length) / 4,
+  );
+  let sum = 0;
+
+  for (let p = 0; p < pixels; p += 1) {
+    const i = p * 4;
+    const aCb =
+      128 - 0.114572 * a[i] -
+      0.385428 * a[i + 1] +
+      0.5 * a[i + 2];
+    const aCr =
+      128 + 0.5 * a[i] -
+      0.454153 * a[i + 1] -
+      0.045847 * a[i + 2];
+    const bCb =
+      128 - 0.114572 * b[i] -
+      0.385428 * b[i + 1] +
+      0.5 * b[i + 2];
+    const bCr =
+      128 + 0.5 * b[i] -
+      0.454153 * b[i + 1] -
+      0.045847 * b[i + 2];
+    sum += Math.sqrt(
+      ((aCb - bCb) ** 2 + (aCr - bCr) ** 2) / 2,
+    );
+  }
+
+  return sum / pixels;
+}
+
 function metrics(
   sourceCanvas: HTMLCanvasElement,
   candidateCanvas: HTMLCanvasElement,
@@ -74,6 +134,10 @@ function metrics(
     candidateGradient / Math.max(0.5, sourceGradient);
   const noiseRatio =
     candidateNoise / Math.max(0.35, sourceNoise);
+  const chromaError = meanChromaError(
+    sourceCanvas,
+    candidateCanvas,
+  );
 
   // La fidélité reste dominante. Un petit gain de détail est récompensé,
   // mais une sur-accentuation ou une hausse du bruit est pénalisée.
@@ -95,6 +159,8 @@ function metrics(
       : 0;
   const localPenalty =
     Math.max(0, localError - 24) * 0.8;
+  const chromaPenalty =
+    Math.max(0, chromaError - 2.5) * 1.6;
 
   return {
     ssimToSource: similarity,
@@ -102,13 +168,15 @@ function metrics(
     localErrorP99: localError,
     detailRatio,
     noiseRatio,
+    chromaError,
     score:
       fidelityScore +
       psnrScore +
       usefulDetail -
       excessDetailPenalty -
       noisePenalty -
-      localPenalty,
+      localPenalty -
+      chromaPenalty,
   };
 }
 
@@ -164,14 +232,15 @@ export async function duelFinalMasters(
     const winner: "primary" | "classic" =
       margin >= 1.25 &&
       primaryMetrics.ssimToSource >= 0.84 &&
-      primaryMetrics.localErrorP99 <= 36
+      primaryMetrics.localErrorP99 <= 36 &&
+      primaryMetrics.chromaError <= 7.5
         ? "primary"
         : "classic";
 
     const rationale =
       winner === "primary"
         ? `Master IA conservé : avantage mesuré +${margin.toFixed(2)} points sur la baseline déterministe.`
-        : `Baseline déterministe conservée : avantage IA insuffisant (${margin.toFixed(2)} points) ou fidélité locale trop faible.`;
+        : `Baseline déterministe conservée : avantage IA insuffisant (${margin.toFixed(2)} points), fidélité locale ou couleur insuffisante.`;
 
     return {
       winner,

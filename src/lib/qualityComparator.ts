@@ -29,6 +29,10 @@ export interface QualityComparison {
   psnr: number;
   ssim: number;
   changedPixelsPercent: number;
+  /** Erreur chromatique moyenne en espace YCbCr, niveaux 0..255. */
+  meanChromaError: number;
+  /** 95e percentile de l'erreur chromatique locale. */
+  chromaErrorP95: number;
   width: number;
   height: number;
   sourcePreview: string;
@@ -291,6 +295,68 @@ function comparisonStats(
   };
 }
 
+function chromaStats(
+  sourceImage: ImageData,
+  outputImage: ImageData,
+): Pick<QualityComparison, "meanChromaError" | "chromaErrorP95"> {
+  const a = sourceImage.data;
+  const b = outputImage.data;
+  const pixels = Math.max(
+    1,
+    Math.min(a.length, b.length) / 4,
+  );
+  const histogram = new Uint32Array(256);
+  let sum = 0;
+
+  for (let p = 0; p < pixels; p += 1) {
+    const i = p * 4;
+    const aCb =
+      128 -
+      0.114572 * a[i] -
+      0.385428 * a[i + 1] +
+      0.5 * a[i + 2];
+    const aCr =
+      128 +
+      0.5 * a[i] -
+      0.454153 * a[i + 1] -
+      0.045847 * a[i + 2];
+    const bCb =
+      128 -
+      0.114572 * b[i] -
+      0.385428 * b[i + 1] +
+      0.5 * b[i + 2];
+    const bCr =
+      128 +
+      0.5 * b[i] -
+      0.454153 * b[i + 1] -
+      0.045847 * b[i + 2];
+
+    const error = Math.sqrt(
+      ((aCb - bCb) ** 2 + (aCr - bCr) ** 2) / 2,
+    );
+    sum += error;
+    histogram[
+      Math.max(0, Math.min(255, Math.round(error)))
+    ] += 1;
+  }
+
+  const p95Target = pixels * 0.95;
+  let cumulative = 0;
+  let p95 = 0;
+  for (let value = 0; value < histogram.length; value += 1) {
+    cumulative += histogram[value];
+    if (cumulative >= p95Target) {
+      p95 = value;
+      break;
+    }
+  }
+
+  return {
+    meanChromaError: sum / pixels,
+    chromaErrorP95: p95,
+  };
+}
+
 function differenceCanvas(sourceImage: ImageData, outputImage: ImageData): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = sourceImage.width;
@@ -349,6 +415,7 @@ export async function compareImageQuality(source: Blob, output: Blob): Promise<Q
   const sourceMetrics = qualityMetrics(sourceImage);
   const outputMetrics = qualityMetrics(outputImage);
   const stats = comparisonStats(sourceImage, outputImage);
+  const chroma = chromaStats(sourceImage, outputImage);
   const diff = differenceCanvas(sourceImage, outputImage);
   const masks = buildZoneMasks(sourceImage);
 
@@ -368,6 +435,7 @@ export async function compareImageQuality(source: Blob, output: Blob): Promise<Q
     contrastChangePercent: relativeChange(sourceMetrics.contrast, outputMetrics.contrast),
     edgeGainPercent: relativeChange(sourceMetrics.edgeEnergy, outputMetrics.edgeEnergy),
     ...stats,
+    ...chroma,
     width: geometry.width,
     height: geometry.height,
     sourcePreview: sourceCanvas.toDataURL("image/jpeg", 0.9),

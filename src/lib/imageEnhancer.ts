@@ -244,8 +244,17 @@ function resampleTo(
   return canvas;
 }
 
+export type RestorationPolicy = "full" | "raw-ai";
+
 export interface EnhanceImageOptions {
   engine?: EngineId;
+  /**
+   * full = pipeline historique complet.
+   * raw-ai = l'IA reçoit les pixels source les plus fidèles possible ; les
+   * heuristiques Deep/Precision/Depth ne sont pas empilées avant le réseau.
+   * Studio Auto utilise ce mode pour rapprocher le master final des probes.
+   */
+  restorationPolicy?: RestorationPolicy;
   deepFocus?: DeepFocusSettings;
   precisionRestore?: PrecisionRestoreSettings;
   depthFocusPrecision?: DepthFocusSettings;
@@ -262,6 +271,7 @@ export async function enhanceImage(
 ): Promise<ImageEnhanceResult> {
   const {
     engine = "canvas",
+    restorationPolicy = "full",
     deepFocus = DEFAULT_DEEP_FOCUS,
     precisionRestore = DEFAULT_PRECISION_RESTORE,
     depthFocusPrecision = DEFAULT_DEPTH_FOCUS,
@@ -294,12 +304,15 @@ export async function enhanceImage(
     if (!ctx) throw new Error("Canvas 2D indisponible.");
     ctx.drawImage(decoded.source, 0, 0);
 
+    const preserveRawForAi =
+      engine === "ai" && restorationPolicy === "raw-ai";
+
     let deepFocusApplied = false;
     let deepFocusLayers = deepFocus.layers;
     let deepFocusConfidence = 0;
     let deepFocusReason: string | undefined;
 
-    if (deepFocus.enabled) {
+    if (deepFocus.enabled && !preserveRawForAi) {
       const report = await applyDeepFocus(current, deepFocus, (ratio, label) => {
         onProgress?.(0.06 + ratio * 0.16, label);
       });
@@ -315,7 +328,7 @@ export async function enhanceImage(
     let precisionFlatCoverage = 0;
     let precisionRestoreReason: string | undefined;
 
-    if (precisionRestore.enabled) {
+    if (precisionRestore.enabled && !preserveRawForAi) {
       const report = await applyPrecisionRestore(current, precisionRestore, (ratio, label) => {
         onProgress?.(0.23 + ratio * 0.13, label);
       });
@@ -336,7 +349,7 @@ export async function enhanceImage(
     let depthFocusMeanCorrection = 0;
     let depthFocusReason: string | undefined;
 
-    if (depthFocusPrecision.enabled) {
+    if (depthFocusPrecision.enabled && !preserveRawForAi) {
       onProgress?.(0.37, "Depth Focus Precision · estimation relative");
       const estimate = await estimateRelativeDepth(current, depthFocusPrecision.centerBias);
       const confidence = buildDepthConfidenceMap(estimate.depth, estimate.structure);
@@ -420,7 +433,11 @@ export async function enhanceImage(
 
       // Pro Max : un léger pré-traitement de la ROI avant la super-résolution
       // aide le réseau à consacrer davantage de capacité aux structures du sujet.
-      if (smallSubjectRoi.enabled && current.width * current.height <= 4_000_000) {
+      if (
+        !preserveRawForAi &&
+        smallSubjectRoi.enabled &&
+        current.width * current.height <= 4_000_000
+      ) {
         const preRoi = detectSmallSubjectRoi(current);
         if (preRoi) {
           enhanceRoiLocally(current, preRoi, Math.min(0.42, (smallSubjectRoi.strength ?? 0.82) * 0.48));
@@ -519,6 +536,15 @@ export async function enhanceImage(
 
     const restoredBeforeFinal =
       deepFocusApplied || precisionRestoreApplied || depthFocusApplied;
+
+    if (preserveRawForAi) {
+      deepFocusReason =
+        "Quality Core v4 : pré-restauration désactivée avant IA pour préserver le signal source.";
+      precisionRestoreReason =
+        "Quality Core v4 : pré-restauration désactivée avant IA ; le réseau reçoit la source non accentuée.";
+      depthFocusReason =
+        "Quality Core v4 : Depth Focus n'est pas empilé avant la super-résolution IA.";
+    }
 
     // Perceptual Imaging Core : finition déterministe créée pour UltraVision.
     // Elle travaille avant le sharpen final afin de débruiter les aplats,

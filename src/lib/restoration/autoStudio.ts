@@ -736,6 +736,10 @@ export async function runAutoStudio(
         result = await enhanceImage(file, target, profile, format, {
           ...enhanceOptions,
           engine: "ai",
+          // Les probes IA sont évaluées sur la source brute. Le master final
+          // doit suivre le même chemin : pas de sharpen/Depth Focus avant le
+          // réseau, sinon on juge une chose et on en livre une autre.
+          restorationPolicy: "raw-ai",
           onProgress: (value, label) =>
             onProgress?.(stageBase + value * stageSpan, label),
         });
