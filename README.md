@@ -142,15 +142,45 @@ avec une amélioration réelle. Elles ne certifient toutefois pas qu'un détail 
 une IA correspond à la scène originale : une hausse de netteté doit toujours être
 interprétée avec la comparaison visuelle.
 
+## Cloud Pro GPT Image 2.5 — optionnel et mesuré
+
+UltraVision conserve son pipeline local comme comportement par défaut. Un mode **Cloud Pro**
+optionnel peut être configuré pour envoyer une copie réduite de la photo à un backend
+sécurisé qui appelle **GPT Image 2.5 Sunburst**. Le résultat cloud ne remplace jamais
+automatiquement le master local sur sa seule apparence : il est normalisé à la géométrie du
+master puis repasse dans le duel local (SSIM, PSNR, détail, bruit et dérive chromatique).
+S'il ne bat pas le master local avec les garde-fous actifs, il est rejeté.
+
+L'application **ne demande jamais de clé OpenAI dans le navigateur**. Le backend
+`api/cloud-pro.mjs` lit `OPENAI_API_KEY` uniquement côté serveur et exige un second secret
+`CLOUD_PRO_ACCESS_TOKEN` pour éviter qu'un déploiement public puisse consommer librement
+le quota API.
+
+Variables serveur requises sur un hébergeur de Functions (par exemple Vercel) :
+
+```text
+OPENAI_API_KEY=...
+CLOUD_PRO_ACCESS_TOKEN=un-secret-long-et-aleatoire
+CLOUD_PRO_ALLOWED_ORIGINS=https://nikoju1977.github.io
+# Optionnel :
+OPENAI_IMAGE_MODEL=gpt-image-2.5-sunburst-2026-09-08
+OPENAI_IMAGE_QUALITY=xhigh
+```
+
+Sur GitHub Pages seul, aucun runtime serveur n'existe : Cloud Pro reste donc non configuré
+tant qu'un endpoint sécurisé n'est pas renseigné dans le panneau du résultat.
+
 ## Vie privée
 
 - Aucune dépendance `@higgsfield/*`.
-- Dépendances : `onnxruntime-web` (MIT), `mediabunny` (MPL-2.0). La MPL-2.0 est un
-  copyleft par fichier : l'utiliser comme dépendance n'oblige à rien, seules des
-  modifications de ses propres fichiers devraient être repartagées.
-- **Aucun média n'est envoyé nulle part.** Images et vidéos sont traitées sur l'appareil.
-- Seuls les **poids du modèle** transitent par le réseau, une seule fois, si tu choisis le
-  chargement par URL. Le chargement d'un `.onnx` local supprime même cet appel.
+- Dépendances locales principales : `onnxruntime-web` (MIT), `mediabunny` (MPL-2.0).
+- **Par défaut, images et vidéos restent sur l'appareil.**
+- Les poids ONNX peuvent être téléchargés puis mis en cache localement.
+- **Cloud Pro constitue l'unique exception explicite** : uniquement quand l'utilisateur
+  ouvre ce panneau et lance volontairement l'envoi, une copie réduite de la photo est
+  transmise à l'endpoint configuré puis à l'API d'image. Le master local reste le repli.
+- La clé `OPENAI_API_KEY` ne doit jamais être exposée au navigateur, au dépôt GitHub ou
+  aux logs.
 
 ## Résolutions
 

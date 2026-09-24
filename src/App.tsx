@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import DeepFocusControl, { type DeepFocusSettings } from "./DeepFocusControl";
 import ComparisonPanel from "./ComparisonPanel";
 import ProExportPanel from "./ProExportPanel";
+import CloudProPanel from "./CloudProPanel";
 import type { QualityComparison } from "./lib/qualityComparator";
 import PrecisionRestoreControl, { type PrecisionRestoreSettings } from "./PrecisionRestoreControl";
 import ScenePrecisionControl from "./ScenePrecisionControl";
@@ -87,6 +88,13 @@ type OutputState = {
   avx?: { state: "pending" | "ready" | "failed"; blob?: Blob; detail: string };
   /** Comparaison master ↔ original calculée avant la livraison. */
   comparison?: QualityComparison;
+  /** Cloud Pro n'est présent que si son candidat a battu le master local. */
+  cloudPro?: {
+    model: string;
+    reason: string;
+    elapsedMs: number;
+    margin: number;
+  };
 } | null;
 
 const IMAGE_TARGETS: Array<{ id: TargetId; label: string; hint: string }> = [
@@ -2238,6 +2246,40 @@ export default function App() {
                 )}
                 {output.avx && <small className="download-note">{output.avx.detail}</small>}
               </div>
+
+              {mode === "image" && file && (
+                <CloudProPanel
+                  source={file}
+                  localMaster={output.blob}
+                  targetSize={output.size}
+                  disabled={busy || auraBusy}
+                  onAccepted={(cloud) => {
+                    setOutput((previous) => {
+                      if (!previous) return previous;
+                      if (previous.url) URL.revokeObjectURL(previous.url);
+                      const url = URL.createObjectURL(cloud.blob);
+                      return {
+                        ...previous,
+                        url,
+                        blob: cloud.blob,
+                        comparison: cloud.comparison,
+                        cloudPro: {
+                          model: cloud.model,
+                          reason: cloud.reason,
+                          elapsedMs: cloud.elapsedMs,
+                          margin: cloud.duel.margin,
+                        },
+                        note: cloud.reason,
+                        notes: [
+                          ...(previous.notes ?? []),
+                          `Cloud Pro : ${cloud.reason}`,
+                          `Cloud Pro : ${cloud.model} · ${(cloud.elapsedMs / 1000).toFixed(1)} s · Δ duel ${cloud.duel.margin >= 0 ? "+" : ""}${cloud.duel.margin.toFixed(2)}.`,
+                        ],
+                      };
+                    });
+                  }}
+                />
+              )}
               {mode === "image" && file && (
                 <ProExportPanel
                   key={output.url}
@@ -2246,7 +2288,9 @@ export default function App() {
                 />
               )}
               <p className="result-verdict">
-                {output.studio
+                {output.cloudPro
+                  ? `Cloud Pro retenu après duel automatique contre le master local. ${output.cloudPro.reason}`
+                  : output.studio
                   ? output.studio.winner === "classic"
                     ? `Traitement retenu : ${output.studio.winnerLabel}. Aucune IA n'a fait mieux sans risque d'invention de détails.`
                     : `Traitement retenu : ${output.studio.winnerLabel}, validé par le contrôle qualité.`
@@ -2264,7 +2308,13 @@ export default function App() {
                 </div>
                 <div>
                   <span>Traitement</span>
-                  <strong>{output.engineUsed === "ai" ? "IA locale" : "Local sécurisé"}</strong>
+                  <strong>
+                    {output.cloudPro
+                      ? "Cloud Pro + verrou local"
+                      : output.engineUsed === "ai"
+                        ? "IA locale"
+                        : "Local sécurisé"}
+                  </strong>
                 </div>
               </div>
 
@@ -2320,8 +2370,20 @@ export default function App() {
                 <div><dt>Résolution</dt><dd>{formatDimensions(output.size)}</dd></div>
                 <div><dt>Taille</dt><dd>{(output.blob.size / 1024 / 1024).toFixed(1)} Mo</dd></div>
                 <div><dt>Traitement</dt><dd>Local navigateur</dd></div>
+                {output.cloudPro && (
+                  <div>
+                    <dt>Cloud Pro</dt>
+                    <dd>
+                      {output.cloudPro.model} · duel {output.cloudPro.margin >= 0 ? "+" : ""}
+                      {output.cloudPro.margin.toFixed(2)} · {(output.cloudPro.elapsedMs / 1000).toFixed(1)} s
+                    </dd>
+                  </div>
+                )}
                 {output.engineUsed && (
-                  <div><dt>Moteur</dt><dd>{output.engineUsed === "ai" ? "IA locale (ONNX)" : "Canvas"}</dd></div>
+                  <div>
+                    <dt>Moteur local de référence</dt>
+                    <dd>{output.engineUsed === "ai" ? "IA locale (ONNX)" : "Canvas"}</dd>
+                  </div>
                 )}
                 {output.engineUsed === "ai" && (
                   <div><dt>Reconstruction IA</dt><dd>{output.aiPasses ?? 1} passe(s)</dd></div>

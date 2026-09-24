@@ -1284,3 +1284,64 @@ footer { text-align: center; color: #52657e; font-size: .75rem; padding: 24px 0 
 .pro-export-row div { display: grid; min-width: 0; }
 .pro-export-row small { color: #8a9bb3; font-size: .72rem; overflow-wrap: anywhere; }
 .pro-export-row button { flex: none; min-width: 104px; min-height: 40px; }
+
+
+/* --- Cloud Pro (optionnel, derrière proxy sécurisé) --- */
+.cloud-pro-panel {
+  margin: 14px 0;
+  border: 1px solid rgba(125, 165, 226, .16);
+  border-radius: 16px;
+  background: rgba(12, 28, 48, .58);
+  overflow: hidden;
+}
+
+.cloud-pro-panel > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 14px;
+}
+
+.cloud-pro-panel > summary::-webkit-details-marker { display: none; }
+.cloud-pro-panel > summary span { font-weight: 800; }
+.cloud-pro-panel > summary small { color: #8295ad; font-size: .7rem; text-align: right; }
+
+.cloud-pro-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 14px 14px;
+}
+
+.cloud-pro-field {
+  display: grid;
+  gap: 6px;
+  color: #9fb1c9;
+  font-size: .76rem;
+  font-weight: 700;
+}
+
+.cloud-pro-field input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,.09);
+  background: rgba(3,8,16,.78);
+  color: #dce8fb;
+  font-size: 16px;
+}
+
+.cloud-pro-field input:focus {
+  outline: none;
+  border-color: #5e9cff;
+}
+
+.cloud-pro-run { width: 100%; min-height: 44px; }
+.cloud-privacy { margin-top: 0; }
+.cloud-privacy code { color: #f7ddb3; }
+.cloud-result-ok {
+  border: 1px solid rgba(88, 231, 165, .24);
+  background: rgba(88, 231, 165, .08);
+}
