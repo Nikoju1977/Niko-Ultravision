@@ -381,6 +381,8 @@ export async function runAgenticImageMaster(
     if (c.ssim < 0.8) failures.push(`fidélité SSIM ${c.ssim.toFixed(3)} < 0,80`);
     if (c.psnr < 24) failures.push(`PSNR ${c.psnr.toFixed(1)} dB < 24`);
     if (Math.abs(c.contrastChangePercent) > 20) failures.push(`contraste modifié de ${c.contrastChangePercent.toFixed(0)} %`);
+    if (c.meanChromaError > 7.5) failures.push(`dérive couleur moyenne ${c.meanChromaError.toFixed(1)} niveaux`);
+    if (c.chromaErrorP95 > 20) failures.push(`dérive couleur locale p95 ${c.chromaErrorP95.toFixed(0)} niveaux`);
     if (c.sharpnessGainPercent < -2) failures.push(`micro-détail ${c.sharpnessGainPercent.toFixed(1)} %`);
     if (c.edgeGainPercent < -2) failures.push(`contours ${c.edgeGainPercent.toFixed(1)} %`);
     const structured: [string, ZoneComparison][] = [
@@ -470,16 +472,48 @@ export async function runAgenticImageMaster(
         result.size,
       );
       if (finalCheck.valid) {
-        result = { ...result, blob: finished };
-        validation = finalCheck;
-        decisions.push(
-          decision(
-            "quality",
-            "Finition naturelle",
-            "ok",
-            "Grain photographique fin réintroduit dans les zones lisses, puis fichier final redécodé et validé.",
-          ),
+        // La finition est désormais elle aussi soumise à un vrai contrôle
+        // qualité. Le résultat retourné et les métriques affichées décrivent
+        // donc exactement le même fichier.
+        const beforeNaturalComparison = comparison;
+        const finishedComparison = await compareImageQuality(
+          file,
+          finished,
         );
+        const finishFailures = gateFailures(finishedComparison);
+        const regressed =
+          finishedComparison.ssim <
+            beforeNaturalComparison.ssim - 0.004 ||
+          finishedComparison.psnr <
+            beforeNaturalComparison.psnr - 0.6 ||
+          finishedComparison.edgeGainPercent <
+            beforeNaturalComparison.edgeGainPercent - 2 ||
+          finishedComparison.meanChromaError >
+            beforeNaturalComparison.meanChromaError + 1.5;
+
+        if (!finishFailures.length && !regressed) {
+          result = { ...result, blob: finished };
+          validation = finalCheck;
+          comparison = finishedComparison;
+          decisions.push(
+            decision(
+              "quality",
+              "Finition naturelle",
+              "ok",
+              `Finition conservée après re-mesure : SSIM ${comparison.ssim.toFixed(3)} · PSNR ${comparison.psnr.toFixed(1)} dB · dérive couleur ${comparison.meanChromaError.toFixed(1)}.`,
+            ),
+          );
+        } else {
+          result = { ...result, blob: beforeNatural };
+          decisions.push(
+            decision(
+              "quality",
+              "Finition naturelle",
+              "warning",
+              `Finition annulée automatiquement : ${finishFailures.join(" · ") || "régression mesurée par rapport au master précédent"}.`,
+            ),
+          );
+        }
       } else {
         result = { ...result, blob: beforeNatural };
         decisions.push(
