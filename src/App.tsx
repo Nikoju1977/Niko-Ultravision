@@ -1018,6 +1018,13 @@ export default function App() {
               `Duel SSIM : IA ${master.duel.primary.ssimToSource.toFixed(4)} · classique ${master.duel.classic.ssimToSource.toFixed(4)} · marge ${master.duel.margin.toFixed(2)}.`,
             ]
           : []),
+        ...(master.evidenceFusion
+          ? [
+              master.evidenceFusion.applied
+                ? `Evidence Fusion : cycle ${Math.round(master.evidenceFusion.cycleConfidence * 100)} % · poids IA détail ${Math.round(master.evidenceFusion.meanAiDetailWeight * 100)} % · détails IA atténués ${master.evidenceFusion.rejectedDetailPercent.toFixed(1)} %.`
+                : `Evidence Fusion : ${master.evidenceFusion.skippedReason ?? "non appliquée"}`,
+            ]
+          : []),
         `Validation finale : ${master.validation.message}`,
         `Master : ${master.validation.width}×${master.validation.height} · ${(master.validation.bytes / 1024 / 1024).toFixed(2)} Mo.`,
       ];
