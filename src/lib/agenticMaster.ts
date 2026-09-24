@@ -2,7 +2,10 @@ import { applyNaturalFinish } from "./restoration/naturalFinish";
 import { compareImageQuality, type QualityComparison, type ZoneComparison } from "./qualityComparator";
 import { decodeImageFile } from "./imageDecode";
 import { canvas2d, unsharpMask } from "./restoration/imageMath";
-import { adaptiveBlend } from "./adaptiveBlend";
+import {
+  fuseMasterWithEvidence,
+  type EvidenceFusionReport,
+} from "./evidenceFusion";
 import { aiEngineAvailable, loadedModel, webGpuAvailable } from "./aiUpscaler";
 import {
   buildAutopilotImagePlan,
@@ -55,6 +58,7 @@ export interface AgenticImageMasterResult {
   comparison: QualityComparison;
   autopilot: AutopilotImagePlan;
   duel: FinalMasterDuel | null;
+  evidenceFusion: EvidenceFusionReport | null;
 }
 
 function decision(
@@ -121,6 +125,7 @@ export async function runAgenticImageMaster(
   let studio: StudioReport | null = null;
   let usedEmergencyFallback = false;
   let duel: FinalMasterDuel | null = null;
+  let evidenceFusion: EvidenceFusionReport | null = null;
 
   try {
     onProgress?.(0.10, "Agents experts · benchmark des moteurs");
@@ -236,29 +241,52 @@ export async function runAgenticImageMaster(
     );
   }
 
-  // Finition pro : mélange adaptatif IA / original (peau et aplats naturels,
-  // structure nette, contours sans escalier).
-  if (result.engineUsed === "ai" && result.size.width * result.size.height <= 16_000_000) {
+  // Evidence Fusion : fusion tuilée à trois bandes de fréquences.
+  // La basse fréquence et la chrominance restent ancrées sur l'original ;
+  // l'IA n'apporte les fréquences moyenne/haute que là où structure,
+  // cohérence locale et cycle consistency le justifient.
+  if (result.engineUsed === "ai") {
     throwIfCancelled();
-    onProgress?.(0.935, "Finition · mélange adaptatif IA / original");
+    onProgress?.(0.935, "Evidence Fusion · fréquences + cycle consistency");
     try {
-      const finished = await adaptiveFinish(file, result.blob, result.size, plan.format);
-      result = { ...result, blob: finished.blob };
-      decisions.push(
-        decision(
-          "quality",
-          "Agent Finition",
-          "ok",
-          `Mélange adaptatif appliqué : IA à pleine force sur la structure (texte, objets, reflets), grain naturel de l'original conservé sur peau et aplats (poids IA moyen ${Math.round(finished.meanAiWeight * 100)} %), contours anti-escalier.`,
-        ),
+      const fused = await fuseMasterWithEvidence(
+        file,
+        result.blob,
+        result.size,
+        {
+          format: plan.format,
+          onProgress: (ratio, label) =>
+            onProgress?.(0.935 + ratio * 0.012, label),
+        },
       );
+      evidenceFusion = fused.report;
+      if (fused.report.applied) {
+        result = { ...result, blob: fused.blob };
+        decisions.push(
+          decision(
+            "quality",
+            "Agent Evidence Fusion",
+            "ok",
+            `Fusion multi-fréquence validée : poids IA détail moyen ${Math.round(fused.report.meanAiDetailWeight * 100)} % · cycle ${Math.round(fused.report.cycleConfidence * 100)} % · MAE ${fused.report.cycleMeanAbsoluteError.toFixed(2)} · ${fused.report.rejectedDetailPercent.toFixed(1)} % des détails IA fortement atténués.`,
+          ),
+        );
+      } else {
+        decisions.push(
+          decision(
+            "quality",
+            "Agent Evidence Fusion",
+            "warning",
+            fused.report.skippedReason ?? "Evidence Fusion non appliquée.",
+          ),
+        );
+      }
     } catch (reason) {
       decisions.push(
         decision(
           "quality",
-          "Agent Finition",
+          "Agent Evidence Fusion",
           "warning",
-          `Mélange adaptatif non appliqué : ${reason instanceof Error ? reason.message : "raison inconnue"}.`,
+          `Evidence Fusion non appliquée : ${reason instanceof Error ? reason.message : "raison inconnue"}.`,
         ),
       );
     }
@@ -406,16 +434,37 @@ export async function runAgenticImageMaster(
     throwIfCancelled();
     onProgress?.(0.98, "Finition naturelle · grain photographique");
     try {
-      const finished = await applyNaturalFinish(result.blob, plan.format);
-      result = { ...result, blob: finished };
-      decisions.push(
-        decision(
-          "quality",
-          "Finition naturelle",
-          "ok",
-          "Grain photographique fin réintroduit dans les zones lisses (peau, aplats) : supprime l'effet « plastique » de l'IA sans ajouter de détail.",
-        ),
+      const beforeNatural = result.blob;
+      const finished = await applyNaturalFinish(
+        result.blob,
+        plan.format,
       );
+      const finalCheck = await validateImageMaster(
+        finished,
+        result.size,
+      );
+      if (finalCheck.valid) {
+        result = { ...result, blob: finished };
+        validation = finalCheck;
+        decisions.push(
+          decision(
+            "quality",
+            "Finition naturelle",
+            "ok",
+            "Grain photographique fin réintroduit dans les zones lisses, puis fichier final redécodé et validé.",
+          ),
+        );
+      } else {
+        result = { ...result, blob: beforeNatural };
+        decisions.push(
+          decision(
+            "validation",
+            "Finition naturelle",
+            "warning",
+            `Finition refusée par la validation finale : ${finalCheck.message}. Master précédent conservé.`,
+          ),
+        );
+      }
     } catch (reason) {
       decisions.push(
         decision(
@@ -440,6 +489,7 @@ export async function runAgenticImageMaster(
     usedEmergencyFallback,
     autopilot,
     duel,
+    evidenceFusion,
   };
 }
 
@@ -477,47 +527,4 @@ async function faithfulMaster(
   } finally {
     decoded.close();
   }
-}
-
-
-/** Applique le mélange adaptatif au master IA, à sa taille exacte. */
-async function adaptiveFinish(
-  file: Blob,
-  master: Blob,
-  size: { width: number; height: number },
-  format: string,
-): Promise<{ blob: Blob; meanAiWeight: number }> {
-  const { width, height } = size;
-  const read = async (blob: Blob): Promise<Uint8ClampedArray> => {
-    const decoded = await decodeImageFile(blob);
-    try {
-      const { canvas, ctx } = canvas2d(width, height);
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(decoded.source, 0, 0, width, height);
-      const data = ctx.getImageData(0, 0, width, height).data;
-      canvas.width = 1;
-      canvas.height = 1;
-      return data;
-    } finally {
-      decoded.close();
-    }
-  };
-  const ai = await read(master);
-  const faithful = await read(file);
-  // Laisse respirer l'interface avant le calcul.
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const blended = adaptiveBlend(ai, faithful, width, height);
-  const { canvas, ctx } = canvas2d(width, height);
-  ctx.putImageData(new ImageData(blended.data as Uint8ClampedArray<ArrayBuffer>, width, height), 0, 0);
-  const blob = await new Promise<Blob>((resolve, reject) =>
-    canvas.toBlob(
-      (value) => (value ? resolve(value) : reject(new Error("encodage du master fini impossible"))),
-      format === "image/jpeg" || format === "image/webp" ? format : "image/png",
-      0.95,
-    ),
-  );
-  canvas.width = 1;
-  canvas.height = 1;
-  return { blob, meanAiWeight: blended.meanAiWeight };
 }
