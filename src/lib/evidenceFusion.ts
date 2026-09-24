@@ -8,11 +8,21 @@ export interface EvidenceFusionReport {
   cycleMeanAbsoluteError: number;
   rejectedDetailPercent: number;
   bands: number;
+  elapsedMs: number;
+  cycleMs: number;
+  fusionMs: number;
+  estimatedPeakWorkingMb: number;
+  bandRows: number;
+  performanceAbort: boolean;
+  qualityGate: "not-run" | "accepted" | "reverted";
+  qualityDelta: number | null;
   skippedReason?: string;
 }
 
 export interface EvidenceFusionOptions {
   format: string;
+  /** Dimensions source connues : permettent un preflight mémoire sans décoder. */
+  sourceSize?: { width: number; height: number };
   onProgress?: (ratio: number, label: string) => void;
 }
 
@@ -39,11 +49,16 @@ function lumaAt(
   );
 }
 
-function runtimeBudget(width: number): {
+interface FusionRuntimeBudget {
   maxPixels: number;
   bandRows: number;
+  maxWorkingMb: number;
+  maxFusionMs: number;
+  mobile: boolean;
   label: string;
-} {
+}
+
+function runtimeBudget(width: number): FusionRuntimeBudget {
   const nav = navigator as Navigator & { deviceMemory?: number };
   const memory =
     typeof nav.deviceMemory === "number"
@@ -52,20 +67,36 @@ function runtimeBudget(width: number): {
   const mobile = /Android|iPhone|iPad|iPod/i.test(
     navigator.userAgent,
   );
+  const lowMemory = memory !== null && memory <= 4;
 
+  // Les plafonds sont volontairement plus prudents que les limites canvas :
+  // Evidence Fusion coexiste avec un master décodé, l'original, le canvas
+  // final et plusieurs buffers de bande.
   const maxPixels = mobile
-    ? memory !== null && memory <= 4
-      ? 6_000_000
-      : 9_000_000
-    : memory !== null && memory <= 4
-      ? 12_000_000
-      : 24_000_000;
+    ? lowMemory
+      ? 4_500_000
+      : 7_500_000
+    : lowMemory
+      ? 10_000_000
+      : 22_000_000;
+  const maxWorkingMb = mobile
+    ? lowMemory
+      ? 150
+      : 230
+    : lowMemory
+      ? 420
+      : 900;
+  const maxFusionMs = mobile
+    ? lowMemory
+      ? 9_000
+      : 15_000
+    : 35_000;
 
-  // Deux ImageData, deux cartes de luminance et une sortie RGBA coexistent
-  // pendant une bande. On garde une marge supplémentaire pour le canvas final.
   const tempBytes = mobile
-    ? 16 * 1024 * 1024
-    : 42 * 1024 * 1024;
+    ? lowMemory
+      ? 10 * 1024 * 1024
+      : 14 * 1024 * 1024
+    : 38 * 1024 * 1024;
   const bytesPerPixelEstimate = 22;
   const rowsByMemory = Math.floor(
     tempBytes /
@@ -74,14 +105,38 @@ function runtimeBudget(width: number): {
 
   return {
     maxPixels,
+    maxWorkingMb,
+    maxFusionMs,
+    mobile,
     bandRows: Math.max(
-      32,
-      Math.min(mobile ? 96 : 192, rowsByMemory),
+      24,
+      Math.min(
+        mobile ? (lowMemory ? 56 : 80) : 176,
+        rowsByMemory,
+      ),
     ),
     label: mobile
       ? `mobile ${memory ?? "RAM ?"} Go`
       : `desktop ${memory ?? "RAM ?"} Go`,
   };
+}
+
+function estimatedPeakWorkingMb(
+  outputPixels: number,
+  sourcePixels: number,
+  width: number,
+  bandRows: number,
+): number {
+  // Surfaces décodées source + master + canvas de sortie, puis deux bandes
+  // RGBA, deux lumas Float32 et la bande de sortie. Le coefficient 1.18 garde
+  // une marge pour les objets JS et les allocations internes Canvas.
+  const fullBytes =
+    sourcePixels * 4 +
+    outputPixels * 4 +
+    outputPixels * 4;
+  const bandPixels = width * (bandRows + HALO * 2);
+  const bandBytes = bandPixels * 22;
+  return ((fullBytes + bandBytes) * 1.18) / (1024 * 1024);
 }
 
 function makeCanvas(
@@ -410,29 +465,76 @@ export async function fuseMasterWithEvidence(
   blob: Blob;
   report: EvidenceFusionReport;
 }> {
+  const startedAt = performance.now();
   const pixels = outputSize.width * outputSize.height;
   const budget = runtimeBudget(outputSize.width);
+  const preflightSourcePixels = options.sourceSize
+    ? options.sourceSize.width * options.sourceSize.height
+    : pixels;
+  const preflightPeakMb = estimatedPeakWorkingMb(
+    pixels,
+    preflightSourcePixels,
+    outputSize.width,
+    budget.bandRows,
+  );
+
+  const skipped = (
+    reason: string,
+    peakMb = preflightPeakMb,
+  ): {
+    blob: Blob;
+    report: EvidenceFusionReport;
+  } => ({
+    blob: master,
+    report: {
+      applied: false,
+      meanAiDetailWeight: 0,
+      cycleConfidence: 0,
+      cycleMeanAbsoluteError: 0,
+      rejectedDetailPercent: 0,
+      bands: 0,
+      elapsedMs: performance.now() - startedAt,
+      cycleMs: 0,
+      fusionMs: 0,
+      estimatedPeakWorkingMb: peakMb,
+      bandRows: budget.bandRows,
+      performanceAbort: false,
+      qualityGate: "not-run",
+      qualityDelta: null,
+      skippedReason: reason,
+    },
+  });
 
   if (pixels > budget.maxPixels) {
-    return {
-      blob: master,
-      report: {
-        applied: false,
-        meanAiDetailWeight: 0,
-        cycleConfidence: 0,
-        cycleMeanAbsoluteError: 0,
-        rejectedDetailPercent: 0,
-        bands: 0,
-        skippedReason:
-          `Evidence Fusion ignorée à ${(pixels / 1_000_000).toFixed(1)} MP : budget sûr ${(budget.maxPixels / 1_000_000).toFixed(1)} MP (${budget.label}).`,
-      },
-    };
+    return skipped(
+      `Evidence Fusion ignorée à ${(pixels / 1_000_000).toFixed(1)} MP : budget sûr ${(budget.maxPixels / 1_000_000).toFixed(1)} MP (${budget.label}).`,
+    );
+  }
+  if (preflightPeakMb > budget.maxWorkingMb) {
+    return skipped(
+      `Evidence Fusion ignorée avant décodage : pic mémoire estimé ${preflightPeakMb.toFixed(0)} Mo > budget ${budget.maxWorkingMb} Mo (${budget.label}).`,
+    );
   }
 
   const [source, ai] = await Promise.all([
     decodeImageFile(original),
     decodeImageFile(master),
   ]);
+
+  const actualPeakMb = estimatedPeakWorkingMb(
+    pixels,
+    source.width * source.height,
+    outputSize.width,
+    budget.bandRows,
+  );
+  if (actualPeakMb > budget.maxWorkingMb) {
+    source.close();
+    ai.close();
+    return skipped(
+      `Evidence Fusion ignorée après lecture des dimensions : pic mémoire estimé ${actualPeakMb.toFixed(0)} Mo > budget ${budget.maxWorkingMb} Mo.`,
+      actualPeakMb,
+    );
+  }
 
   const output = makeCanvas(
     outputSize.width,
@@ -448,6 +550,7 @@ export async function fuseMasterWithEvidence(
       0.03,
       "Evidence Fusion · cycle consistency",
     );
+    const cycleStartedAt = performance.now();
     const cycle = await buildCycleMap(
       source.source,
       source.width,
@@ -456,6 +559,9 @@ export async function fuseMasterWithEvidence(
       ai.width,
       ai.height,
     );
+    const cycleMs = performance.now() - cycleStartedAt;
+    const fusionStartedAt = performance.now();
+    let measuredBandMs = 0;
 
     // Si le master ne ressemble déjà plus suffisamment à la source une fois
     // reprojeté, la fusion devient très conservatrice automatiquement.
@@ -471,6 +577,7 @@ export async function fuseMasterWithEvidence(
       y0 += budget.bandRows
     ) {
       throwIfCancelled();
+      const bandStartedAt = performance.now();
       const writeStart = y0;
       const writeEnd = Math.min(
         outputSize.height,
@@ -725,12 +832,56 @@ export async function fuseMasterWithEvidence(
       faithfulBand.width = faithfulBand.height = 1;
       aiBand.width = aiBand.height = 1;
       bands += 1;
+      measuredBandMs += performance.now() - bandStartedAt;
 
       const ratio =
         writeEnd / Math.max(1, outputSize.height);
+      const remainingBands = Math.max(
+        0,
+        Math.ceil(
+          (outputSize.height - writeEnd) /
+            budget.bandRows,
+        ),
+      );
+      const meanBandMs =
+        measuredBandMs / Math.max(1, bands);
+      const projectedFusionMs =
+        measuredBandMs +
+        remainingBands * meanBandMs;
+
+      // Watchdog de performance : après deux bandes réelles, si le téléphone
+      // indique que la passe complète serait trop longue, on rend le master
+      // précédent plutôt que de monopoliser le thread principal.
+      if (
+        bands >= 2 &&
+        projectedFusionMs > budget.maxFusionMs
+      ) {
+        return {
+          blob: master,
+          report: {
+            applied: false,
+            meanAiDetailWeight: 0,
+            cycleConfidence: cycle.meanConfidence,
+            cycleMeanAbsoluteError: cycle.meanAbsoluteError,
+            rejectedDetailPercent: 0,
+            bands,
+            elapsedMs: performance.now() - startedAt,
+            cycleMs,
+            fusionMs: performance.now() - fusionStartedAt,
+            estimatedPeakWorkingMb: actualPeakMb,
+            bandRows: budget.bandRows,
+            performanceAbort: true,
+            qualityGate: "not-run",
+            qualityDelta: null,
+            skippedReason:
+              `Evidence Fusion interrompue proprement : temps projeté ${(projectedFusionMs / 1000).toFixed(1)} s > budget ${(budget.maxFusionMs / 1000).toFixed(0)} s (${budget.label}).`,
+          },
+        };
+      }
+
       options.onProgress?.(
         0.12 + ratio * 0.84,
-        `Evidence Fusion · bande ${bands} · ${Math.round(ratio * 100)} %`,
+        `Evidence Fusion · bande ${bands} · ${Math.round(ratio * 100)} % · ~${Math.round(meanBandMs)} ms/bande`,
       );
       await new Promise<void>((resolve) =>
         window.setTimeout(resolve, 0),
@@ -754,6 +905,14 @@ export async function fuseMasterWithEvidence(
         rejectedDetailPercent:
           (rejected / denominator) * 100,
         bands,
+        elapsedMs: performance.now() - startedAt,
+        cycleMs,
+        fusionMs: performance.now() - fusionStartedAt,
+        estimatedPeakWorkingMb: actualPeakMb,
+        bandRows: budget.bandRows,
+        performanceAbort: false,
+        qualityGate: "not-run",
+        qualityDelta: null,
       },
     };
   } finally {

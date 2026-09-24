@@ -249,27 +249,52 @@ export async function runAgenticImageMaster(
     throwIfCancelled();
     onProgress?.(0.935, "Evidence Fusion · fréquences + cycle consistency");
     try {
+      const preFusionBlob = result.blob;
       const fused = await fuseMasterWithEvidence(
         file,
-        result.blob,
+        preFusionBlob,
         result.size,
         {
           format: plan.format,
+          sourceSize,
           onProgress: (ratio, label) =>
             onProgress?.(0.935 + ratio * 0.012, label),
         },
       );
       evidenceFusion = fused.report;
       if (fused.report.applied) {
-        result = { ...result, blob: fused.blob };
-        decisions.push(
-          decision(
-            "quality",
-            "Agent Evidence Fusion",
-            "ok",
-            `Fusion multi-fréquence validée : poids IA détail moyen ${Math.round(fused.report.meanAiDetailWeight * 100)} % · cycle ${Math.round(fused.report.cycleConfidence * 100)} % · MAE ${fused.report.cycleMeanAbsoluteError.toFixed(2)} · ${fused.report.rejectedDetailPercent.toFixed(1)} % des détails IA fortement atténués.`,
-          ),
+        // Une nouvelle étape n'est jamais gardée sur sa seule promesse :
+        // elle doit battre le master précédent sur le même duel source.
+        const fusionDuel = await duelFinalMasters(
+          file,
+          fused.blob,
+          preFusionBlob,
         );
+        evidenceFusion.qualityDelta = fusionDuel.margin;
+
+        if (fusionDuel.winner === "primary") {
+          evidenceFusion.qualityGate = "accepted";
+          result = { ...result, blob: fused.blob };
+          decisions.push(
+            decision(
+              "quality",
+              "Agent Evidence Fusion",
+              "ok",
+              `Fusion multi-fréquence conservée après duel : +${fusionDuel.margin.toFixed(2)} points · poids IA détail ${Math.round(fused.report.meanAiDetailWeight * 100)} % · cycle ${Math.round(fused.report.cycleConfidence * 100)} % · pic mémoire estimé ${fused.report.estimatedPeakWorkingMb.toFixed(0)} Mo · ${Math.round(fused.report.elapsedMs)} ms.`,
+            ),
+          );
+        } else {
+          evidenceFusion.qualityGate = "reverted";
+          result = { ...result, blob: preFusionBlob };
+          decisions.push(
+            decision(
+              "quality",
+              "Agent Evidence Fusion",
+              "warning",
+              `Fusion calculée puis annulée automatiquement : gain insuffisant (${fusionDuel.margin.toFixed(2)} points). Le master IA précédent, mesuré meilleur, est conservé.`,
+            ),
+          );
+        }
       } else {
         decisions.push(
           decision(
@@ -438,6 +463,7 @@ export async function runAgenticImageMaster(
       const finished = await applyNaturalFinish(
         result.blob,
         plan.format,
+        { expectedSize: result.size },
       );
       const finalCheck = await validateImageMaster(
         finished,
