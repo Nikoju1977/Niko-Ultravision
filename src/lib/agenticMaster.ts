@@ -463,6 +463,7 @@ export async function runAgenticImageMaster(
       const finished = await applyNaturalFinish(
         result.blob,
         plan.format,
+        { expectedSize: result.size },
       );
       const finalCheck = await validateImageMaster(
         finished,
