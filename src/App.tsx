@@ -1021,8 +1021,8 @@ export default function App() {
         ...(master.evidenceFusion
           ? [
               master.evidenceFusion.applied
-                ? `Evidence Fusion : cycle ${Math.round(master.evidenceFusion.cycleConfidence * 100)} % · poids IA détail ${Math.round(master.evidenceFusion.meanAiDetailWeight * 100)} % · détails IA atténués ${master.evidenceFusion.rejectedDetailPercent.toFixed(1)} %.`
-                : `Evidence Fusion : ${master.evidenceFusion.skippedReason ?? "non appliquée"}`,
+                ? `Evidence Fusion : ${master.evidenceFusion.qualityGate === "accepted" ? "conservée" : master.evidenceFusion.qualityGate === "reverted" ? "annulée par le duel qualité" : "calculée"} · cycle ${Math.round(master.evidenceFusion.cycleConfidence * 100)} % · poids IA détail ${Math.round(master.evidenceFusion.meanAiDetailWeight * 100)} % · détails IA atténués ${master.evidenceFusion.rejectedDetailPercent.toFixed(1)} % · ${Math.round(master.evidenceFusion.elapsedMs)} ms · pic mémoire estimé ${master.evidenceFusion.estimatedPeakWorkingMb.toFixed(0)} Mo · bandes ${master.evidenceFusion.bandRows}px${master.evidenceFusion.qualityDelta !== null ? ` · Δ qualité ${master.evidenceFusion.qualityDelta >= 0 ? "+" : ""}${master.evidenceFusion.qualityDelta.toFixed(2)}` : ""}.`
+                : `Evidence Fusion : ${master.evidenceFusion.skippedReason ?? "non appliquée"} · pic mémoire estimé ${master.evidenceFusion.estimatedPeakWorkingMb.toFixed(0)} Mo${master.evidenceFusion.performanceAbort ? " · watchdog performance déclenché" : ""}.`,
             ]
           : []),
         `Validation finale : ${master.validation.message}`,
