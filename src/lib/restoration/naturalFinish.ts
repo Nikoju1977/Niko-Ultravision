@@ -8,17 +8,66 @@
  * aucune structure (ni contour, ni forme) : c'est une texture aléatoire de très
  * faible amplitude, déterministe (même image → même résultat).
  */
+import { throwIfCancelled } from "../cancellation";
 import { decodeImageFile } from "../imageDecode";
 import { canvas2d } from "./imageMath";
 
 export interface NaturalFinishOptions {
   /** Écart-type du grain en niveaux 0–255 (défaut 1,8). */
   amplitude?: number;
+  /** Évite même le décodage si les dimensions sont déjà connues. */
+  expectedSize?: { width: number; height: number };
   onProgress?: (ratio: number) => void;
 }
 
-const BAND = 128;
 const HALO = 6;
+
+function finishBudget(width: number): {
+  maxPixels: number;
+  bandRows: number;
+  label: string;
+} {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const memory =
+    typeof nav.deviceMemory === "number"
+      ? nav.deviceMemory
+      : null;
+  const mobile = /Android|iPhone|iPad|iPod/i.test(
+    navigator.userAgent,
+  );
+  const lowMemory = memory !== null && memory <= 4;
+  const maxPixels = mobile
+    ? lowMemory
+      ? 4_000_000
+      : 7_000_000
+    : lowMemory
+      ? 10_000_000
+      : 20_000_000;
+  const maxBandBytes = mobile
+    ? lowMemory
+      ? 9 * 1024 * 1024
+      : 14 * 1024 * 1024
+    : 32 * 1024 * 1024;
+  // ImageData + luma + gradient + intégrale Float64 + bruit Float32.
+  const estimatedBytesPerPixel = 24;
+  const bandRows = Math.max(
+    24,
+    Math.min(
+      mobile ? (lowMemory ? 48 : 72) : 128,
+      Math.floor(
+        maxBandBytes /
+          Math.max(1, width * estimatedBytesPerPixel),
+      ),
+    ),
+  );
+  return {
+    maxPixels,
+    bandRows,
+    label: mobile
+      ? `mobile ${memory ?? "RAM ?"} Go`
+      : `desktop ${memory ?? "RAM ?"} Go`,
+  };
+}
 
 /** Bruit blanc déterministe ~N(0,1) à partir des coordonnées. */
 function hashNoise(x: number, y: number): number {
@@ -36,9 +85,27 @@ export async function applyNaturalFinish(
   options: NaturalFinishOptions = {},
 ): Promise<Blob> {
   const amplitude = options.amplitude ?? 1.8;
+  if (options.expectedSize) {
+    const expectedPixels =
+      options.expectedSize.width * options.expectedSize.height;
+    const preflight = finishBudget(options.expectedSize.width);
+    if (expectedPixels > preflight.maxPixels) {
+      throw new Error(
+        `Finition naturelle ignorée à ${(expectedPixels / 1_000_000).toFixed(1)} MP : budget sûr ${(preflight.maxPixels / 1_000_000).toFixed(1)} MP (${preflight.label}).`,
+      );
+    }
+  }
+
   const decoded = await decodeImageFile(master);
   const width = decoded.width;
   const height = decoded.height;
+  const budget = finishBudget(width);
+  if (width * height > budget.maxPixels) {
+    decoded.close();
+    throw new Error(
+      `Finition naturelle ignorée à ${((width * height) / 1_000_000).toFixed(1)} MP : budget sûr ${(budget.maxPixels / 1_000_000).toFixed(1)} MP (${budget.label}).`,
+    );
+  }
   const { canvas, ctx } = canvas2d(width, height);
   try {
     ctx.drawImage(decoded.source, 0, 0);
@@ -50,9 +117,17 @@ export async function applyNaturalFinish(
   // renormalisé à un écart-type 1 (somme des carrés du noyau = 36/256).
   const norm = 1 / Math.sqrt(36 / 256);
 
-  for (let y0 = 0; y0 < height; y0 += BAND) {
+  for (
+    let y0 = 0;
+    y0 < height;
+    y0 += budget.bandRows
+  ) {
+    throwIfCancelled();
     const top = Math.max(0, y0 - HALO);
-    const bottom = Math.min(height, y0 + BAND + HALO);
+    const bottom = Math.min(
+      height,
+      y0 + budget.bandRows + HALO,
+    );
     const bandHeight = bottom - top;
     const image = ctx.getImageData(0, top, width, bandHeight);
     const px = image.data;
@@ -99,7 +174,10 @@ export async function applyNaturalFinish(
     }
 
     const start = y0 - top;
-    const end = Math.min(bandHeight, start + BAND);
+    const end = Math.min(
+      bandHeight,
+      start + budget.bandRows,
+    );
     for (let r = start; r < end; r += 1) {
       for (let c = 0; c < width; c += 1) {
         const i = r * width + c;
@@ -125,7 +203,9 @@ export async function applyNaturalFinish(
     }
     // On ne réécrit que le cœur de bande (sans halo).
     ctx.putImageData(image, 0, top, 0, start, width, end - start);
-    options.onProgress?.(Math.min(1, (y0 + BAND) / height));
+    options.onProgress?.(
+      Math.min(1, (y0 + budget.bandRows) / height),
+    );
     // Rend la main à l'interface entre deux bandes.
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
