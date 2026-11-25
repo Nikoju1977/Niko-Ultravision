@@ -1,4 +1,39 @@
-# Niko UltraVision Pro
+# Niko UltraVision Pro — Studio Niko Design
+
+**Local-first image restoration · ONNX super-resolution · Browser video processing**
+
+[![Runtime](https://img.shields.io/badge/runtime-React%20%2F%20TypeScript-blue)](package.json) [![Inference](https://img.shields.io/badge/inference-ONNX%20Runtime%20Web-blue)](src/lib/aiEngineCore.ts) [![License](https://img.shields.io/badge/license-restricted-lightgrey)](LICENSE.md)
+
+[Développement](#développement) · [Sécurité](SECURITY.md) · [English overview](#english-overview) · [Portfolio](https://github.com/Nikoju1977)
+
+## Architecture et contrats de traitement
+
+```mermaid
+flowchart TD
+    Input[Source image or video] --> Decode[Decode and capability checks]
+    Decode --> Restore[Local restoration]
+    Restore --> Canvas[Canvas resampling]
+    Restore --> ONNX[Optional ONNX tiled inference]
+    Canvas --> Quality[Quality comparison]
+    ONNX --> Quality
+    Quality --> Export[Image export]
+    Decode --> Video[Video conversion]
+    Video --> Codecs[WebCodecs or MediaRecorder fallback]
+    Codecs --> VideoOut[Video export]
+    Restore -. Explicit optional request .-> Cloud[Configured cloud endpoint]
+    Cloud --> Quality
+```
+
+| Module | Fonction |
+| --- | --- |
+| [aiEngineCore.ts](src/lib/aiEngineCore.ts) | Création de session ONNX, inférence et tuilage |
+| [aiUpscaler.ts](src/lib/aiUpscaler.ts) | Orchestration de la super-résolution |
+| [aiWorker.ts](src/lib/aiWorker.ts) | Traitement hors thread interface |
+| [videoEnhancer.ts](src/lib/videoEnhancer.ts) | Conversion vidéo et choix des replis |
+| [qualityComparator.ts](src/lib/qualityComparator.ts) | Comparaison avant/après |
+| [cloudPro.ts](src/lib/cloudPro.ts) | Traitement distant optionnel et comparaison |
+
+Le code contient bien des appels `InferenceSession.create` et `session.run`, distincts du simple rééchantillonnage Canvas. La présence d'une inférence réelle ne prouve pas qu'un modèle donné fonctionne sur tous les navigateurs, ni qu'il restitue fidèlement un détail absent. Les modèles, fournisseurs et performances externes ne sont pas revérifiés par cette mise à jour.
 
 Application autonome de restauration et de rééchantillonnage local d'images et de vidéos.
 
@@ -20,8 +55,8 @@ L'URL est modifiable dans l'interface, et un fichier `.onnx` local peut être ch
 place — ce qui rend le mode IA utilisable entièrement hors ligne.
 
 Le moteur est **agnostique du modèle** : le nom des entrées/sorties et le facteur
-d'échelle sont lus sur la session ONNX au chargement, pas codés en dur. Tout modèle de
-super-résolution à une entrée et une sortie NCHW fonctionne (Swin2SR, SwinIR, Real-ESRGAN,
+d'échelle sont lus sur la session ONNX au chargement, pas codés en dur. Les modèles de
+super-résolution à une entrée et une sortie NCHW sont des candidats à vérifier (Swin2SR, SwinIR, Real-ESRGAN,
 EDSR). Les tuiles sont complétées au multiple de 8 par réplication de bord, pour les
 architectures à fenêtre glissante.
 
@@ -213,8 +248,7 @@ Deux pipelines, choisis à l'exécution selon le navigateur :
 
 **WebCodecs (Chrome, Edge, Safari 16.4+)** — le fichier source est démultiplexé, décodé,
 retraité et réencodé hors temps réel via [mediabunny](https://mediabunny.dev) (MPL-2.0).
-Horodatage exact, **aucune image perdue**, piste audio recopiée sans réencodage quand le
-conteneur le permet.
+Le pipeline vise à préserver les horodatages et les images ; la piste audio peut être recopiée sans réencodage quand le conteneur le permet. Vérifier ces propriétés sur le fichier final.
 
 **MediaRecorder (repli)** — encodage en temps réel sur `captureStream`, plafonné à 4K.
 Des images peuvent être perdues si le rendu prend du retard, et la qualité n'est réglable
@@ -299,3 +333,28 @@ de mediabunny et d'ONNX Runtime Web, et le build de production passe.
 En revanche, **l'inférence IA et l'encodage WebCodecs doivent être testés dans un vrai
 navigateur** : disponibilité de l'URL du modèle, compatibilité de son graphe et temps de calcul effectif
 sur ta machine.
+
+
+## Protocole de validation proposé
+
+| Essai | Preuve à conserver |
+| --- | --- |
+| Canvas vs ONNX | Même source, mêmes dimensions de sortie ; relever modèle, backend, durée et échecs |
+| Fidélité | Comparer visuellement texte, contours, aplats et textures ; consigner SSIM/PSNR à résolution commune |
+| Vidéo | Relever codec, cadence, dimensions, durée et présence de la piste audio du fichier final |
+| Repli | Identifier WebCodecs ou MediaRecorder ; ne pas confondre leurs garanties |
+| Mobile | Tester une source modeste avant 4K/8K, relever mémoire, interruptions et annulation |
+
+Ce protocole n'a pas été exécuté pour la révision documentaire. Les métriques calculées sans référence haute résolution ne prouvent pas la fidélité de détails reconstruits. La capacité 8K dépend de l'appareil, des codecs et des ressources ; elle n'est pas une certification.
+
+## English overview
+
+UltraVision Pro is a React/TypeScript application for local image restoration, conventional Canvas resampling, optional tiled ONNX inference using WebGPU/WASM, and browser video conversion through mediabunny/WebCodecs with a MediaRecorder fallback. Quality metrics and heuristic focus maps support comparison, but do not prove recovery of original scene detail or physical depth. Video resolution, codec, bit depth and performance depend on the actual pipeline and browser. Cloud Pro is an optional explicit remote request and needs a configured server; the model's availability and billing must be checked separately.
+
+Node.js 22.12+ is required by the project. Run `npm ci`, then `npm run dev`; build using `npm run build`. No fresh build, inference, encoding, benchmark or production check was executed during this documentation update.
+
+## Licence et contribution / License and contribution
+
+[LICENSE.md](LICENSE.md) reserves existing rights to original contributions; the public repository is not itself licensed as open source. ONNX Runtime Web, mediabunny, model weights and other third-party components retain their respective licenses. Report reproducible issues without private media or credentials; see [SECURITY.md](SECURITY.md).
+
+**Studio Niko Design** · Local-first imaging, explicit processing contracts and measurable quality.
